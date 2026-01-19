@@ -28,6 +28,7 @@ Usage:
 """
 
 import io
+import json
 import os
 import random
 import tarfile
@@ -35,13 +36,10 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Union
 
 import torch
+import torch.distributed as dist
 from torch.utils.data import IterableDataset
 
-from nemo.collections.asr.data.audio_to_text import (
-    TarredAudioToBPEDataset,
-    _TarredAudioToTextDataset,
-    _speech_collate_fn,
-)
+from nemo.collections.asr.data.audio_to_text import _speech_collate_fn
 from nemo.collections.asr.parts.preprocessing.features import WaveformFeaturizer
 from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, NeuralType
 from nemo.utils import logging
@@ -176,13 +174,17 @@ def concatenate_audio_tensors(
     return torch.cat(chunks)
 
 
-class MergedTarredAudioToBPEDataset(TarredAudioToBPEDataset):
+class MergedTarredAudioToBPEDataset(IterableDataset):
     """
-    A TarredAudioToBPEDataset that supports on-the-fly audio merging.
+    A dataset that supports on-the-fly audio merging from tarred audio files.
 
-    When merge_audio=True, the manifest should contain pipe-separated paths
-    that will be merged during training. This avoids pre-processing overhead
-    and allows different silence gaps each epoch (data augmentation).
+    This dataset reads a manifest where each entry contains pipe-separated paths
+    pointing to multiple audio files that should be merged during training.
+    The audio files are extracted from tar archives and concatenated with
+    random silence gaps.
+
+    Unlike the standard TarredAudioToBPEDataset which iterates over tar files,
+    this dataset iterates over manifest entries and extracts audio on-demand.
 
     Manifest format for merged samples:
     {
@@ -196,15 +198,21 @@ class MergedTarredAudioToBPEDataset(TarredAudioToBPEDataset):
     }
 
     Args:
-        merge_audio: Whether to enable on-the-fly merging
+        manifest_filepath: Path to the merged manifest JSON file
+        tokenizer: Tokenizer for encoding text
+        sample_rate: Audio sample rate
         merge_silence_min_ms: Minimum silence gap between merged samples (ms)
         merge_silence_max_ms: Maximum silence gap between merged samples (ms)
-        ... (all other args from TarredAudioToBPEDataset)
+        shuffle: Whether to shuffle manifest entries
+        min_duration: Minimum duration filter
+        max_duration: Maximum duration filter
+        global_rank: Current process rank for distributed training
+        world_size: Total number of processes for distributed training
     """
 
     def __init__(
         self,
-        audio_tar_filepaths: Union[str, List[str]],
+        audio_tar_filepaths: Union[str, List[str]],  # Kept for API compatibility, not used
         manifest_filepath: str,
         tokenizer: 'nemo.collections.common.tokenizers.TokenizerSpec',
         sample_rate: int,
@@ -222,103 +230,133 @@ class MergedTarredAudioToBPEDataset(TarredAudioToBPEDataset):
         return_sample_id: bool = False,
         manifest_parse_func: Optional[Callable] = None,
         # Merge-specific parameters
-        merge_audio: bool = False,
+        merge_audio: bool = True,
         merge_silence_min_ms: int = 200,
         merge_silence_max_ms: int = 1000,
     ):
-        self.merge_audio = merge_audio
+        self.manifest_filepath = manifest_filepath
+        self.tokenizer = tokenizer
+        self.sample_rate = sample_rate
+        self.int_values = int_values
+        self.augmentor = augmentor
+        self.shuffle_n = shuffle_n
+        self.min_duration = min_duration
+        self.max_duration = max_duration
+        self.trim = trim
+        self.use_start_end_token = use_start_end_token
+        self.global_rank = global_rank
+        self.world_size = world_size if world_size > 0 else 1
+        self.return_sample_id = return_sample_id
         self.merge_silence_min_ms = merge_silence_min_ms
         self.merge_silence_max_ms = merge_silence_max_ms
+
+        # BOS/EOS tokens
+        if hasattr(tokenizer, 'bos_id') and tokenizer.bos_id is not None:
+            self.bos_id = tokenizer.bos_id if use_start_end_token else None
+        else:
+            self.bos_id = None
+        if hasattr(tokenizer, 'eos_id') and tokenizer.eos_id is not None:
+            self.eos_id = tokenizer.eos_id if use_start_end_token else None
+        else:
+            self.eos_id = None
+
+        # Load and filter manifest
+        self.manifest_entries = self._load_manifest()
 
         # Per-worker tar cache (initialized lazily)
         self._tar_cache = None
 
-        super().__init__(
-            audio_tar_filepaths=audio_tar_filepaths,
-            manifest_filepath=manifest_filepath,
-            tokenizer=tokenizer,
-            sample_rate=sample_rate,
-            int_values=int_values,
-            augmentor=augmentor,
-            shuffle_n=shuffle_n,
-            min_duration=min_duration,
-            max_duration=max_duration,
-            trim=trim,
-            use_start_end_token=use_start_end_token,
-            shard_strategy=shard_strategy,
-            shard_manifests=shard_manifests,
-            global_rank=global_rank,
-            world_size=world_size,
-            return_sample_id=return_sample_id,
-            manifest_parse_func=manifest_parse_func,
+        # Create featurizer for audio processing
+        self.featurizer = WaveformFeaturizer(sample_rate=sample_rate, int_values=int_values)
+
+        logging.info(
+            f"MergedTarredAudioToBPEDataset: {len(self.manifest_entries)} entries, "
+            f"silence={merge_silence_min_ms}-{merge_silence_max_ms}ms"
         )
 
-        if self.merge_audio:
-            logging.info(
-                f"On-the-fly audio merging enabled: "
-                f"silence={merge_silence_min_ms}-{merge_silence_max_ms}ms"
-            )
+    def _load_manifest(self) -> List[Dict]:
+        """Load and filter manifest entries."""
+        entries = []
+        with open(self.manifest_filepath, 'r', encoding='utf-8') as f:
+            for line in f:
+                entry = json.loads(line.strip())
+                duration = entry.get('duration', 0)
+
+                # Apply duration filters
+                if self.min_duration is not None and duration < self.min_duration:
+                    continue
+                if self.max_duration is not None and duration > self.max_duration:
+                    continue
+
+                entries.append(entry)
+
+        return entries
 
     def _get_tar_cache(self) -> TarFileCache:
         """Get or create worker-local tar cache."""
         if self._tar_cache is None:
-            self._tar_cache = TarFileCache(max_open=32)
+            self._tar_cache = TarFileCache(max_open=64)
         return self._tar_cache
 
-    def _build_sample(self, tup):
-        """
-        Build training sample, with optional on-the-fly merging.
+    def __len__(self):
+        return len(self.manifest_entries)
 
-        If merge_audio is enabled and the manifest entry has pipe-separated paths,
-        this will extract multiple audio files and concatenate them with silence.
-        """
-        audio_bytes, audio_filename, offset_id = tup
-
-        # Get manifest entry
-        file_id, _ = os.path.splitext(os.path.basename(audio_filename))
-        manifest_idx = self.manifest_processor.collection.mapping[file_id][offset_id]
-        manifest_entry = self.manifest_processor.collection[manifest_idx]
-
-        # Check if this is a merged sample
-        audio_filepath = getattr(manifest_entry, 'audio_filepath', audio_filename)
-
-        if self.merge_audio and '|' in str(audio_filepath):
-            # This is a merged sample - extract and concatenate multiple audio files
-            return self._build_merged_sample(manifest_entry, manifest_idx)
+    def __iter__(self):
+        """Iterate over manifest entries, yielding processed samples."""
+        # Get worker info for multi-worker data loading
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is None:
+            # Single-process data loading
+            worker_id = 0
+            num_workers = 1
         else:
-            # Regular sample - use parent implementation
-            return super()._build_sample(tup)
+            worker_id = worker_info.id
+            num_workers = worker_info.num_workers
 
-    def _build_merged_sample(self, manifest_entry, manifest_idx):
-        """
-        Build a merged sample by extracting and concatenating multiple audio files.
-        """
-        # Parse pipe-separated fields
-        audio_filepaths = str(manifest_entry.audio_filepath).split('|')
+        # Calculate total number of workers across all ranks
+        total_workers = self.world_size * num_workers
+        global_worker_id = self.global_rank * num_workers + worker_id
 
-        # Get shard_ids and tar_dirs if available
-        shard_ids_str = getattr(manifest_entry, 'shard_id', None)
-        tar_dirs_str = getattr(manifest_entry, 'tar_dir', None)
+        # Shard entries across workers
+        entries = self.manifest_entries[global_worker_id::total_workers]
 
-        if shard_ids_str and '|' in str(shard_ids_str):
-            shard_ids = [int(s) for s in str(shard_ids_str).split('|')]
-        else:
-            shard_ids = [0] * len(audio_filepaths)
-
-        if tar_dirs_str and '|' in str(tar_dirs_str):
-            tar_dirs = str(tar_dirs_str).split('|')
-        else:
-            # Fallback: try to infer from audio_tar_filepaths
-            tar_dirs = [os.path.dirname(self.audio_tar_filepaths[0])] * len(audio_filepaths)
+        # Optional shuffling
+        if self.shuffle_n > 0:
+            random.shuffle(entries)
 
         tar_cache = self._get_tar_cache()
+
+        for idx, entry in enumerate(entries):
+            sample = self._process_entry(entry, tar_cache, idx)
+            if sample is not None:
+                yield sample
+
+    def _process_entry(self, entry: Dict, tar_cache: TarFileCache, idx: int):
+        """Process a manifest entry and return a training sample."""
+        # Parse pipe-separated fields
+        audio_filepaths = entry.get('audio_filepath', '').split('|')
+        shard_ids_str = entry.get('shard_id', '')
+        tar_dirs_str = entry.get('tar_dir', '')
+
+        if '|' in shard_ids_str:
+            shard_ids = [int(s) for s in shard_ids_str.split('|')]
+        else:
+            shard_ids = [int(shard_ids_str)] if shard_ids_str else [0] * len(audio_filepaths)
+
+        if '|' in tar_dirs_str:
+            tar_dirs = tar_dirs_str.split('|')
+        else:
+            tar_dirs = [tar_dirs_str] * len(audio_filepaths)
 
         # Extract and process each audio file
         audio_tensors = []
         for audio_path, shard_id, tar_dir in zip(audio_filepaths, shard_ids, tar_dirs):
+            if not tar_dir or not audio_path:
+                continue
+
             audio_bytes = extract_audio_from_tar(tar_cache, tar_dir, shard_id, audio_path)
             if audio_bytes is None:
-                logging.warning(f"Failed to extract {audio_path}, skipping merge")
+                logging.debug(f"Failed to extract {audio_path} from {tar_dir}/audio_{shard_id}.tar")
                 continue
 
             # Process audio bytes through featurizer
@@ -333,18 +371,18 @@ class MergedTarredAudioToBPEDataset(TarredAudioToBPEDataset):
                 )
                 audio_tensors.append(features)
             except Exception as e:
-                logging.warning(f"Failed to process {audio_path}: {e}")
+                logging.debug(f"Failed to process {audio_path}: {e}")
             finally:
                 audio_stream.close()
 
         if len(audio_tensors) == 0:
-            logging.warning("No audio extracted for merged sample, returning None")
+            logging.warning(f"No audio extracted for entry {idx}, skipping")
             return None
 
         # Concatenate with random silence
         merged_audio = concatenate_audio_tensors(
             audio_tensors,
-            sample_rate=self.featurizer.sample_rate,
+            sample_rate=self.sample_rate,
             silence_min_ms=self.merge_silence_min_ms,
             silence_max_ms=self.merge_silence_max_ms,
         )
@@ -353,25 +391,37 @@ class MergedTarredAudioToBPEDataset(TarredAudioToBPEDataset):
         f = merged_audio
         fl = torch.tensor(merged_audio.shape[0]).long()
 
-        # Text features (already combined in manifest)
-        t = manifest_entry.text_tokens
-        tl = len(manifest_entry.text_tokens)
-
-        self.manifest_processor.process_text_by_sample(sample=manifest_entry)
+        # Tokenize text
+        text = entry.get('text', '')
+        t = self.tokenizer.text_to_ids(text)
 
         if self.bos_id is not None:
             t = [self.bos_id] + t
-            tl += 1
         if self.eos_id is not None:
             t = t + [self.eos_id]
-            tl += 1
+
+        tl = len(t)
 
         if self.return_sample_id:
-            return f, fl, torch.tensor(t).long(), torch.tensor(tl).long(), manifest_idx
+            return f, fl, torch.tensor(t).long(), torch.tensor(tl).long(), idx
         else:
             return f, fl, torch.tensor(t).long(), torch.tensor(tl).long()
+
+    def collate_fn(self, batch):
+        """Collate function for DataLoader."""
+        return _speech_collate_fn(batch, pad_id=0)
 
     def __del__(self):
         """Clean up tar cache on deletion."""
         if self._tar_cache is not None:
             self._tar_cache.close_all()
+
+    @property
+    def output_types(self):
+        """Define output types for NeMo."""
+        return {
+            'audio_signal': NeuralType(('B', 'T'), AudioSignal()),
+            'a_sig_length': NeuralType(tuple('B'), LengthsType()),
+            'transcripts': NeuralType(('B', 'T'), LabelsType()),
+            'transcript_length': NeuralType(tuple('B'), LengthsType()),
+        }
