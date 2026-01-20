@@ -880,12 +880,43 @@ class _TarredAudioToTextDataset(IterableDataset):
         )
 
         # Put together WebDataset pipeline
+        # Custom handler for tar files where audio files are stored with full filenames
+        # (e.g., "dataset__sample_001.wav") instead of webdataset's key.extension format
+        def _extract_audio_from_sample(sample):
+            """Extract audio data from tarfile sample, handling both standard webdataset
+            format and custom format where full filename is the key."""
+            # Standard webdataset format: sample has keys like 'wav', 'mp3', etc.
+            for ext in ['wav', 'mp3', 'flac', 'opus', 'ogg']:
+                if ext in sample:
+                    return {'audio': sample[ext], 'key': sample.get('__key__', '')}
+
+            # Custom format: the key itself ends with .wav (or other audio extension)
+            # In this case, the sample dict has keys like '__key__', '__url__', and the full filename
+            for key, value in sample.items():
+                if key.startswith('__'):
+                    continue
+                # Check if this key looks like an audio file
+                key_lower = key.lower()
+                if any(key_lower.endswith(f'.{ext}') for ext in ['wav', 'mp3', 'flac', 'opus', 'ogg']):
+                    # Use the filename (without path) as the key for manifest lookup
+                    return {'audio': value, 'key': key}
+
+            # Fallback: return None to skip this sample
+            return None
+
+        def _audio_extractor(data):
+            """Pipeline stage to extract audio from samples."""
+            for sample in data:
+                result = _extract_audio_from_sample(sample)
+                if result is not None:
+                    yield result
+
         self._dataset = wds.DataPipeline(
             wds.SimpleShardList(urls=audio_tar_filepaths),
             webdataset_split_by_workers,
             wds.shuffle(shuffle_n),
             wds.tarfile_to_samples(),
-            wds.rename(audio=VALID_FILE_FORMATS, key='__key__'),
+            _audio_extractor,
             wds.to_tuple('audio', 'key'),
             self._filter,
             self._loop_offsets,

@@ -161,22 +161,21 @@ def extract_audio_from_tar(
     return None
 
 
-def fast_wav_to_float32(wav_bytes: bytes) -> Optional[np.ndarray]:
+def fast_wav_to_int16(wav_bytes: bytes) -> Optional[np.ndarray]:
     """
-    Fast WAV to float32 conversion without librosa/soundfile.
+    Fast WAV to int16 extraction without librosa/soundfile.
 
     Assumes 16-bit PCM WAV at 16kHz (skips resampling).
-    This is ~10x faster than librosa/soundfile for simple WAV files.
+    Returns int16 to defer float conversion until after concatenation.
 
     Args:
         wav_bytes: Raw WAV file bytes
 
     Returns:
-        Float32 numpy array normalized to [-1, 1], or None if parsing failed
+        Int16 numpy array (view, no copy), or None if parsing failed
     """
     try:
         # WAV header: first 44 bytes for standard PCM
-        # RIFF header (12 bytes) + fmt chunk (24 bytes) + data header (8 bytes)
         if len(wav_bytes) < 44:
             return None
 
@@ -193,13 +192,9 @@ def fast_wav_to_float32(wav_bytes: bytes) -> Optional[np.ndarray]:
         data_size = struct.unpack('<I', wav_bytes[data_offset + 4:data_offset + 8])[0]
         pcm_start = data_offset + 8
 
-        # Extract PCM data
+        # Extract PCM data as int16 view (no copy!)
         pcm_bytes = wav_bytes[pcm_start:pcm_start + data_size]
-
-        # Convert 16-bit PCM to float32
-        # Using numpy for fast vectorized conversion
-        samples = np.frombuffer(pcm_bytes, dtype=np.int16)
-        return samples.astype(np.float32) / 32768.0
+        return np.frombuffer(pcm_bytes, dtype=np.int16).copy()  # copy needed since wav_bytes may be freed
 
     except Exception:
         return None
@@ -365,7 +360,9 @@ class MergedTarredAudioToBPEDataset(IterableDataset):
     def _get_tar_cache(self) -> TarFileCache:
         """Get or create worker-local tar cache."""
         if self._tar_cache is None:
-            self._tar_cache = TarFileCache(max_open=64)
+            # Larger cache to reduce tar open/close overhead
+            # Each worker gets its own cache
+            self._tar_cache = TarFileCache(max_open=128)
         return self._tar_cache
 
     def __len__(self):
@@ -418,8 +415,11 @@ class MergedTarredAudioToBPEDataset(IterableDataset):
         else:
             tar_dirs = [tar_dirs_str] * len(audio_filepaths)
 
-        # Extract and process each audio file
-        audio_arrays = []
+        # Extract and process each audio file (keep as int16 for speed)
+        audio_arrays_int16 = []
+        fallback_arrays_float = []
+        use_fallback = False
+
         for audio_path, shard_id, tar_dir in zip(audio_filepaths, shard_ids, tar_dirs):
             if not tar_dir or not audio_path:
                 continue
@@ -430,11 +430,17 @@ class MergedTarredAudioToBPEDataset(IterableDataset):
                 continue
 
             # Fast path: direct WAV parsing (assumes 16kHz 16-bit PCM)
-            samples = fast_wav_to_float32(audio_bytes)
-            if samples is not None:
-                audio_arrays.append(samples)
+            samples = fast_wav_to_int16(audio_bytes)
+            if samples is not None and not use_fallback:
+                audio_arrays_int16.append(samples)
             else:
                 # Fallback to featurizer for non-standard WAV files
+                use_fallback = True
+                # Convert any existing int16 arrays to float
+                for arr in audio_arrays_int16:
+                    fallback_arrays_float.append(arr.astype(np.float32) / 32768.0)
+                audio_arrays_int16.clear()
+
                 audio_stream = io.BytesIO(audio_bytes)
                 try:
                     features = self.featurizer.process(
@@ -444,18 +450,21 @@ class MergedTarredAudioToBPEDataset(IterableDataset):
                         trim=self.trim,
                         orig_sr=None,
                     )
-                    audio_arrays.append(features.numpy())
+                    fallback_arrays_float.append(features.numpy())
                 except Exception as e:
                     logging.debug(f"Failed to process {audio_path}: {e}")
                 finally:
                     audio_stream.close()
 
-        if len(audio_arrays) == 0:
+        if len(audio_arrays_int16) == 0 and len(fallback_arrays_float) == 0:
             logging.warning(f"No audio extracted for entry {idx}, skipping")
             return None
 
-        # Fast concatenation with random silence (numpy, then convert to tensor once)
-        merged_audio = self._fast_concatenate(audio_arrays)
+        # Fast concatenation - int16 path or fallback float path
+        if not use_fallback:
+            merged_audio = self._fast_concatenate_int16(audio_arrays_int16)
+        else:
+            merged_audio = self._fast_concatenate_float(fallback_arrays_float)
 
         # Audio features
         f = torch.from_numpy(merged_audio)
@@ -477,9 +486,51 @@ class MergedTarredAudioToBPEDataset(IterableDataset):
         else:
             return f, fl, torch.tensor(t).long(), torch.tensor(tl).long()
 
-    def _fast_concatenate(self, audio_arrays: List[np.ndarray]) -> np.ndarray:
+    def _fast_concatenate_int16(self, audio_arrays: List[np.ndarray]) -> np.ndarray:
         """
-        Fast numpy-based audio concatenation with random silence.
+        Fast int16 concatenation with silence, converts to float32 only at the end.
+
+        Args:
+            audio_arrays: List of int16 numpy arrays
+
+        Returns:
+            Concatenated float32 numpy array normalized to [-1, 1]
+        """
+        if len(audio_arrays) == 0:
+            return np.array([], dtype=np.float32)
+
+        if len(audio_arrays) == 1:
+            return audio_arrays[0].astype(np.float32) / 32768.0
+
+        # Pre-calculate total length for single allocation
+        total_samples = sum(arr.shape[0] for arr in audio_arrays)
+
+        # Add silence lengths
+        silence_lengths = []
+        for _ in range(len(audio_arrays) - 1):
+            silence_ms = random.randint(self.merge_silence_min_ms, self.merge_silence_max_ms)
+            silence_samples = int(self.sample_rate * silence_ms / 1000)
+            silence_lengths.append(silence_samples)
+            total_samples += silence_samples
+
+        # Single allocation in int16 (silence = 0)
+        result_int16 = np.zeros(total_samples, dtype=np.int16)
+
+        # Copy data
+        offset = 0
+        for i, arr in enumerate(audio_arrays):
+            result_int16[offset:offset + arr.shape[0]] = arr
+            offset += arr.shape[0]
+
+            if i < len(silence_lengths):
+                offset += silence_lengths[i]
+
+        # Single float conversion at the end
+        return result_int16.astype(np.float32) / 32768.0
+
+    def _fast_concatenate_float(self, audio_arrays: List[np.ndarray]) -> np.ndarray:
+        """
+        Fast float32 concatenation with random silence (fallback path).
 
         Args:
             audio_arrays: List of float32 numpy arrays
@@ -514,7 +565,6 @@ class MergedTarredAudioToBPEDataset(IterableDataset):
             offset += arr.shape[0]
 
             if i < len(silence_lengths):
-                # Silence is already zeros, just advance offset
                 offset += silence_lengths[i]
 
         return result
