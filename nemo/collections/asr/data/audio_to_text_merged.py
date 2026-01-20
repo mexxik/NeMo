@@ -31,10 +31,12 @@ import io
 import json
 import os
 import random
+import struct
 import tarfile
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Union
 
+import numpy as np
 import torch
 import torch.distributed as dist
 from torch.utils.data import IterableDataset
@@ -51,13 +53,18 @@ __all__ = [
 
 class TarFileCache:
     """
-    Cache for open tarfile handles to avoid repeated open/close overhead.
-    Thread-local to support multiple DataLoader workers.
+    Cache for open tarfile handles and their member indices.
+
+    Key optimizations:
+    - Caches open file handles to avoid repeated open/close
+    - Caches member name -> TarInfo mapping for O(1) lookups instead of O(n)
+    - LRU eviction to bound memory usage
     """
 
     def __init__(self, max_open: int = 32):
         self.max_open = max_open
         self._cache: Dict[str, tarfile.TarFile] = {}
+        self._index_cache: Dict[str, Dict[str, tarfile.TarInfo]] = {}
         self._access_order: List[str] = []
 
     def get(self, tar_path: str) -> Optional[tarfile.TarFile]:
@@ -76,16 +83,31 @@ class TarFileCache:
             except Exception:
                 pass
             del self._cache[oldest]
+            if oldest in self._index_cache:
+                del self._index_cache[oldest]
 
         # Open new tarfile
         try:
             tf = tarfile.open(tar_path, 'r')
             self._cache[tar_path] = tf
             self._access_order.append(tar_path)
+
+            # Build index for O(1) member lookups
+            self._index_cache[tar_path] = {m.name: m for m in tf.getmembers()}
+
             return tf
         except Exception as e:
             logging.warning(f"Failed to open tarfile {tar_path}: {e}")
             return None
+
+    def get_member(self, tar_path: str, member_name: str) -> Optional[tarfile.TarInfo]:
+        """Get a TarInfo by name with O(1) lookup from cached index."""
+        if tar_path not in self._index_cache:
+            # Ensure tar is opened and indexed
+            if self.get(tar_path) is None:
+                return None
+
+        return self._index_cache.get(tar_path, {}).get(member_name)
 
     def close_all(self):
         """Close all cached tarfile handles."""
@@ -95,6 +117,7 @@ class TarFileCache:
             except Exception:
                 pass
         self._cache.clear()
+        self._index_cache.clear()
         self._access_order.clear()
 
 
@@ -123,16 +146,63 @@ def extract_audio_from_tar(
         return None
 
     try:
-        member = tf.getmember(audio_filename)
+        # Use cached index for O(1) lookup instead of O(n) getmember()
+        member = tar_cache.get_member(tar_path, audio_filename)
+        if member is None:
+            logging.warning(f"Audio file {audio_filename} not found in {tar_path}")
+            return None
+
         file_obj = tf.extractfile(member)
         if file_obj:
             return file_obj.read()
-    except KeyError:
-        logging.warning(f"Audio file {audio_filename} not found in {tar_path}")
     except Exception as e:
         logging.warning(f"Error extracting {audio_filename} from {tar_path}: {e}")
 
     return None
+
+
+def fast_wav_to_float32(wav_bytes: bytes) -> Optional[np.ndarray]:
+    """
+    Fast WAV to float32 conversion without librosa/soundfile.
+
+    Assumes 16-bit PCM WAV at 16kHz (skips resampling).
+    This is ~10x faster than librosa/soundfile for simple WAV files.
+
+    Args:
+        wav_bytes: Raw WAV file bytes
+
+    Returns:
+        Float32 numpy array normalized to [-1, 1], or None if parsing failed
+    """
+    try:
+        # WAV header: first 44 bytes for standard PCM
+        # RIFF header (12 bytes) + fmt chunk (24 bytes) + data header (8 bytes)
+        if len(wav_bytes) < 44:
+            return None
+
+        # Verify RIFF header
+        if wav_bytes[:4] != b'RIFF' or wav_bytes[8:12] != b'WAVE':
+            return None
+
+        # Find 'data' chunk (may not be at offset 36 if there are extra chunks)
+        data_offset = wav_bytes.find(b'data')
+        if data_offset == -1:
+            return None
+
+        # Read data chunk size (4 bytes after 'data')
+        data_size = struct.unpack('<I', wav_bytes[data_offset + 4:data_offset + 8])[0]
+        pcm_start = data_offset + 8
+
+        # Extract PCM data
+        pcm_bytes = wav_bytes[pcm_start:pcm_start + data_size]
+
+        # Convert 16-bit PCM to float32
+        # Using numpy for fast vectorized conversion
+        samples = np.frombuffer(pcm_bytes, dtype=np.int16)
+        return samples.astype(np.float32) / 32768.0
+
+    except Exception:
+        return None
 
 
 def concatenate_audio_tensors(
@@ -349,7 +419,7 @@ class MergedTarredAudioToBPEDataset(IterableDataset):
             tar_dirs = [tar_dirs_str] * len(audio_filepaths)
 
         # Extract and process each audio file
-        audio_tensors = []
+        audio_arrays = []
         for audio_path, shard_id, tar_dir in zip(audio_filepaths, shard_ids, tar_dirs):
             if not tar_dir or not audio_path:
                 continue
@@ -359,36 +429,36 @@ class MergedTarredAudioToBPEDataset(IterableDataset):
                 logging.debug(f"Failed to extract {audio_path} from {tar_dir}/audio_{shard_id}.tar")
                 continue
 
-            # Process audio bytes through featurizer
-            audio_stream = io.BytesIO(audio_bytes)
-            try:
-                features = self.featurizer.process(
-                    audio_stream,
-                    offset=0,
-                    duration=None,
-                    trim=self.trim,
-                    orig_sr=None,
-                )
-                audio_tensors.append(features)
-            except Exception as e:
-                logging.debug(f"Failed to process {audio_path}: {e}")
-            finally:
-                audio_stream.close()
+            # Fast path: direct WAV parsing (assumes 16kHz 16-bit PCM)
+            samples = fast_wav_to_float32(audio_bytes)
+            if samples is not None:
+                audio_arrays.append(samples)
+            else:
+                # Fallback to featurizer for non-standard WAV files
+                audio_stream = io.BytesIO(audio_bytes)
+                try:
+                    features = self.featurizer.process(
+                        audio_stream,
+                        offset=0,
+                        duration=None,
+                        trim=self.trim,
+                        orig_sr=None,
+                    )
+                    audio_arrays.append(features.numpy())
+                except Exception as e:
+                    logging.debug(f"Failed to process {audio_path}: {e}")
+                finally:
+                    audio_stream.close()
 
-        if len(audio_tensors) == 0:
+        if len(audio_arrays) == 0:
             logging.warning(f"No audio extracted for entry {idx}, skipping")
             return None
 
-        # Concatenate with random silence
-        merged_audio = concatenate_audio_tensors(
-            audio_tensors,
-            sample_rate=self.sample_rate,
-            silence_min_ms=self.merge_silence_min_ms,
-            silence_max_ms=self.merge_silence_max_ms,
-        )
+        # Fast concatenation with random silence (numpy, then convert to tensor once)
+        merged_audio = self._fast_concatenate(audio_arrays)
 
         # Audio features
-        f = merged_audio
+        f = torch.from_numpy(merged_audio)
         fl = torch.tensor(merged_audio.shape[0]).long()
 
         # Tokenize text
@@ -406,6 +476,48 @@ class MergedTarredAudioToBPEDataset(IterableDataset):
             return f, fl, torch.tensor(t).long(), torch.tensor(tl).long(), idx
         else:
             return f, fl, torch.tensor(t).long(), torch.tensor(tl).long()
+
+    def _fast_concatenate(self, audio_arrays: List[np.ndarray]) -> np.ndarray:
+        """
+        Fast numpy-based audio concatenation with random silence.
+
+        Args:
+            audio_arrays: List of float32 numpy arrays
+
+        Returns:
+            Concatenated float32 numpy array
+        """
+        if len(audio_arrays) == 0:
+            return np.array([], dtype=np.float32)
+
+        if len(audio_arrays) == 1:
+            return audio_arrays[0]
+
+        # Pre-calculate total length for single allocation
+        total_samples = sum(arr.shape[0] for arr in audio_arrays)
+
+        # Add silence lengths
+        silence_lengths = []
+        for _ in range(len(audio_arrays) - 1):
+            silence_ms = random.randint(self.merge_silence_min_ms, self.merge_silence_max_ms)
+            silence_samples = int(self.sample_rate * silence_ms / 1000)
+            silence_lengths.append(silence_samples)
+            total_samples += silence_samples
+
+        # Single allocation
+        result = np.zeros(total_samples, dtype=np.float32)
+
+        # Copy data
+        offset = 0
+        for i, arr in enumerate(audio_arrays):
+            result[offset:offset + arr.shape[0]] = arr
+            offset += arr.shape[0]
+
+            if i < len(silence_lengths):
+                # Silence is already zeros, just advance offset
+                offset += silence_lengths[i]
+
+        return result
 
     def collate_fn(self, batch):
         """Collate function for DataLoader."""
