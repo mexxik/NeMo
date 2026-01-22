@@ -372,64 +372,81 @@ class StreamingMergedTarredAudioToBPEDataset(IterableDataset):
                 'file_id': file_id,
             })
 
-            # When buffer is ready, yield merged samples
-            while len(buffer) >= self.merge_count and buffer.is_ready():
+            # When buffer is ready, yield samples (merged or single depending on duration)
+            while len(buffer) >= 1 and buffer.is_ready():
                 merged_sample = self._create_merged_sample(buffer, sample_idx)
                 if merged_sample is not None:
                     yield merged_sample
                     sample_idx += 1
+                else:
+                    # No more samples can be created
+                    break
 
         # Mark buffer exhausted and drain remaining samples
         buffer.mark_exhausted()
-        while len(buffer) >= self.merge_count:
+        while len(buffer) >= 1:
             merged_sample = self._create_merged_sample(buffer, sample_idx)
             if merged_sample is not None:
                 yield merged_sample
                 sample_idx += 1
-
-        # Handle remaining samples (less than merge_count)
-        # Option 1: yield them as single samples
-        # Option 2: discard them
-        # We'll yield them as smaller merged batches
-        while len(buffer) > 0:
-            count = min(len(buffer), self.merge_count)
-            samples = [buffer.get_random() for _ in range(count)]
-            samples = [s for s in samples if s is not None]
-            if samples:
-                merged = self._merge_samples(samples, sample_idx)
-                if merged is not None:
-                    yield merged
-                    sample_idx += 1
-
-    def _create_merged_sample(self, buffer: ShuffleBuffer, sample_idx: int):
-        """Create a merged sample from buffer."""
-        samples = []
-        total_duration = 0
-
-        # Pick samples that fit within max_merged_duration
-        attempts = 0
-        while len(samples) < self.merge_count and attempts < self.merge_count * 3:
-            attempts += 1
-            sample = buffer.get_random()
-            if sample is None:
+            else:
                 break
 
-            # Check if adding this sample would exceed max duration
-            if self.max_merged_duration is not None:
-                if total_duration + sample['duration'] > self.max_merged_duration:
-                    # Put it back and try another
-                    buffer.add(sample)
-                    continue
+    def _create_merged_sample(self, buffer: ShuffleBuffer, sample_idx: int):
+        """Create a merged sample from buffer.
 
-            samples.append(sample)
-            total_duration += sample['duration']
-
-        if len(samples) < self.merge_count:
-            # Not enough samples, put them back
-            for s in samples:
-                buffer.add(s)
+        New logic: Merge up to merge_count samples as long as total duration
+        stays under max_merged_duration. If even 2 samples would exceed the limit,
+        yield a single sample instead.
+        """
+        # Get first sample
+        first_sample = buffer.get_random()
+        if first_sample is None:
             return None
 
+        samples = [first_sample]
+        total_duration = first_sample['duration']
+
+        # Try to add more samples up to merge_count, respecting max duration
+        while len(samples) < self.merge_count:
+            # Estimate silence duration (use average)
+            avg_silence = (self.merge_silence_min_ms + self.merge_silence_max_ms) / 2 / 1000
+
+            # Check if we have room for another sample
+            # We need at least some minimum duration (say 0.5s) plus silence
+            min_additional = 0.5 + avg_silence
+            if self.max_merged_duration is not None:
+                if total_duration + min_additional > self.max_merged_duration:
+                    # No room for more samples, yield what we have
+                    break
+
+            # Try to find a sample that fits
+            found = False
+            attempts = 0
+            max_attempts = min(len(buffer), 10)  # Don't try too many times
+
+            while attempts < max_attempts:
+                attempts += 1
+                candidate = buffer.get_random()
+                if candidate is None:
+                    break
+
+                # Check if this sample fits
+                candidate_total = total_duration + candidate['duration'] + avg_silence
+                if self.max_merged_duration is None or candidate_total <= self.max_merged_duration:
+                    samples.append(candidate)
+                    total_duration = candidate_total
+                    found = True
+                    break
+                else:
+                    # Doesn't fit, put it back
+                    buffer.add(candidate)
+
+            if not found:
+                # Couldn't find a fitting sample, stop trying
+                break
+
+        # Return whatever we collected (1 or more samples)
         return self._merge_samples(samples, sample_idx)
 
     def _merge_samples(self, samples: List[dict], sample_idx: int):
