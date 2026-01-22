@@ -26,7 +26,7 @@ from omegaconf import DictConfig, OmegaConf, open_dict
 from omegaconf.listconfig import ListConfig
 from torch.utils.data import ChainDataset
 
-from nemo.collections.asr.data import audio_to_text, audio_to_text_dali, audio_to_text_merged
+from nemo.collections.asr.data import audio_to_text, audio_to_text_dali, audio_to_text_merged, audio_to_text_merged_streaming
 from nemo.collections.asr.data.huggingface.hf_audio_to_text_dataset import (
     get_hf_audio_to_text_bpe_dataset,
     get_hf_audio_to_text_char_dataset,
@@ -382,27 +382,56 @@ def get_tarred_dataset(
             # Check if on-the-fly audio merging is enabled
             merge_audio = config.get('merge_audio', False)
             if merge_audio:
-                dataset = audio_to_text_merged.MergedTarredAudioToBPEDataset(
-                    audio_tar_filepaths=tarred_audio_filepath,
-                    manifest_filepath=manifest_filepath,
-                    tokenizer=tokenizer,
-                    sample_rate=config['sample_rate'],
-                    int_values=config.get('int_values', False),
-                    augmentor=augmentor,
-                    shuffle_n=shuffle_n,
-                    max_duration=config.get('max_duration', None),
-                    min_duration=config.get('min_duration', None),
-                    trim=config.get('trim_silence', False),
-                    use_start_end_token=config.get('use_start_end_token', True),
-                    shard_strategy=config.get('tarred_shard_strategy', 'scatter'),
-                    shard_manifests=config.get('shard_manifests', False),
-                    global_rank=global_rank,
-                    world_size=world_size,
-                    return_sample_id=config.get('return_sample_id', False),
-                    merge_audio=True,
-                    merge_silence_min_ms=config.get('merge_silence_min_ms', 200),
-                    merge_silence_max_ms=config.get('merge_silence_max_ms', 1000),
-                )
+                # Use streaming version (WebDataset-based, much faster)
+                # Old version uses random tar access which is slow
+                use_streaming = config.get('merge_streaming', True)  # Default to streaming
+                if use_streaming:
+                    dataset = audio_to_text_merged_streaming.StreamingMergedTarredAudioToBPEDataset(
+                        audio_tar_filepaths=tarred_audio_filepath,
+                        manifest_filepath=manifest_filepath,
+                        tokenizer=tokenizer,
+                        sample_rate=config['sample_rate'],
+                        int_values=config.get('int_values', False),
+                        augmentor=augmentor,
+                        shuffle_n=shuffle_n,
+                        max_duration=config.get('max_duration', None),
+                        min_duration=config.get('min_duration', None),
+                        max_merged_duration=config.get('max_merged_duration', 30.0),
+                        trim=config.get('trim_silence', False),
+                        use_start_end_token=config.get('use_start_end_token', True),
+                        shard_strategy=config.get('tarred_shard_strategy', 'scatter'),
+                        shard_manifests=config.get('shard_manifests', False),
+                        global_rank=global_rank,
+                        world_size=world_size,
+                        return_sample_id=config.get('return_sample_id', False),
+                        merge_count=config.get('merge_count', 2),
+                        merge_buffer_size=config.get('merge_buffer_size', 2000),
+                        merge_silence_min_ms=config.get('merge_silence_min_ms', 200),
+                        merge_silence_max_ms=config.get('merge_silence_max_ms', 1000),
+                    )
+                else:
+                    # Legacy: random tar access (slow, but supports pre-computed merge manifests)
+                    dataset = audio_to_text_merged.MergedTarredAudioToBPEDataset(
+                        audio_tar_filepaths=tarred_audio_filepath,
+                        manifest_filepath=manifest_filepath,
+                        tokenizer=tokenizer,
+                        sample_rate=config['sample_rate'],
+                        int_values=config.get('int_values', False),
+                        augmentor=augmentor,
+                        shuffle_n=shuffle_n,
+                        max_duration=config.get('max_duration', None),
+                        min_duration=config.get('min_duration', None),
+                        trim=config.get('trim_silence', False),
+                        use_start_end_token=config.get('use_start_end_token', True),
+                        shard_strategy=config.get('tarred_shard_strategy', 'scatter'),
+                        shard_manifests=config.get('shard_manifests', False),
+                        global_rank=global_rank,
+                        world_size=world_size,
+                        return_sample_id=config.get('return_sample_id', False),
+                        merge_audio=True,
+                        merge_silence_min_ms=config.get('merge_silence_min_ms', 200),
+                        merge_silence_max_ms=config.get('merge_silence_max_ms', 1000),
+                    )
             else:
                 dataset = audio_to_text.TarredAudioToBPEDataset(
                     audio_tar_filepaths=tarred_audio_filepath,
