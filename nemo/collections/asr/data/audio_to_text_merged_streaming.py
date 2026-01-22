@@ -30,9 +30,8 @@ import torch
 import webdataset as wds
 from torch.utils.data import IterableDataset
 
-from nemo.collections.asr.data.audio_to_text import _speech_collate_fn
+from nemo.collections.asr.data.audio_to_text import _speech_collate_fn, expand_sharded_filepaths
 from nemo.collections.asr.parts.preprocessing.features import WaveformFeaturizer
-from nemo.collections.common.data.utils import expand_sharded_filepaths
 from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, NeuralType
 from nemo.utils import logging
 from nemo.utils.distributed import webdataset_split_by_workers
@@ -351,6 +350,10 @@ class StreamingMergedTarredAudioToBPEDataset(IterableDataset):
             if audio is None:
                 continue
 
+            # Skip samples not in manifest (respects hours limits from prepare_streaming_merge)
+            if file_id not in self.text_mapping:
+                continue
+
             # Apply duration filters
             duration = len(audio) / self.sample_rate
             if self.min_duration is not None and duration < self.min_duration:
@@ -359,7 +362,7 @@ class StreamingMergedTarredAudioToBPEDataset(IterableDataset):
                 continue
 
             # Get text
-            text = self.text_mapping.get(file_id, '')
+            text = self.text_mapping[file_id]
 
             # Add to buffer
             buffer.add({
