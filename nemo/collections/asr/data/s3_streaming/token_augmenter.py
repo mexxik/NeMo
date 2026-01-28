@@ -9,17 +9,32 @@ from typing import Set
 
 # Sentence-ending punctuation by script type
 SENTENCE_ENDINGS: Set[str] = {
-    # Latin/Cyrillic/Hebrew (standard Western punctuation)
+    # Latin/Cyrillic (standard Western punctuation)
+    # Used by: English, French, German, Spanish, Italian, Portuguese, Ukrainian, Vietnamese
     '.', '!', '?',
+
     # Chinese/Japanese full-width punctuation
-    '。',  # Chinese period
-    '！',  # Chinese exclamation
-    '？',  # Chinese question mark
-    # Chinese ellipsis (sometimes used as ending)
-    '…',
+    '。',  # Chinese/Japanese period (句号)
+    '！',  # Chinese/Japanese exclamation (叹号)
+    '？',  # Chinese/Japanese question mark (问号)
+    '…',  # Ellipsis (sometimes used as ending)
+
     # Arabic punctuation
-    '؟',  # Arabic question mark
-    '۔',  # Urdu full stop
+    # Arabic uses Western period (.) but has its own question mark
+    '؟',  # Arabic question mark (؟)
+    '۔',  # Urdu/Arabic full stop (less common)
+    '؛',  # Arabic semicolon (sometimes sentence-final)
+
+    # Hebrew punctuation
+    # Hebrew uses standard Western punctuation: . ! ?
+    # (already covered above)
+
+    # Vietnamese punctuation
+    # Vietnamese uses standard Western punctuation: . ! ?
+    # (already covered above)
+
+    # Korean punctuation (if needed in future)
+    # Korean typically uses Western punctuation or full-width versions
 }
 
 

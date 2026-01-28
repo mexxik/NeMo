@@ -2,22 +2,226 @@
 Sample filtering for S3 streaming dataset.
 
 Provides configurable filters for duration, character rate, and text quality.
+Matches the filtering logic from 01_gather.py for consistency.
 """
 
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Set
 
 from nemo.utils import logging
+
+
+# Allowed characters per language
+# These are the characters that should appear in clean transcriptions
+ALLOWED_CHARS: Dict[str, Set[str]] = {
+    'en': set(
+        'abcdefghijklmnopqrstuvwxyz'
+        'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+        '0123456789'
+        " '"  # space and apostrophe
+        '.,!?;:-'  # punctuation
+    ),
+    'fr': set(
+        'abcdefghijklmnopqrstuvwxyz'
+        'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+        'àâäéèêëïîôùûüÿçœæ'
+        'ÀÂÄÉÈÊËÏÎÔÙÛÜŸÇŒÆ'
+        '0123456789'
+        " '"  # space and apostrophe
+        '.,!?;:-«»'  # punctuation including French quotes
+    ),
+    'de': set(
+        'abcdefghijklmnopqrstuvwxyz'
+        'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+        'äöüß'
+        'ÄÖÜ'
+        '0123456789'
+        " '"  # space and apostrophe
+        '.,!?;:-„"'  # punctuation including German quotes
+    ),
+    'es': set(
+        'abcdefghijklmnopqrstuvwxyz'
+        'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+        'áéíóúüñ'
+        'ÁÉÍÓÚÜÑ'
+        '0123456789'
+        " '"  # space and apostrophe
+        '.,!?;:-¿¡«»'  # punctuation including Spanish marks
+    ),
+    'it': set(
+        'abcdefghijklmnopqrstuvwxyz'
+        'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+        'àèéìíîòóùú'
+        'ÀÈÉÌÍÎÒÓÙÚ'
+        '0123456789'
+        " '"  # space and apostrophe
+        '.,!?;:-«»'  # punctuation
+    ),
+    'pt': set(
+        'abcdefghijklmnopqrstuvwxyz'
+        'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+        'àáâãçéêíóôõú'
+        'ÀÁÂÃÇÉÊÍÓÔÕÚ'
+        '0123456789'
+        " '"  # space and apostrophe
+        '.,!?;:-«»'  # punctuation
+    ),
+    'uk': set(
+        'абвгґдеєжзиіїйклмнопрстуфхцчшщьюя'
+        'АБВГҐДЕЄЖЗИІЇЙКЛМНОПРСТУФХЦЧШЩЬЮЯ'
+        '0123456789'
+        " '"  # space and apostrophe
+        '.,!?;:-«»—'  # punctuation including Ukrainian quotes and dash
+    ),
+    'vi': set(
+        # Vietnamese uses Latin script with many diacritics
+        'abcdefghijklmnopqrstuvwxyz'
+        'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+        # Vietnamese-specific letters with diacritics
+        'àáảãạăằắẳẵặâầấẩẫậ'
+        'ÀÁẢÃẠĂẰẮẲẴẶÂẦẤẨẪẬ'
+        'èéẻẽẹêềếểễệ'
+        'ÈÉẺẼẸÊỀẾỂỄỆ'
+        'ìíỉĩị'
+        'ÌÍỈĨỊ'
+        'òóỏõọôồốổỗộơờớởỡợ'
+        'ÒÓỎÕỌÔỒỐỔỖỘƠỜỚỞỠỢ'
+        'ùúủũụưừứửữự'
+        'ÙÚỦŨỤƯỪỨỬỮỰ'
+        'ỳýỷỹỵ'
+        'ỲÝỶỸỴ'
+        'đĐ'
+        '0123456789'
+        " '"  # space and apostrophe
+        '.,!?;:-'  # punctuation
+    ),
+    # Languages with non-Latin scripts or very large character sets
+    # skip character validation - rely on is_valid_text() for garbage detection
+    'zh': set(),  # Chinese - thousands of characters
+    'ar': set(),  # Arabic script
+    'he': set(),  # Hebrew script
+    'ja': set(),  # Japanese (Kanji + Hiragana + Katakana)
+    'ko': set(),  # Korean (Hangul)
+}
+
+
+def get_allowed_chars(languages: List[str]) -> Set[str]:
+    """Get combined allowed characters for specified languages."""
+    allowed = set()
+    for lang in languages:
+        if lang in ALLOWED_CHARS:
+            allowed.update(ALLOWED_CHARS[lang])
+        else:
+            # For unknown languages, allow basic Latin + digits + punctuation
+            allowed.update(ALLOWED_CHARS.get('en', set()))
+    return allowed
+
+
+def has_valid_chars(text: str, allowed_chars: Set[str]) -> bool:
+    """
+    Check if text contains only allowed characters.
+
+    Rejects any sample with even a single unsupported character.
+    This ensures a clean vocabulary for the tokenizer.
+
+    Args:
+        text: Text to check
+        allowed_chars: Set of allowed characters
+
+    Returns:
+        True if ALL characters are valid, False otherwise
+    """
+    if not text:
+        return False
+
+    # Skip character validation if allowed_chars is empty (e.g., for Chinese)
+    if not allowed_chars:
+        return True
+
+    for c in text:
+        if c not in allowed_chars:
+            return False
+    return True
+
+
+def is_valid_text(text: str) -> bool:
+    """
+    Check if text is valid (not corrupted).
+
+    Filters out samples with:
+    - Too many non-alphanumeric characters
+    - HTML entities (&lt;, &gt;, &amp;)
+    - Too many special characters in short text
+    - JSON/code garbage from YouTube metadata
+    - Repeating character patterns
+    - Music-only tags
+    """
+    if not text or len(text.strip()) == 0:
+        return False
+
+    text_stripped = text.strip()
+
+    # Filter out music-only tags
+    if text_stripped in ['[Music]', '[Musique]', '[Música]', '[Musik]', '[音乐]']:
+        return False
+
+    # Filter out JSON/code garbage (YouTube metadata leaks)
+    garbage_markers = [
+        'codecs=', 'bitrate', '.NET CLR', 'ytcfg', 'https://', 'http://',
+        'indexRange', 'initRange', 'contentLength', 'clickTrackingParams',
+        'navigationEndpoint', 'thumbnailRenderer', 'clientName', 'clientVersion',
+    ]
+    if any(marker in text for marker in garbage_markers):
+        return False
+
+    # Filter out text with too many JSON-like characters
+    json_chars = text.count('{') + text.count('}') + text.count('[') + text.count(']')
+    if json_chars > 3:
+        return False
+
+    # Filter out repeating character patterns (e.g., "AAAAAAA", "0000000", "fffff")
+    if len(text) > 20:
+        # Check if first 10 chars repeat multiple times
+        pattern = text[:10]
+        if text.count(pattern) >= 3:
+            return False
+        # Check for single character repetition
+        for char in set(text[:20]):
+            if text.count(char * 10) > 0:
+                return False
+
+    # Count alphanumeric vs special characters
+    alpha_count = sum(c.isalnum() or c.isspace() for c in text)
+    total_count = len(text)
+
+    # If less than 50% alphanumeric, likely corrupted
+    if total_count > 0 and alpha_count / total_count < 0.5:
+        return False
+
+    # Check for HTML entities
+    if any(entity in text for entity in ['&lt;', '&gt;', '&amp;', '&quot;']):
+        return False
+
+    # Check for excessive special characters in sequence
+    special_chars = sum(not c.isalnum() and not c.isspace() for c in text)
+    if total_count > 0 and special_chars / total_count > 0.3:
+        return False
+
+    return True
 
 
 @dataclass
 class FilterConfig:
     """Configuration for sample filtering."""
     min_duration: float = 0.5
-    max_duration: float = 15.0
-    max_chars_per_sec: float = 25.0
+    max_duration: float = 30.0
+    min_chars_per_sec: float = 3.0  # Only applied for duration > 2s
+    max_chars_per_sec: float = 40.0
     min_chars: int = 1
-    max_chars: Optional[int] = None
+    max_chars: int = 500
+    validate_text: bool = True  # Enable is_valid_text() check
+    validate_chars: bool = True  # Enable has_valid_chars() check
+    languages: List[str] = field(default_factory=lambda: ['en'])
 
 
 class SampleFilter:
@@ -26,20 +230,27 @@ class SampleFilter:
 
     Filters:
     - Duration bounds (min/max)
-    - Character rate (chars per second)
+    - Character rate (chars per second, min and max)
     - Text length bounds
+    - Text validity (garbage detection)
+    - Character validity (per-language allowed characters)
     """
 
     def __init__(self, config: FilterConfig):
         self.config = config
+        self._allowed_chars = get_allowed_chars(config.languages) if config.validate_chars else set()
         self._stats = {
             'total': 0,
             'passed': 0,
             'rejected_min_duration': 0,
             'rejected_max_duration': 0,
-            'rejected_char_rate': 0,
+            'rejected_min_char_rate': 0,
+            'rejected_max_char_rate': 0,
+            'rejected_min_required_duration': 0,
             'rejected_min_chars': 0,
             'rejected_max_chars': 0,
+            'rejected_invalid_text': 0,
+            'rejected_invalid_chars': 0,
         }
 
     def __call__(self, sample: dict) -> bool:
@@ -66,19 +277,49 @@ class SampleFilter:
             self._stats['rejected_max_duration'] += 1
             return False
 
-        # Character rate filter (prevents RNN-T loss issues)
-        if duration > 0 and len(text) / duration > self.config.max_chars_per_sec:
-            self._stats['rejected_char_rate'] += 1
-            return False
-
         # Text length filters
-        if len(text) < self.config.min_chars:
+        text_len = len(text.strip())
+        if text_len < self.config.min_chars:
             self._stats['rejected_min_chars'] += 1
             return False
 
-        if self.config.max_chars is not None and len(text) > self.config.max_chars:
+        if text_len > self.config.max_chars:
             self._stats['rejected_max_chars'] += 1
             return False
+
+        # Text validity check (garbage detection)
+        if self.config.validate_text and not is_valid_text(text):
+            self._stats['rejected_invalid_text'] += 1
+            return False
+
+        # Character validity check (per-language)
+        if self.config.validate_chars and self._allowed_chars:
+            if not has_valid_chars(text, self._allowed_chars):
+                self._stats['rejected_invalid_chars'] += 1
+                return False
+
+        # Character rate filters
+        if duration > 0:
+            chars_per_sec = len(text) / duration
+
+            # Too fast - likely misaligned or garbage
+            if chars_per_sec > self.config.max_chars_per_sec:
+                self._stats['rejected_max_char_rate'] += 1
+                return False
+
+            # Too slow - only apply for longer durations (> 2s)
+            # This allows short utterances like "Yes" or "No"
+            if duration > 2.0 and chars_per_sec < self.config.min_chars_per_sec:
+                self._stats['rejected_min_char_rate'] += 1
+                return False
+
+            # Check if audio is impossibly short for the text
+            # Assume max possible speech rate ~50 chars/sec (very fast)
+            # If audio < text_len * 0.02, it's physically impossible
+            min_required_duration = text_len * 0.02
+            if duration < min_required_duration:
+                self._stats['rejected_min_required_duration'] += 1
+                return False
 
         self._stats['passed'] += 1
         return True
@@ -99,6 +340,10 @@ class SampleFilter:
         logging.info(f"Filter stats: {passed}/{total} passed ({pass_rate:.1f}%)")
         logging.info(f"  Rejected min_duration: {self._stats['rejected_min_duration']}")
         logging.info(f"  Rejected max_duration: {self._stats['rejected_max_duration']}")
-        logging.info(f"  Rejected char_rate: {self._stats['rejected_char_rate']}")
+        logging.info(f"  Rejected min_char_rate: {self._stats['rejected_min_char_rate']}")
+        logging.info(f"  Rejected max_char_rate: {self._stats['rejected_max_char_rate']}")
+        logging.info(f"  Rejected min_required_duration: {self._stats['rejected_min_required_duration']}")
         logging.info(f"  Rejected min_chars: {self._stats['rejected_min_chars']}")
         logging.info(f"  Rejected max_chars: {self._stats['rejected_max_chars']}")
+        logging.info(f"  Rejected invalid_text: {self._stats['rejected_invalid_text']}")
+        logging.info(f"  Rejected invalid_chars: {self._stats['rejected_invalid_chars']}")

@@ -186,11 +186,17 @@ class S3MultiLangStreamingDataset(IterableDataset):
             client_kwargs['endpoint_url'] = s3_endpoint_url
         self.s3_client = boto3.client('s3', **client_kwargs)
 
-        # Create filter
+        # Create filter with all the same filters as 01_gather.py
         filter_config = FilterConfig(
             min_duration=min_duration,
             max_duration=max_duration,
+            min_chars_per_sec=3.0,  # Only applied for duration > 2s
             max_chars_per_sec=max_chars_per_sec,
+            min_chars=1,
+            max_chars=500,
+            validate_text=True,  # Garbage/corrupted text detection
+            validate_chars=True,  # Per-language character validation
+            languages=list(language_sources.keys()),  # Languages for char validation
         )
         self.sample_filter = SampleFilter(filter_config)
 
