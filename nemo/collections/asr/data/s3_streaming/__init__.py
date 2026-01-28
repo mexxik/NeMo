@@ -5,6 +5,7 @@ This package provides components for streaming audio data directly from S3
 with round-robin language sampling and on-the-fly token augmentation.
 """
 
+from .audio_merger import AudioMerger, MergeBuffer, MergeConfig
 from .dataset import S3MultiLangStreamingDataset
 from .filters import (
     ALLOWED_CHARS,
@@ -21,6 +22,9 @@ from .token_augmenter import SENTENCE_ENDINGS, TokenAugmenter
 
 __all__ = [
     'S3MultiLangStreamingDataset',
+    'AudioMerger',
+    'MergeBuffer',
+    'MergeConfig',
     'ALLOWED_CHARS',
     'FilterConfig',
     'SampleFilter',

@@ -16,9 +16,11 @@ from nemo.collections.asr.data.audio_to_text import _speech_collate_fn
 from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, NeuralType
 from nemo.utils import logging
 
+from .audio_merger import AudioMerger, MergeBuffer, MergeConfig
 from .filters import FilterConfig, SampleFilter
 from .lang_source_manager import LanguageSourceManager
 from .round_robin import RoundRobinInterleaver
+from .s3_tar_stream import S3ManifestLoader
 from .token_augmenter import TokenAugmenter
 
 try:
@@ -128,8 +130,18 @@ class S3MultiLangStreamingDataset(IterableDataset):
         # BPE options
         use_start_end_token: bool = True,
 
+        # Audio merging (for multi-utterance training with silence gaps)
+        merge_utterances: bool = False,
+        merge_probability: float = 0.3,
+        merge_min_utterances: int = 2,
+        merge_max_utterances: int = 3,
+        merge_silence_min: float = 0.5,
+        merge_silence_max: float = 1.5,
+        merge_max_duration: float = 30.0,
+
         # Other
         return_sample_id: bool = False,
+        samples_per_epoch: int = None,  # Override automatic length calculation
     ):
         """
         Initialize S3 multi-language streaming dataset.
@@ -254,13 +266,73 @@ class S3MultiLangStreamingDataset(IterableDataset):
         # Language managers will be created lazily per worker
         self._interleaver: Optional[RoundRobinInterleaver] = None
 
+        # Audio merger for multi-utterance training
+        self.merge_config = MergeConfig(
+            enabled=merge_utterances,
+            merge_probability=merge_probability,
+            min_utterances=merge_min_utterances,
+            max_utterances=merge_max_utterances,
+            silence_min_sec=merge_silence_min,
+            silence_max_sec=merge_silence_max,
+            max_merged_duration=merge_max_duration,
+        )
+        self.audio_merger = AudioMerger(self.merge_config, sample_rate=sample_rate)
+
+        # Store samples_per_epoch for __len__
+        # If not provided, auto-calculate from manifest counts
+        if samples_per_epoch is not None:
+            self.samples_per_epoch = samples_per_epoch
+            logging.info(f"Using provided samples_per_epoch: {samples_per_epoch}")
+        else:
+            self.samples_per_epoch = self._calculate_total_samples()
+            if self.samples_per_epoch > 0:
+                logging.info(f"Auto-calculated samples_per_epoch from manifests: {self.samples_per_epoch}")
+            else:
+                # Fallback to default estimate if manifest loading failed
+                total_sources = sum(len(sources) for sources in language_sources.values())
+                self.samples_per_epoch = total_sources * 100000
+                logging.warning(
+                    f"Could not load manifests for counting, using estimate: {self.samples_per_epoch}"
+                )
+
         endpoint_info = s3_endpoint_url or "AWS S3"
         logging.info(
             f"S3MultiLangStreamingDataset: bucket={s3_bucket}, "
             f"endpoint={endpoint_info}, "
             f"languages={list(language_sources.keys())}, "
-            f"add_eou={add_eou_token}"
+            f"add_eou={add_eou_token}, "
+            f"merge_utterances={merge_utterances}"
         )
+
+    def _calculate_total_samples(self) -> int:
+        """
+        Calculate total samples by counting manifest entries.
+
+        This loads each manifest once to get the accurate count.
+        The manifests will be loaded again by workers during iteration,
+        but this gives us the correct epoch length upfront.
+
+        Returns:
+            Total number of samples across all language sources
+        """
+        manifest_loader = S3ManifestLoader(s3_client=self.s3_client)
+        total = 0
+
+        for lang, sources in self.language_sources.items():
+            for source in sources:
+                source_prefix = f"{self.s3_prefix.rstrip('/') + '/' if self.s3_prefix else ''}{source}/"
+                manifest_key = f"{source_prefix}tarred_audio_manifest.json"
+
+                try:
+                    count = manifest_loader.count_manifest_entries(
+                        self.s3_bucket, manifest_key
+                    )
+                    total += count
+                    logging.info(f"[{lang}] {source}: {count} manifest entries")
+                except Exception as e:
+                    logging.warning(f"[{lang}] Failed to count manifest for {source}: {e}")
+
+        return total
 
     def _create_interleaver(self) -> RoundRobinInterleaver:
         """Create language managers and interleaver (called once per worker)."""
@@ -304,7 +376,28 @@ class S3MultiLangStreamingDataset(IterableDataset):
         # Shuffle buffer
         shuffle_buffer = ShuffleBuffer(buffer_size=self.shuffle_buffer_size)
 
+        # Merge buffer for multi-utterance merging
+        merge_buffer = MergeBuffer(self.audio_merger, self.merge_config)
+
         sample_idx = 0
+
+        def process_and_yield(sample):
+            """Process sample through merge buffer and yield results."""
+            nonlocal sample_idx
+
+            # Try to add to merge buffer - may return merged sample, single sample, or None
+            result_sample = merge_buffer.add(sample)
+            if result_sample is not None:
+                result = self._process_sample(result_sample, sample_idx)
+                if result is not None:
+                    sample_idx += 1
+
+                    # Log merge stats periodically
+                    if sample_idx % 10000 == 0 and self.merge_config.enabled:
+                        self.audio_merger.log_stats()
+
+                    return result
+            return None
 
         # Stream samples through interleaver and shuffle buffer
         for sample in interleaver:
@@ -314,14 +407,19 @@ class S3MultiLangStreamingDataset(IterableDataset):
             while shuffle_buffer.is_ready():
                 buffered_sample = shuffle_buffer.get_random()
                 if buffered_sample is not None:
-                    result = self._process_sample(buffered_sample, sample_idx)
+                    result = process_and_yield(buffered_sample)
                     if result is not None:
                         yield result
-                        sample_idx += 1
 
-        # Drain remaining samples from buffer
+        # Drain remaining samples from shuffle buffer
         for buffered_sample in shuffle_buffer.drain():
-            result = self._process_sample(buffered_sample, sample_idx)
+            result = process_and_yield(buffered_sample)
+            if result is not None:
+                yield result
+
+        # Drain remaining samples from merge buffer
+        for remaining_sample in merge_buffer.drain():
+            result = self._process_sample(remaining_sample, sample_idx)
             if result is not None:
                 yield result
                 sample_idx += 1
@@ -330,15 +428,17 @@ class S3MultiLangStreamingDataset(IterableDataset):
         """
         Process a sample into training tensors.
 
+        Handles both regular samples and merged multi-utterance samples.
+
         Args:
             sample: Dict with 'audio' (np.array) and 'text' (str)
+                   For merged samples, also has 'original_texts' and 'eou_positions'
             sample_idx: Sample index
 
         Returns:
             Tuple of tensors or None if processing failed
         """
         audio = sample.get('audio')
-        text = sample.get('text', '')
 
         if audio is None:
             return None
@@ -351,27 +451,38 @@ class S3MultiLangStreamingDataset(IterableDataset):
 
         audio_len = torch.tensor(audio_tensor.shape[0]).long()
 
-        # Check if we should add EOU token (based on sentence-ending punctuation)
-        should_add_eou = (
-            self.add_eou_token
-            and self.eou_token_id is not None
-            and self.token_augmenter.should_add_eou(text)
-        )
+        # Check if this is a merged sample
+        original_texts = sample.get('original_texts')
+        eou_positions = sample.get('eou_positions', [])
 
-        # Tokenize text (without <eou> - we'll append the ID directly)
-        tokens = self.tokenizer.text_to_ids(text)
+        if original_texts is not None:
+            # Merged sample: tokenize each segment and add EOU where appropriate
+            tokens = self._tokenize_merged(original_texts, eou_positions)
+        else:
+            # Regular sample
+            text = sample.get('text', '')
 
-        # Add BOS token if configured
-        if self.bos_id is not None:
-            tokens = [self.bos_id] + tokens
+            # Check if we should add EOU token (based on sentence-ending punctuation)
+            should_add_eou = (
+                self.add_eou_token
+                and self.eou_token_id is not None
+                and self.token_augmenter.should_add_eou(text)
+            )
 
-        # Add EOU token ID directly (before EOS, after text)
-        if should_add_eou:
-            tokens = tokens + [self.eou_token_id]
+            # Tokenize text (without <eou> - we'll append the ID directly)
+            tokens = self.tokenizer.text_to_ids(text)
 
-        # Add EOS token if configured
-        if self.eos_id is not None:
-            tokens = tokens + [self.eos_id]
+            # Add BOS token if configured
+            if self.bos_id is not None:
+                tokens = [self.bos_id] + tokens
+
+            # Add EOU token ID directly (before EOS, after text)
+            if should_add_eou:
+                tokens = tokens + [self.eou_token_id]
+
+            # Add EOS token if configured
+            if self.eos_id is not None:
+                tokens = tokens + [self.eos_id]
 
         tokens_tensor = torch.tensor(tokens).long()
         tokens_len = torch.tensor(len(tokens)).long()
@@ -381,19 +492,52 @@ class S3MultiLangStreamingDataset(IterableDataset):
         else:
             return audio_tensor, audio_len, tokens_tensor, tokens_len
 
+    def _tokenize_merged(self, texts: List[str], eou_positions: List[int]) -> List[int]:
+        """
+        Tokenize merged multi-utterance sample.
+
+        Args:
+            texts: List of text segments
+            eou_positions: Indices of segments that should have EOU appended
+
+        Returns:
+            Combined token list with EOU tokens inserted appropriately
+        """
+        tokens = []
+
+        # Add BOS token if configured (only at the very beginning)
+        if self.bos_id is not None:
+            tokens.append(self.bos_id)
+
+        for i, text in enumerate(texts):
+            # Tokenize this segment
+            segment_tokens = self.tokenizer.text_to_ids(text)
+            tokens.extend(segment_tokens)
+
+            # Add EOU after this segment if it's in eou_positions
+            if self.add_eou_token and self.eou_token_id is not None and i in eou_positions:
+                tokens.append(self.eou_token_id)
+
+        # Add EOS token if configured (only at the very end)
+        if self.eos_id is not None:
+            tokens.append(self.eos_id)
+
+        return tokens
+
     def collate_fn(self, batch):
         """Collate function for DataLoader."""
         return _speech_collate_fn(batch, pad_id=0)
 
     def __len__(self):
         """
-        Approximate dataset length.
+        Dataset length for epoch calculation.
 
-        Since we're streaming, this is an estimate based on typical shard sizes.
+        Returns samples_per_epoch, which is either:
+        - Explicitly provided by user
+        - Auto-calculated from manifest entry counts
+        - Fallback estimate if manifest loading failed
         """
-        # Rough estimate: assume 1000 samples per source
-        total_sources = sum(len(sources) for sources in self.language_sources.values())
-        return total_sources * 1000
+        return self.samples_per_epoch
 
     @property
     def output_types(self):

@@ -193,3 +193,10 @@ class LanguageSourceManager:
     def epoch(self) -> int:
         """Current epoch number."""
         return self._epoch
+
+    @property
+    def total_samples(self) -> int:
+        """Get total number of manifest entries across all sources."""
+        if not self._initialized:
+            self._initialize()
+        return sum(len(m) for m in self._manifests_by_source.values())

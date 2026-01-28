@@ -263,6 +263,34 @@ class S3ManifestLoader:
         logging.info(f"Loaded {len(entries)} manifest entries")
         return entries
 
+    def count_manifest_entries(
+        self,
+        s3_bucket: str,
+        manifest_key: str,
+    ) -> int:
+        """
+        Count entries in a manifest file without full parsing.
+
+        This is faster than load_manifest() when you only need the count.
+
+        Args:
+            s3_bucket: S3 bucket name
+            manifest_key: Key (path) to manifest file
+
+        Returns:
+            Number of entries (non-empty lines) in the manifest
+        """
+        try:
+            response = self.s3_client.get_object(Bucket=s3_bucket, Key=manifest_key)
+            content = response['Body'].read().decode('utf-8')
+
+            # Count non-empty lines
+            count = sum(1 for line in content.strip().split('\n') if line.strip())
+            return count
+        except Exception as e:
+            logging.warning(f"Failed to count entries in s3://{s3_bucket}/{manifest_key}: {e}")
+            return 0
+
     def list_tar_files(self, s3_bucket: str, prefix: str) -> list:
         """
         List TAR files in an S3 prefix.
