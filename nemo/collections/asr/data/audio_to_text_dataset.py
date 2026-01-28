@@ -27,6 +27,7 @@ from omegaconf.listconfig import ListConfig
 from torch.utils.data import ChainDataset
 
 from nemo.collections.asr.data import audio_to_text, audio_to_text_dali, audio_to_text_merged, audio_to_text_merged_streaming
+from nemo.collections.asr.data import s3_streaming
 from nemo.collections.asr.data.huggingface.hf_audio_to_text_dataset import (
     get_hf_audio_to_text_bpe_dataset,
     get_hf_audio_to_text_char_dataset,
@@ -792,6 +793,30 @@ def get_audio_to_text_bpe_dataset_from_config(
         return get_hf_audio_to_text_bpe_dataset(
             config=config, global_rank=global_rank, world_size=world_size, tokenizer=tokenizer, augmentor=augmentor
         )
+
+    # S3 Multi-Language Streaming Dataset
+    if config.get('dataset_type') == 's3_multilang_streaming':
+        logging.info("Using S3 Multi-Language Streaming Dataset")
+        dataset = s3_streaming.S3MultiLangStreamingDataset(
+            s3_bucket=config['s3_bucket'],
+            s3_prefix=config.get('s3_prefix', ''),
+            s3_endpoint_url=config.get('s3_endpoint_url', None),
+            aws_region=config.get('aws_region', 'us-east-1'),
+            language_sources=OmegaConf.to_container(config['language_sources']),
+            tokenizer=tokenizer,
+            sample_rate=config.get('sample_rate', 16000),
+            min_duration=config.get('min_duration', 0.5),
+            max_duration=config.get('max_duration', 15.0),
+            max_chars_per_sec=config.get('max_chars_per_sec', 25.0),
+            add_eou_token=config.get('add_eou_token', True),
+            eou_token=config.get('eou_token', '<eou>'),
+            shuffle_buffer_size=config.get('shuffle_buffer_size', 2000),
+            global_rank=global_rank,
+            world_size=world_size,
+            use_start_end_token=config.get('use_start_end_token', True),
+            return_sample_id=config.get('return_sample_id', False),
+        )
+        return dataset
 
     is_concat = config.get('is_concat', False)
     if is_concat:
