@@ -210,13 +210,6 @@ class AudioMerger:
 
         self._stats['merged'] += 1
 
-        # Log progress periodically
-        if self._stats['merged'] % 1000 == 0:
-            logging.info(
-                f"AudioMerger: {self._stats['merged']} samples merged "
-                f"({len(samples)} utterances, {total_duration:.1f}s)"
-            )
-
         return {
             'audio': merged_audio,
             'text': '|'.join(merged_texts),  # Use | as segment separator
