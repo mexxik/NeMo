@@ -9,6 +9,7 @@ from typing import Dict, Iterator, List, Optional
 from nemo.utils import logging
 
 from .filters import FilterConfig, SampleFilter
+from .prefetch_buffer import PrefetchBuffer
 from .s3_tar_stream import S3ManifestLoader, S3TarStream
 from .token_augmenter import TokenAugmenter
 
@@ -23,6 +24,7 @@ class LanguageSourceManager:
     - Automatic rotation when a TAR/source is exhausted
     - Applies filters and token augmentation
     - Epoch tracking
+    - Optional prefetching for reduced I/O latency
     """
 
     def __init__(
@@ -34,6 +36,7 @@ class LanguageSourceManager:
         s3_client,
         sample_filter: SampleFilter,
         token_augmenter: TokenAugmenter,
+        prefetch_buffer_size: int = 100,
     ):
         """
         Initialize language source manager.
@@ -46,6 +49,7 @@ class LanguageSourceManager:
             s3_client: Boto3 S3 client
             sample_filter: Filter for duration/char rate
             token_augmenter: Augmenter for adding <eou> tokens
+            prefetch_buffer_size: Number of samples to prefetch (0 to disable)
         """
         self.lang = lang
         self.s3_bucket = s3_bucket
@@ -54,6 +58,7 @@ class LanguageSourceManager:
         self.s3_client = s3_client
         self.sample_filter = sample_filter
         self.token_augmenter = token_augmenter
+        self.prefetch_buffer_size = prefetch_buffer_size
 
         self.manifest_loader = S3ManifestLoader(s3_client=s3_client)
 
@@ -66,6 +71,10 @@ class LanguageSourceManager:
         self._epoch = 0
         self._exhausted = False
         self._initialized = False
+
+        # Prefetch buffer (created on first use)
+        self._prefetch_buffer: Optional[PrefetchBuffer] = None
+        self._prefetch_iter: Optional[Iterator] = None
 
     def _initialize(self):
         """Load manifests and discover TAR files for all sources."""
@@ -141,13 +150,66 @@ class LanguageSourceManager:
         # All sources exhausted for this epoch
         return False
 
+    def _generate_samples(self) -> Iterator[dict]:
+        """
+        Generator that yields samples from all sources.
+
+        This is used as the source factory for the prefetch buffer.
+        """
+        if not self._initialized:
+            self._initialize()
+
+        while True:
+            if self._current_stream is None:
+                if not self._advance_to_next_stream():
+                    # All sources exhausted
+                    self._exhausted = True
+                    return
+
+            try:
+                sample = next(self._current_stream)
+
+                # Apply filter
+                if not self.sample_filter(sample):
+                    continue
+
+                # Apply token augmentation
+                sample = self.token_augmenter(sample)
+
+                yield sample
+
+            except StopIteration:
+                # Current stream exhausted, try next
+                self._current_stream = None
+                continue
+
     def get_next_sample(self) -> Optional[dict]:
         """
         Get next valid sample from this language's sources.
 
+        Uses prefetch buffer if enabled for reduced I/O latency.
+
         Returns:
             Sample dict or None if all sources exhausted
         """
+        # Use prefetch buffer if enabled
+        if self.prefetch_buffer_size > 0:
+            # Initialize prefetch buffer on first call
+            if self._prefetch_buffer is None:
+                self._prefetch_buffer = PrefetchBuffer(
+                    source_factory=self._generate_samples,
+                    buffer_size=self.prefetch_buffer_size,
+                    name=f"lang-{self.lang}",
+                )
+                self._prefetch_iter = iter(self._prefetch_buffer)
+
+            try:
+                return next(self._prefetch_iter)
+            except StopIteration:
+                self._exhausted = True
+                return None
+
+        # Non-prefetch path (original behavior)
         if not self._initialized:
             self._initialize()
 
@@ -177,6 +239,12 @@ class LanguageSourceManager:
 
     def reset(self):
         """Reset to beginning of all sources for new epoch."""
+        # Stop prefetch buffer if running
+        if self._prefetch_buffer is not None:
+            self._prefetch_buffer.stop()
+            self._prefetch_buffer = None
+            self._prefetch_iter = None
+
         self._current_source_idx = 0
         self._current_tar_idx = 0
         self._current_stream = None
@@ -200,3 +268,14 @@ class LanguageSourceManager:
         if not self._initialized:
             self._initialize()
         return sum(len(m) for m in self._manifests_by_source.values())
+
+    def stop(self):
+        """Stop prefetch buffer and cleanup resources."""
+        if self._prefetch_buffer is not None:
+            self._prefetch_buffer.stop()
+            self._prefetch_buffer = None
+            self._prefetch_iter = None
+
+    def __del__(self):
+        """Cleanup on deletion."""
+        self.stop()
