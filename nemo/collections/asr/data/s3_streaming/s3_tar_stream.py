@@ -9,6 +9,7 @@ import io
 import json
 import struct
 import tarfile
+import time
 from typing import Dict, Iterator, Optional
 
 import numpy as np
@@ -119,57 +120,85 @@ class S3TarStream:
             Dict with keys: audio (np.array), text (str), duration (float), lang (str), filename (str)
         """
         self._exhausted = False
+        processed_files = set()  # Track files we've already yielded
 
-        try:
-            # Get the TAR file as a streaming response
-            response = self.s3_client.get_object(Bucket=self.s3_bucket, Key=self.tar_key)
-            body = response['Body']
+        for attempt in range(self.max_retries):
+            try:
+                # Get the TAR file as a streaming response
+                response = self.s3_client.get_object(Bucket=self.s3_bucket, Key=self.tar_key)
+                body = response['Body']
 
-            # Wrap in a file-like object for tarfile
-            tar_stream = S3StreamWrapper(body)
+                # Wrap in a file-like object for tarfile
+                tar_stream = S3StreamWrapper(body)
 
-            # Open as tarfile in streaming mode
-            with tarfile.open(fileobj=tar_stream, mode='r|*') as tar:
-                for member in tar:
-                    if not member.isfile():
-                        continue
-
-                    filename = member.name
-
-                    # Check if this file is in our manifest
-                    if filename not in self.manifest_entries:
-                        # Skip files not in manifest (filtered out)
-                        continue
-
-                    # Extract audio bytes
-                    try:
-                        audio_file = tar.extractfile(member)
-                        if audio_file is None:
+                # Open as tarfile in streaming mode
+                with tarfile.open(fileobj=tar_stream, mode='r|*') as tar:
+                    for member in tar:
+                        if not member.isfile():
                             continue
-                        audio_bytes = audio_file.read()
-                    except Exception as e:
-                        logging.warning(f"Failed to extract {filename}: {e}")
-                        continue
 
-                    # Parse WAV to float32
-                    audio = fast_wav_to_float32(audio_bytes)
-                    if audio is None:
-                        logging.debug(f"Failed to parse WAV: {filename}")
-                        continue
+                        filename = member.name
 
-                    # Get manifest entry
-                    entry = self.manifest_entries[filename]
+                        # Skip already processed files (from previous retry)
+                        if filename in processed_files:
+                            continue
 
-                    yield {
-                        'audio': audio,
-                        'text': entry.get('text', ''),
-                        'duration': entry.get('duration', len(audio) / 16000),
-                        'lang': entry.get('lang', 'unknown'),
-                        'filename': filename,
-                    }
+                        # Check if this file is in our manifest
+                        if filename not in self.manifest_entries:
+                            # Skip files not in manifest (filtered out)
+                            continue
 
-        except Exception as e:
-            logging.error(f"Error streaming TAR from s3://{self.s3_bucket}/{self.tar_key}: {e}")
+                        # Extract audio bytes
+                        try:
+                            audio_file = tar.extractfile(member)
+                            if audio_file is None:
+                                continue
+                            audio_bytes = audio_file.read()
+                        except Exception as e:
+                            # Connection error during extraction - raise to trigger retry
+                            if 'IncompleteRead' in str(e) or 'Connection' in str(e):
+                                raise
+                            logging.warning(f"Failed to extract {filename}: {e}")
+                            continue
+
+                        # Parse WAV to float32
+                        audio = fast_wav_to_float32(audio_bytes)
+                        if audio is None:
+                            logging.debug(f"Failed to parse WAV: {filename}")
+                            continue
+
+                        # Get manifest entry
+                        entry = self.manifest_entries[filename]
+
+                        # Mark as processed before yielding
+                        processed_files.add(filename)
+
+                        yield {
+                            'audio': audio,
+                            'text': entry.get('text', ''),
+                            'duration': entry.get('duration', len(audio) / 16000),
+                            'lang': entry.get('lang', 'unknown'),
+                            'filename': filename,
+                        }
+
+                # Successfully completed - exit retry loop
+                break
+
+            except Exception as e:
+                error_str = str(e)
+                is_connection_error = 'IncompleteRead' in error_str or 'Connection' in error_str
+
+                if is_connection_error and attempt < self.max_retries - 1:
+                    # Exponential backoff: 1s, 2s, 4s
+                    sleep_time = 2 ** attempt
+                    logging.warning(
+                        f"Connection error on {self.tar_key}, retry {attempt + 1}/{self.max_retries} "
+                        f"in {sleep_time}s (processed {len(processed_files)} files so far)"
+                    )
+                    time.sleep(sleep_time)
+                else:
+                    logging.error(f"Error streaming TAR from s3://{self.s3_bucket}/{self.tar_key}: {e}")
+                    break
 
         self._exhausted = True
 
@@ -216,10 +245,13 @@ class S3StreamWrapper:
 
 class S3ManifestLoader:
     """
-    Loads manifest files from S3.
+    Loads manifest files from S3 with local caching.
     """
 
-    def __init__(self, s3_client=None, aws_region: str = "us-east-1"):
+    # Class-level cache directory
+    _default_cache_dir = None
+
+    def __init__(self, s3_client=None, aws_region: str = "us-east-1", cache_dir: str = None):
         if not BOTO3_AVAILABLE:
             raise ImportError("boto3 is required for S3 streaming. Install with: pip install boto3")
 
@@ -228,26 +260,87 @@ class S3ManifestLoader:
         else:
             self.s3_client = boto3.client('s3', region_name=aws_region)
 
+        # Set cache directory
+        if cache_dir:
+            self.cache_dir = cache_dir
+        elif S3ManifestLoader._default_cache_dir:
+            self.cache_dir = S3ManifestLoader._default_cache_dir
+        else:
+            # Default to ~/.cache/nemo_s3_manifests
+            import os
+            self.cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "nemo_s3_manifests")
+
+        # Create cache directory if needed
+        import os
+        os.makedirs(self.cache_dir, exist_ok=True)
+
+    @classmethod
+    def set_default_cache_dir(cls, cache_dir: str):
+        """Set default cache directory for all instances."""
+        cls._default_cache_dir = cache_dir
+
+    def _get_cache_path(self, s3_bucket: str, manifest_key: str) -> str:
+        """Get local cache path for a manifest."""
+        import os
+        import hashlib
+        # Create a safe filename from bucket and key
+        cache_key = f"{s3_bucket}/{manifest_key}"
+        cache_hash = hashlib.md5(cache_key.encode()).hexdigest()[:12]
+        safe_name = manifest_key.replace('/', '_').replace('\\', '_')
+        return os.path.join(self.cache_dir, f"{cache_hash}_{safe_name}")
+
     def load_manifest(
         self,
         s3_bucket: str,
         manifest_key: str,
+        use_cache: bool = True,
     ) -> Dict[str, dict]:
         """
-        Load manifest from S3 and return filename -> entry mapping.
+        Load manifest from S3 (or local cache) and return filename -> entry mapping.
 
         Args:
             s3_bucket: S3 bucket name
             manifest_key: Key (path) to manifest file
+            use_cache: If True, use local cache when available
 
         Returns:
             Dict mapping audio filename to manifest entry
         """
-        logging.info(f"Loading manifest from s3://{s3_bucket}/{manifest_key}")
+        import os
 
+        cache_path = self._get_cache_path(s3_bucket, manifest_key)
+
+        # Try to load from cache first
+        if use_cache and os.path.exists(cache_path):
+            try:
+                with open(cache_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                entries = self._parse_manifest_content(content)
+                logging.debug(f"Loaded {len(entries)} manifest entries from cache: {cache_path}")
+                return entries
+            except Exception as e:
+                logging.warning(f"Failed to load cached manifest, fetching from S3: {e}")
+
+        # Download from S3
+        logging.info(f"Downloading manifest from s3://{s3_bucket}/{manifest_key}")
         response = self.s3_client.get_object(Bucket=s3_bucket, Key=manifest_key)
         content = response['Body'].read().decode('utf-8')
 
+        # Save to cache
+        if use_cache:
+            try:
+                with open(cache_path, 'w', encoding='utf-8') as f:
+                    f.write(content)
+                logging.debug(f"Cached manifest to: {cache_path}")
+            except Exception as e:
+                logging.warning(f"Failed to cache manifest: {e}")
+
+        entries = self._parse_manifest_content(content)
+        logging.info(f"Loaded {len(entries)} manifest entries from S3")
+        return entries
+
+    def _parse_manifest_content(self, content: str) -> Dict[str, dict]:
+        """Parse manifest content into filename -> entry mapping."""
         entries = {}
         for line in content.strip().split('\n'):
             if not line:
@@ -259,30 +352,48 @@ class S3ManifestLoader:
                     entries[filename] = entry
             except json.JSONDecodeError:
                 continue
-
-        logging.info(f"Loaded {len(entries)} manifest entries")
         return entries
 
     def count_manifest_entries(
         self,
         s3_bucket: str,
         manifest_key: str,
+        use_cache: bool = True,
     ) -> int:
         """
-        Count entries in a manifest file without full parsing.
+        Count entries in a manifest file.
 
-        This is faster than load_manifest() when you only need the count.
+        Uses local cache when available to avoid re-downloading.
 
         Args:
             s3_bucket: S3 bucket name
             manifest_key: Key (path) to manifest file
+            use_cache: If True, use local cache when available
 
         Returns:
             Number of entries (non-empty lines) in the manifest
         """
+        import os
+
+        cache_path = self._get_cache_path(s3_bucket, manifest_key)
+
         try:
-            response = self.s3_client.get_object(Bucket=s3_bucket, Key=manifest_key)
-            content = response['Body'].read().decode('utf-8')
+            # Try cache first
+            if use_cache and os.path.exists(cache_path):
+                with open(cache_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+            else:
+                # Download from S3
+                response = self.s3_client.get_object(Bucket=s3_bucket, Key=manifest_key)
+                content = response['Body'].read().decode('utf-8')
+
+                # Save to cache
+                if use_cache:
+                    try:
+                        with open(cache_path, 'w', encoding='utf-8') as f:
+                            f.write(content)
+                    except Exception:
+                        pass  # Ignore cache write errors
 
             # Count non-empty lines
             count = sum(1 for line in content.strip().split('\n') if line.strip())
