@@ -1,13 +1,16 @@
 """
-Language source manager for S3 streaming dataset.
+Language source manager for streaming dataset.
 
 Manages multiple TAR sources for a single language with automatic rotation.
+Supports both S3 and local disk storage.
 """
 
+import os
 from typing import Dict, Iterator, List, Optional
 
 from nemo.utils import logging
 
+from .disk_tar_stream import DiskManifestLoader, DiskTarStream
 from .filters import FilterConfig, SampleFilter
 from .prefetch_buffer import PrefetchBuffer
 from .s3_tar_stream import S3ManifestLoader, S3TarStream
@@ -25,17 +28,24 @@ class LanguageSourceManager:
     - Applies filters and token augmentation
     - Epoch tracking
     - Optional prefetching for reduced I/O latency
+    - Supports both S3 and local disk storage
     """
 
     def __init__(
         self,
         lang: str,
-        s3_bucket: str,
-        s3_prefix: str,
         sources: List[str],
-        s3_client,
         sample_filter: SampleFilter,
         token_augmenter: TokenAugmenter,
+        # Storage config - either S3 or disk
+        storage_type: str = "s3",  # "s3" or "disk"
+        # S3 config
+        s3_bucket: str = None,
+        s3_prefix: str = None,
+        s3_client=None,
+        # Disk config
+        data_root: str = None,
+        # Common
         prefetch_buffer_size: int = 100,
     ):
         """
@@ -43,24 +53,38 @@ class LanguageSourceManager:
 
         Args:
             lang: Language code (e.g., "en", "uk", "zh")
-            s3_bucket: S3 bucket name
-            s3_prefix: S3 prefix (e.g., "asr-data/")
             sources: List of source names (e.g., ["common_en_train", "yodas_en_en000"])
-            s3_client: Boto3 S3 client
             sample_filter: Filter for duration/char rate
             token_augmenter: Augmenter for adding <eou> tokens
+            storage_type: "s3" or "disk"
+            s3_bucket: S3 bucket name (required for S3)
+            s3_prefix: S3 prefix (e.g., "asr-data/")
+            s3_client: Boto3 S3 client (required for S3)
+            data_root: Root directory for data (required for disk)
             prefetch_buffer_size: Number of samples to prefetch (0 to disable)
         """
         self.lang = lang
-        self.s3_bucket = s3_bucket
-        self.s3_prefix = s3_prefix.rstrip('/') + '/' if s3_prefix else ''
         self.sources = sources
-        self.s3_client = s3_client
         self.sample_filter = sample_filter
         self.token_augmenter = token_augmenter
         self.prefetch_buffer_size = prefetch_buffer_size
+        self.storage_type = storage_type
 
-        self.manifest_loader = S3ManifestLoader(s3_client=s3_client)
+        # Storage-specific setup
+        if storage_type == "s3":
+            if s3_bucket is None or s3_client is None:
+                raise ValueError("s3_bucket and s3_client required for S3 storage")
+            self.s3_bucket = s3_bucket
+            self.s3_prefix = s3_prefix.rstrip('/') + '/' if s3_prefix else ''
+            self.s3_client = s3_client
+            self.manifest_loader = S3ManifestLoader(s3_client=s3_client)
+        elif storage_type == "disk":
+            if data_root is None:
+                raise ValueError("data_root required for disk storage")
+            self.data_root = data_root
+            self.manifest_loader = DiskManifestLoader()
+        else:
+            raise ValueError(f"Unknown storage_type: {storage_type}. Use 's3' or 'disk'")
 
         # State tracking
         self._current_source_idx = 0
@@ -81,34 +105,66 @@ class LanguageSourceManager:
         if self._initialized:
             return
 
-        logging.info(f"[{self.lang}] Initializing {len(self.sources)} sources...")
+        logging.info(f"[{self.lang}] Initializing {len(self.sources)} sources ({self.storage_type})...")
 
         for source in self.sources:
-            source_prefix = f"{self.s3_prefix}{source}/"
-
-            # List TAR files
-            tar_files = self.manifest_loader.list_tar_files(self.s3_bucket, source_prefix)
-            if not tar_files:
-                logging.warning(f"[{self.lang}] No TAR files found in {source_prefix}")
-                continue
-
-            self._tar_files_by_source[source] = tar_files
-            logging.info(f"[{self.lang}] {source}: {len(tar_files)} TAR files")
-
-            # Load manifest
-            manifest_key = f"{source_prefix}tarred_audio_manifest.json"
-            try:
-                manifest = self.manifest_loader.load_manifest(self.s3_bucket, manifest_key)
-                self._manifests_by_source[source] = manifest
-                logging.info(f"[{self.lang}] {source}: {len(manifest)} manifest entries")
-            except Exception as e:
-                logging.error(f"[{self.lang}] Failed to load manifest for {source}: {e}")
-                continue
+            if self.storage_type == "s3":
+                self._init_s3_source(source)
+            else:
+                self._init_disk_source(source)
 
         self._initialized = True
 
         # Start first stream
         self._advance_to_next_stream()
+
+    def _init_s3_source(self, source: str):
+        """Initialize a source from S3."""
+        source_prefix = f"{self.s3_prefix}{source}/"
+
+        # List TAR files
+        tar_files = self.manifest_loader.list_tar_files(self.s3_bucket, source_prefix)
+        if not tar_files:
+            logging.warning(f"[{self.lang}] No TAR files found in {source_prefix}")
+            return
+
+        self._tar_files_by_source[source] = tar_files
+        logging.info(f"[{self.lang}] {source}: {len(tar_files)} TAR files")
+
+        # Load manifest
+        manifest_key = f"{source_prefix}tarred_audio_manifest.json"
+        try:
+            manifest = self.manifest_loader.load_manifest(self.s3_bucket, manifest_key)
+            self._manifests_by_source[source] = manifest
+            logging.info(f"[{self.lang}] {source}: {len(manifest)} manifest entries")
+        except Exception as e:
+            logging.error(f"[{self.lang}] Failed to load manifest for {source}: {e}")
+
+    def _init_disk_source(self, source: str):
+        """Initialize a source from local disk."""
+        source_dir = os.path.join(self.data_root, source)
+
+        if not os.path.isdir(source_dir):
+            logging.warning(f"[{self.lang}] Source directory not found: {source_dir}")
+            return
+
+        # List TAR files
+        tar_files = self.manifest_loader.list_tar_files(source_dir)
+        if not tar_files:
+            logging.warning(f"[{self.lang}] No TAR files found in {source_dir}")
+            return
+
+        self._tar_files_by_source[source] = tar_files
+        logging.info(f"[{self.lang}] {source}: {len(tar_files)} TAR files")
+
+        # Load manifest
+        manifest_path = os.path.join(source_dir, "tarred_audio_manifest.json")
+        try:
+            manifest = self.manifest_loader.load_manifest(manifest_path)
+            self._manifests_by_source[source] = manifest
+            logging.info(f"[{self.lang}] {source}: {len(manifest)} manifest entries")
+        except Exception as e:
+            logging.error(f"[{self.lang}] Failed to load manifest for {source}: {e}")
 
     def _advance_to_next_stream(self) -> bool:
         """
@@ -128,17 +184,24 @@ class LanguageSourceManager:
             tar_files = self._tar_files_by_source[source]
 
             if self._current_tar_idx < len(tar_files):
-                tar_key = tar_files[self._current_tar_idx]
+                tar_path = tar_files[self._current_tar_idx]
                 manifest = self._manifests_by_source.get(source, {})
 
-                logging.debug(f"[{self.lang}] Opening stream: {tar_key}")
+                logging.debug(f"[{self.lang}] Opening stream: {tar_path}")
 
-                stream = S3TarStream(
-                    s3_bucket=self.s3_bucket,
-                    tar_key=tar_key,
-                    manifest_entries=manifest,
-                    s3_client=self.s3_client,
-                )
+                if self.storage_type == "s3":
+                    stream = S3TarStream(
+                        s3_bucket=self.s3_bucket,
+                        tar_key=tar_path,
+                        manifest_entries=manifest,
+                        s3_client=self.s3_client,
+                    )
+                else:
+                    stream = DiskTarStream(
+                        tar_path=tar_path,
+                        manifest_entries=manifest,
+                    )
+
                 self._current_stream = iter(stream)
                 self._current_tar_idx += 1
                 return True
