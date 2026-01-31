@@ -24,6 +24,13 @@ from .lang_source_manager import LanguageSourceManager
 from .prefetch_buffer import MultiSourcePrefetcher, PrefetchBuffer
 from .round_robin import RoundRobinInterleaver
 from .s3_tar_stream import S3ManifestLoader, S3TarStream
+from .sqlite_manifest import (
+    DictManifestProvider,
+    ManifestProvider,
+    SQLiteManifestCache,
+    SQLiteManifestProvider,
+    get_default_cache_dir,
+)
 from .token_augmenter import SENTENCE_ENDINGS, TokenAugmenter
 
 # Alias for cleaner naming (supports both S3 and disk)
@@ -53,6 +60,12 @@ __all__ = [
     # Disk streaming
     'DiskManifestLoader',
     'DiskTarStream',
+    # SQLite manifest cache
+    'SQLiteManifestCache',
+    'SQLiteManifestProvider',
+    'DictManifestProvider',
+    'ManifestProvider',
+    'get_default_cache_dir',
     # Prefetching
     'PrefetchBuffer',
     'MultiSourcePrefetcher',

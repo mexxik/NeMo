@@ -14,6 +14,7 @@ from .disk_tar_stream import DiskManifestLoader, DiskTarStream
 from .filters import FilterConfig, SampleFilter
 from .prefetch_buffer import PrefetchBuffer
 from .s3_tar_stream import S3ManifestLoader, S3TarStream
+from .sqlite_manifest import SQLiteManifestCache, SQLiteManifestProvider
 from .token_augmenter import TokenAugmenter
 
 
@@ -47,6 +48,8 @@ class LanguageSourceManager:
         data_root: str = None,
         # Common
         prefetch_buffer_size: int = 100,
+        # SQLite manifest cache (memory optimization)
+        sqlite_cache_path: str = None,
     ):
         """
         Initialize language source manager.
@@ -86,6 +89,11 @@ class LanguageSourceManager:
         else:
             raise ValueError(f"Unknown storage_type: {storage_type}. Use 's3' or 'disk'")
 
+        # SQLite manifest cache (shared across workers, saves RAM)
+        self.sqlite_cache_path = sqlite_cache_path
+        self._sqlite_cache: Optional[SQLiteManifestCache] = None
+        self._manifest_provider: Optional[SQLiteManifestProvider] = None
+
         # State tracking
         self._current_source_idx = 0
         self._current_tar_idx = 0
@@ -106,6 +114,17 @@ class LanguageSourceManager:
             return
 
         logging.info(f"[{self.lang}] Initializing {len(self.sources)} sources ({self.storage_type})...")
+
+        # Initialize SQLite cache if available (saves RAM with multiple workers)
+        if self.sqlite_cache_path and os.path.exists(self.sqlite_cache_path):
+            try:
+                self._sqlite_cache = SQLiteManifestCache(self.sqlite_cache_path, read_only=True)
+                self._manifest_provider = SQLiteManifestProvider(self._sqlite_cache)
+                logging.info(f"[{self.lang}] Using SQLite manifest cache: {self.sqlite_cache_path}")
+            except Exception as e:
+                logging.warning(f"[{self.lang}] Failed to open SQLite cache, falling back to dict: {e}")
+                self._sqlite_cache = None
+                self._manifest_provider = None
 
         for source in self.sources:
             if self.storage_type == "s3":
@@ -131,7 +150,12 @@ class LanguageSourceManager:
         self._tar_files_by_source[source] = tar_files
         logging.info(f"[{self.lang}] {source}: {len(tar_files)} TAR files")
 
-        # Load manifest
+        # Skip manifest loading if using SQLite cache
+        if self._manifest_provider is not None:
+            logging.debug(f"[{self.lang}] {source}: using SQLite manifest cache")
+            return
+
+        # Load manifest (fallback when SQLite not available)
         manifest_key = f"{source_prefix}tarred_audio_manifest.json"
         try:
             manifest = self.manifest_loader.load_manifest(self.s3_bucket, manifest_key)
@@ -157,7 +181,12 @@ class LanguageSourceManager:
         self._tar_files_by_source[source] = tar_files
         logging.info(f"[{self.lang}] {source}: {len(tar_files)} TAR files")
 
-        # Load manifest
+        # Skip manifest loading if using SQLite cache
+        if self._manifest_provider is not None:
+            logging.debug(f"[{self.lang}] {source}: using SQLite manifest cache")
+            return
+
+        # Load manifest (fallback when SQLite not available)
         manifest_path = os.path.join(source_dir, "tarred_audio_manifest.json")
         try:
             manifest = self.manifest_loader.load_manifest(manifest_path)
@@ -185,7 +214,12 @@ class LanguageSourceManager:
 
             if self._current_tar_idx < len(tar_files):
                 tar_path = tar_files[self._current_tar_idx]
-                manifest = self._manifests_by_source.get(source, {})
+
+                # Use SQLite provider if available, otherwise fall back to dict
+                if self._manifest_provider is not None:
+                    manifest_entries = self._manifest_provider
+                else:
+                    manifest_entries = self._manifests_by_source.get(source, {})
 
                 logging.debug(f"[{self.lang}] Opening stream: {tar_path}")
 
@@ -193,13 +227,13 @@ class LanguageSourceManager:
                     stream = S3TarStream(
                         s3_bucket=self.s3_bucket,
                         tar_key=tar_path,
-                        manifest_entries=manifest,
+                        manifest_entries=manifest_entries,
                         s3_client=self.s3_client,
                     )
                 else:
                     stream = DiskTarStream(
                         tar_path=tar_path,
-                        manifest_entries=manifest,
+                        manifest_entries=manifest_entries,
                     )
 
                 self._current_stream = iter(stream)
@@ -330,6 +364,10 @@ class LanguageSourceManager:
         """Get total number of manifest entries across all sources."""
         if not self._initialized:
             self._initialize()
+        # When using SQLite, _manifests_by_source is empty
+        # The count is handled by the dataset class which built the cache
+        if self._sqlite_cache is not None:
+            return self._sqlite_cache.count_entries()
         return sum(len(m) for m in self._manifests_by_source.values())
 
     def stop(self):
@@ -338,6 +376,10 @@ class LanguageSourceManager:
             self._prefetch_buffer.stop()
             self._prefetch_buffer = None
             self._prefetch_iter = None
+        if self._sqlite_cache is not None:
+            self._sqlite_cache.close()
+            self._sqlite_cache = None
+            self._manifest_provider = None
 
     def __del__(self):
         """Cleanup on deletion."""

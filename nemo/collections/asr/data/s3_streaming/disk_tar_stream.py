@@ -9,7 +9,7 @@ import json
 import os
 import tarfile
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional
+from typing import Dict, Iterator, List, Optional, Union
 
 import numpy as np
 
@@ -23,19 +23,21 @@ class DiskTarStream:
     Streams samples from TAR files stored on local disk.
 
     Provides the same interface as S3TarStream for unified usage.
+    Supports both dict and SQLiteManifestProvider for manifest lookups.
     """
 
     def __init__(
         self,
         tar_path: str,
-        manifest_entries: Dict[str, dict],
+        manifest_entries: Union[Dict[str, dict], "SQLiteManifestProvider"],
     ):
         """
         Initialize disk TAR streamer.
 
         Args:
             tar_path: Path to TAR file on disk
-            manifest_entries: Dict mapping audio filename to manifest entry
+            manifest_entries: Dict or SQLiteManifestProvider for manifest lookups.
+                              Must support `in` operator and `[]` access.
         """
         self.tar_path = tar_path
         self.manifest_entries = manifest_entries

@@ -23,6 +23,7 @@ from .filters import FilterConfig, SampleFilter
 from .lang_source_manager import LanguageSourceManager
 from .round_robin import RoundRobinInterleaver
 from .s3_tar_stream import S3ManifestLoader
+from .sqlite_manifest import SQLiteManifestCache, get_default_cache_dir
 from .token_augmenter import TokenAugmenter
 
 try:
@@ -155,6 +156,10 @@ class S3MultiLangStreamingDataset(IterableDataset):
         # Other
         return_sample_id: bool = False,
         samples_per_epoch: int = None,  # Override automatic length calculation
+
+        # Memory optimization
+        use_sqlite_cache: bool = True,  # Use SQLite for manifest caching (saves RAM with multiple workers)
+        sqlite_cache_dir: str = None,  # Custom cache directory (default: ~/.cache/nemo_manifest_cache)
     ):
         """
         Initialize multi-language streaming dataset.
@@ -295,6 +300,18 @@ class S3MultiLangStreamingDataset(IterableDataset):
         # Language managers will be created lazily per worker
         self._interleaver: Optional[RoundRobinInterleaver] = None
 
+        # SQLite manifest cache for memory-efficient multi-worker loading
+        self.use_sqlite_cache = use_sqlite_cache
+        self._sqlite_cache_path: Optional[str] = None
+        if use_sqlite_cache:
+            import hashlib
+            cache_dir = sqlite_cache_dir or get_default_cache_dir()
+            # Create unique cache ID from config
+            config_str = f"{self.storage_type}:{self.s3_bucket or self.data_root}:{sorted(language_sources.items())}"
+            cache_id = hashlib.md5(config_str.encode()).hexdigest()[:12]
+            self._sqlite_cache_path = os.path.join(cache_dir, f"manifest_cache_{cache_id}.db")
+            os.makedirs(cache_dir, exist_ok=True)
+
         # Audio merger for multi-utterance training
         self.merge_config = MergeConfig(
             enabled=merge_utterances,
@@ -346,13 +363,48 @@ class S3MultiLangStreamingDataset(IterableDataset):
         Calculate total samples by counting manifest entries.
 
         This loads each manifest once to get the accurate count.
-        The manifests will be loaded again by workers during iteration,
-        but this gives us the correct epoch length upfront.
+        If use_sqlite_cache is enabled, also builds the SQLite cache
+        so workers don't need to reload manifests into memory.
 
         Returns:
             Total number of samples across all language sources
         """
         total = 0
+
+        # Initialize SQLite cache if enabled
+        sqlite_cache = None
+        if self.use_sqlite_cache and self._sqlite_cache_path:
+            # Check if cache already exists and is valid
+            if os.path.exists(self._sqlite_cache_path):
+                try:
+                    sqlite_cache = SQLiteManifestCache(self._sqlite_cache_path, read_only=True)
+                    cached_sources = set(sqlite_cache.get_sources())
+                    expected_sources = set()
+                    for sources in self.language_sources.values():
+                        expected_sources.update(sources)
+
+                    if cached_sources == expected_sources:
+                        # Cache is valid, just count from it
+                        total = sqlite_cache.count_entries()
+                        logging.info(f"Using existing SQLite manifest cache: {self._sqlite_cache_path}")
+                        logging.info(f"Total manifest entries from cache: {total}")
+                        sqlite_cache.close()
+                        return total
+                    else:
+                        # Cache is stale, rebuild it
+                        logging.info(f"SQLite cache sources mismatch, rebuilding...")
+                        sqlite_cache.close()
+                        os.remove(self._sqlite_cache_path)
+                except Exception as e:
+                    logging.warning(f"Failed to read existing cache, rebuilding: {e}")
+                    if sqlite_cache:
+                        sqlite_cache.close()
+                    if os.path.exists(self._sqlite_cache_path):
+                        os.remove(self._sqlite_cache_path)
+
+            # Create new cache
+            sqlite_cache = SQLiteManifestCache(self._sqlite_cache_path)
+            logging.info(f"Building SQLite manifest cache: {self._sqlite_cache_path}")
 
         if self.storage_type == "s3":
             manifest_loader = S3ManifestLoader(s3_client=self.s3_client)
@@ -361,13 +413,20 @@ class S3MultiLangStreamingDataset(IterableDataset):
                     source_prefix = f"{self.s3_prefix.rstrip('/') + '/' if self.s3_prefix else ''}{source}/"
                     manifest_key = f"{source_prefix}tarred_audio_manifest.json"
                     try:
-                        count = manifest_loader.count_manifest_entries(
-                            self.s3_bucket, manifest_key
-                        )
-                        total += count
-                        logging.info(f"[{lang}] {source}: {count} manifest entries")
+                        if sqlite_cache:
+                            # Load full manifest and add to cache
+                            manifest = manifest_loader.load_manifest(self.s3_bucket, manifest_key)
+                            count = sqlite_cache.add_entries_batch(manifest, source)
+                            total += count
+                            logging.info(f"[{lang}] {source}: {count} manifest entries (cached)")
+                        else:
+                            count = manifest_loader.count_manifest_entries(
+                                self.s3_bucket, manifest_key
+                            )
+                            total += count
+                            logging.info(f"[{lang}] {source}: {count} manifest entries")
                     except Exception as e:
-                        logging.warning(f"[{lang}] Failed to count manifest for {source}: {e}")
+                        logging.warning(f"[{lang}] Failed to load manifest for {source}: {e}")
         else:
             # Disk storage
             manifest_loader = DiskManifestLoader()
@@ -375,11 +434,22 @@ class S3MultiLangStreamingDataset(IterableDataset):
                 for source in sources:
                     manifest_path = os.path.join(self.data_root, source, "tarred_audio_manifest.json")
                     try:
-                        count = manifest_loader.count_manifest_entries(manifest_path)
-                        total += count
-                        logging.info(f"[{lang}] {source}: {count} manifest entries")
+                        if sqlite_cache:
+                            # Load full manifest and add to cache
+                            manifest = manifest_loader.load_manifest(manifest_path)
+                            count = sqlite_cache.add_entries_batch(manifest, source)
+                            total += count
+                            logging.info(f"[{lang}] {source}: {count} manifest entries (cached)")
+                        else:
+                            count = manifest_loader.count_manifest_entries(manifest_path)
+                            total += count
+                            logging.info(f"[{lang}] {source}: {count} manifest entries")
                     except Exception as e:
-                        logging.warning(f"[{lang}] Failed to count manifest for {source}: {e}")
+                        logging.warning(f"[{lang}] Failed to load manifest for {source}: {e}")
+
+        if sqlite_cache:
+            sqlite_cache.close()
+            logging.info(f"SQLite manifest cache built with {total} entries")
 
         return total
 
@@ -398,6 +468,7 @@ class S3MultiLangStreamingDataset(IterableDataset):
                     s3_bucket=self.s3_bucket,
                     s3_prefix=self.s3_prefix,
                     s3_client=self.s3_client,
+                    sqlite_cache_path=self._sqlite_cache_path,
                 )
             else:
                 manager = LanguageSourceManager(
@@ -407,6 +478,7 @@ class S3MultiLangStreamingDataset(IterableDataset):
                     token_augmenter=self.token_augmenter,
                     storage_type="disk",
                     data_root=self.data_root,
+                    sqlite_cache_path=self._sqlite_cache_path,
                 )
             language_managers[lang] = manager
 

@@ -10,7 +10,7 @@ import json
 import struct
 import tarfile
 import time
-from typing import Dict, Iterator, Optional
+from typing import Dict, Iterator, Optional, Union
 
 import numpy as np
 
@@ -71,13 +71,14 @@ class S3TarStream:
     - Parses TAR headers on-the-fly
     - Matches audio files to manifest entries
     - Handles network retries
+    - Supports both dict and SQLiteManifestProvider for manifest lookups
     """
 
     def __init__(
         self,
         s3_bucket: str,
         tar_key: str,
-        manifest_entries: Dict[str, dict],
+        manifest_entries: Union[Dict[str, dict], "SQLiteManifestProvider"],
         s3_client=None,
         aws_region: str = "us-east-1",
         max_retries: int = 3,
@@ -88,7 +89,8 @@ class S3TarStream:
         Args:
             s3_bucket: S3 bucket name
             tar_key: Key (path) to TAR file in bucket
-            manifest_entries: Dict mapping audio filename to manifest entry
+            manifest_entries: Dict or SQLiteManifestProvider for manifest lookups.
+                              Must support `in` operator and `[]` access.
             s3_client: Optional pre-configured boto3 S3 client
             aws_region: AWS region (if creating new client)
             max_retries: Max retries for S3 operations
