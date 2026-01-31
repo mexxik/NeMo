@@ -304,12 +304,17 @@ class S3MultiLangStreamingDataset(IterableDataset):
         self.use_sqlite_cache = use_sqlite_cache
         self._sqlite_cache_path: Optional[str] = None
         if use_sqlite_cache:
-            import hashlib
             cache_dir = sqlite_cache_dir or get_default_cache_dir()
-            # Create unique cache ID from config
-            config_str = f"{self.storage_type}:{self.s3_bucket or self.data_root}:{sorted(language_sources.items())}"
-            cache_id = hashlib.md5(config_str.encode()).hexdigest()[:12]
-            self._sqlite_cache_path = os.path.join(cache_dir, f"manifest_cache_{cache_id}.db")
+            # Create cache name from sorted source names (path-independent)
+            all_sources = sorted(
+                source for sources in language_sources.values() for source in sources
+            )
+            cache_name = "_".join(all_sources)
+            # Truncate if too long, but keep it readable
+            if len(cache_name) > 100:
+                import hashlib
+                cache_name = cache_name[:60] + "_" + hashlib.md5(cache_name.encode()).hexdigest()[:8]
+            self._sqlite_cache_path = os.path.join(cache_dir, f"manifest_{cache_name}.db")
             os.makedirs(cache_dir, exist_ok=True)
 
         # Audio merger for multi-utterance training
