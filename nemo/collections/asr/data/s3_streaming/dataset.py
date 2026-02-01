@@ -20,8 +20,8 @@ from nemo.utils import logging
 from .audio_merger import AudioMerger, MergeBuffer, MergeConfig
 from .disk_tar_stream import DiskManifestLoader
 from .filters import FilterConfig, SampleFilter
-from .lang_source_manager import LanguageSourceManager
-from .round_robin import RoundRobinInterleaver
+from .lang_source_manager import LanguageSourceManager, SingleSourceManager
+from .round_robin import RoundRobinInterleaver, SourceRoundRobinInterleaver
 from .s3_tar_stream import S3ManifestLoader
 from .sqlite_manifest import SQLiteManifestCache, get_default_cache_dir
 from .token_augmenter import TokenAugmenter
@@ -160,6 +160,9 @@ class S3MultiLangStreamingDataset(IterableDataset):
         # Memory optimization
         use_sqlite_cache: bool = True,  # Use SQLite for manifest caching (saves RAM with multiple workers)
         sqlite_cache_dir: str = None,  # Custom cache directory (default: ~/.cache/nemo_manifest_cache)
+
+        # Rotation mode
+        rotation_level: str = "source",  # "source" or "language"
     ):
         """
         Initialize multi-language streaming dataset.
@@ -184,12 +187,19 @@ class S3MultiLangStreamingDataset(IterableDataset):
             use_start_end_token: Whether to add BOS/EOS tokens
             return_sample_id: Whether to return sample IDs
             samples_per_epoch: Override automatic length calculation
+            rotation_level: How to rotate through data:
+                - "source": Round-robin across individual datasets/sources (default)
+                - "language": Round-robin across languages
         """
         if language_sources is None or len(language_sources) == 0:
             raise ValueError("language_sources must be provided")
 
         if tokenizer is None:
             raise ValueError("tokenizer must be provided")
+
+        if rotation_level not in ("language", "source"):
+            raise ValueError(f"rotation_level must be 'language' or 'source', got: {rotation_level}")
+        self.rotation_level = rotation_level
 
         # Determine storage type
         if data_root is not None:
@@ -346,12 +356,17 @@ class S3MultiLangStreamingDataset(IterableDataset):
                     f"Could not load manifests for counting, using estimate: {self.samples_per_epoch}"
                 )
 
+        # Count total sources for logging
+        total_sources = sum(len(sources) for sources in language_sources.values())
+
         if self.storage_type == "s3":
             endpoint_info = s3_endpoint_url or "AWS S3"
             logging.info(
                 f"MultiLangStreamingDataset (S3): bucket={s3_bucket}, "
                 f"endpoint={endpoint_info}, "
                 f"languages={list(language_sources.keys())}, "
+                f"sources={total_sources}, "
+                f"rotation_level={rotation_level}, "
                 f"add_eou={add_eou_token}, "
                 f"merge_utterances={merge_utterances}"
             )
@@ -359,6 +374,8 @@ class S3MultiLangStreamingDataset(IterableDataset):
             logging.info(
                 f"MultiLangStreamingDataset (Disk): data_root={data_root}, "
                 f"languages={list(language_sources.keys())}, "
+                f"sources={total_sources}, "
+                f"rotation_level={rotation_level}, "
                 f"add_eou={add_eou_token}, "
                 f"merge_utterances={merge_utterances}"
             )
@@ -458,8 +475,15 @@ class S3MultiLangStreamingDataset(IterableDataset):
 
         return total
 
-    def _create_interleaver(self) -> RoundRobinInterleaver:
-        """Create language managers and interleaver (called once per worker)."""
+    def _create_interleaver(self):
+        """Create interleaver based on rotation_level (called once per worker)."""
+        if self.rotation_level == "source":
+            return self._create_source_interleaver()
+        else:
+            return self._create_language_interleaver()
+
+    def _create_language_interleaver(self) -> RoundRobinInterleaver:
+        """Create language-level round-robin interleaver."""
         language_managers = {}
 
         for lang, sources in self.language_sources.items():
@@ -489,6 +513,43 @@ class S3MultiLangStreamingDataset(IterableDataset):
 
         return RoundRobinInterleaver(
             language_managers=language_managers,
+            languages_order=sorted(self.language_sources.keys()),
+        )
+
+    def _create_source_interleaver(self) -> SourceRoundRobinInterleaver:
+        """Create source-level round-robin interleaver."""
+        source_managers = {}
+
+        for lang, sources in self.language_sources.items():
+            for source in sources:
+                manager_key = f"{lang}:{source}"
+                if self.storage_type == "s3":
+                    manager = SingleSourceManager(
+                        lang=lang,
+                        source=source,
+                        sample_filter=self.sample_filter,
+                        token_augmenter=self.token_augmenter,
+                        storage_type="s3",
+                        s3_bucket=self.s3_bucket,
+                        s3_prefix=self.s3_prefix,
+                        s3_client=self.s3_client,
+                        sqlite_cache_path=self._sqlite_cache_path,
+                    )
+                else:
+                    manager = SingleSourceManager(
+                        lang=lang,
+                        source=source,
+                        sample_filter=self.sample_filter,
+                        token_augmenter=self.token_augmenter,
+                        storage_type="disk",
+                        data_root=self.data_root,
+                        sqlite_cache_path=self._sqlite_cache_path,
+                    )
+                source_managers[manager_key] = manager
+
+        return SourceRoundRobinInterleaver(
+            language_sources=self.language_sources,
+            source_managers=source_managers,
             languages_order=sorted(self.language_sources.keys()),
         )
 

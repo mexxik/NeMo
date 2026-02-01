@@ -20,9 +20,9 @@ from .filters import (
     has_valid_chars,
     is_valid_text,
 )
-from .lang_source_manager import LanguageSourceManager
+from .lang_source_manager import LanguageSourceManager, SingleSourceManager
 from .prefetch_buffer import MultiSourcePrefetcher, PrefetchBuffer
-from .round_robin import RoundRobinInterleaver
+from .round_robin import RoundRobinInterleaver, SourceRoundRobinInterleaver
 from .s3_tar_stream import S3ManifestLoader, S3TarStream
 from .sqlite_manifest import (
     DictManifestProvider,
@@ -53,7 +53,9 @@ __all__ = [
     'is_valid_text',
     # Source management
     'LanguageSourceManager',
+    'SingleSourceManager',
     'RoundRobinInterleaver',
+    'SourceRoundRobinInterleaver',
     # S3 streaming
     'S3ManifestLoader',
     'S3TarStream',
