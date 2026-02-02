@@ -181,16 +181,24 @@ class DiskManifestLoader:
             logging.warning(f"Failed to count entries in {manifest_path}: {e}")
             return 0
 
-    def list_tar_files(self, source_dir: str) -> List[str]:
+    def list_tar_files(self, source_dir: str, sqlite_cache=None, source: str = None) -> List[str]:
         """
         List TAR files in a directory.
 
         Args:
             source_dir: Directory containing TAR files
+            sqlite_cache: Optional SQLiteManifestCache for caching TAR file lists
+            source: Source name for cache key (required if sqlite_cache is provided)
 
         Returns:
             List of TAR file paths sorted by name
         """
+        # Try to get from SQLite cache first
+        if sqlite_cache is not None and source is not None:
+            cached_tars = sqlite_cache.get_tar_files(source)
+            if cached_tars is not None:
+                return cached_tars
+
         if not os.path.isdir(source_dir):
             logging.warning(f"Directory not found: {source_dir}")
             return []
@@ -200,4 +208,13 @@ class DiskManifestLoader:
             if filename.endswith('.tar'):
                 tar_files.append(os.path.join(source_dir, filename))
 
-        return sorted(tar_files)
+        tar_files = sorted(tar_files)
+
+        # Cache to SQLite if available
+        if sqlite_cache is not None and source is not None and tar_files:
+            try:
+                sqlite_cache.add_tar_files(source, tar_files)
+            except Exception as e:
+                logging.warning(f"[{source}] Failed to cache TAR files: {e}")
+
+        return tar_files

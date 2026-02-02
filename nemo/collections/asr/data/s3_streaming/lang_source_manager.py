@@ -43,11 +43,11 @@ class LanguageSourceManager:
         # S3 config
         s3_bucket: str = None,
         s3_prefix: str = None,
-        s3_client=None,
+        s3_endpoint_url: str = None,
         # Disk config
         data_root: str = None,
         # Common
-        prefetch_buffer_size: int = 100,
+        prefetch_buffer_size: int = 0,  # Disabled for true sequential streaming
         # SQLite manifest cache (memory optimization)
         sqlite_cache_path: str = None,
     ):
@@ -62,7 +62,7 @@ class LanguageSourceManager:
             storage_type: "s3" or "disk"
             s3_bucket: S3 bucket name (required for S3)
             s3_prefix: S3 prefix (e.g., "asr-data/")
-            s3_client: Boto3 S3 client (required for S3)
+            s3_endpoint_url: S3 endpoint URL (for R2, MinIO, etc.)
             data_root: Root directory for data (required for disk)
             prefetch_buffer_size: Number of samples to prefetch (0 to disable)
         """
@@ -75,12 +75,15 @@ class LanguageSourceManager:
 
         # Storage-specific setup
         if storage_type == "s3":
-            if s3_bucket is None or s3_client is None:
-                raise ValueError("s3_bucket and s3_client required for S3 storage")
+            if s3_bucket is None:
+                raise ValueError("s3_bucket required for S3 storage")
             self.s3_bucket = s3_bucket
             self.s3_prefix = s3_prefix.rstrip('/') + '/' if s3_prefix else ''
-            self.s3_client = s3_client
-            self.manifest_loader = S3ManifestLoader(s3_client=s3_client)
+            self.s3_endpoint_url = s3_endpoint_url
+            # S3 client and manifest loader created lazily in _initialize()
+            # (boto3 clients are not fork-safe, so we create fresh ones in workers)
+            self.s3_client = None
+            self.manifest_loader = None
         elif storage_type == "disk":
             if data_root is None:
                 raise ValueError("data_root required for disk storage")
@@ -109,46 +112,83 @@ class LanguageSourceManager:
         self._prefetch_iter: Optional[Iterator] = None
 
     def _initialize(self):
-        """Load manifests and discover TAR files for all sources."""
+        """Initialize base infrastructure (S3 client, SQLite cache) - sources are lazy."""
         if self._initialized:
             return
 
-        logging.info(f"[{self.lang}] Initializing {len(self.sources)} sources ({self.storage_type})...")
+        # Check if we're in a DataLoader worker (reduce log verbosity)
+        import torch.utils.data
+        worker_info = torch.utils.data.get_worker_info()
+        in_worker = worker_info is not None
+
+        # Worker sharding info
+        self._worker_id = worker_info.id if worker_info else 0
+        self._num_workers = worker_info.num_workers if worker_info else 1
+
+        if not in_worker:
+            logging.info(f"[{self.lang}] Initializing ({self.storage_type}), {len(self.sources)} sources available...")
+
+        # Create S3 client if needed (fresh client per worker, boto3 is not fork-safe)
+        if self.storage_type == "s3" and self.s3_client is None:
+            try:
+                import boto3
+                from botocore.config import Config as BotoConfig
+                boto_config = BotoConfig(
+                    retries={'max_attempts': 3, 'mode': 'adaptive'},
+                    signature_version='s3v4',
+                )
+                client_kwargs = {'config': boto_config}
+                if self.s3_endpoint_url:
+                    client_kwargs['endpoint_url'] = self.s3_endpoint_url
+                self.s3_client = boto3.client('s3', **client_kwargs)
+                self.manifest_loader = S3ManifestLoader(s3_client=self.s3_client)
+            except Exception as e:
+                logging.error(f"[{self.lang}] Failed to create S3 client: {e}")
+                raise
 
         # Initialize SQLite cache if available (saves RAM with multiple workers)
         if self.sqlite_cache_path and os.path.exists(self.sqlite_cache_path):
             try:
                 self._sqlite_cache = SQLiteManifestCache(self.sqlite_cache_path, read_only=True)
                 self._manifest_provider = SQLiteManifestProvider(self._sqlite_cache)
-                logging.info(f"[{self.lang}] Using SQLite manifest cache: {self.sqlite_cache_path}")
+                if not in_worker:
+                    logging.info(f"[{self.lang}] Using SQLite manifest cache: {self.sqlite_cache_path}")
             except Exception as e:
                 logging.warning(f"[{self.lang}] Failed to open SQLite cache, falling back to dict: {e}")
                 self._sqlite_cache = None
                 self._manifest_provider = None
 
-        for source in self.sources:
-            if self.storage_type == "s3":
-                self._init_s3_source(source)
-            else:
-                self._init_disk_source(source)
+        # Track which sources have been initialized
+        self._initialized_sources: set = set()
 
         self._initialized = True
+        # NOTE: Sources are initialized lazily in _advance_to_next_stream()
+        # This allows training to start immediately without loading all manifests
 
-        # Start first stream
-        self._advance_to_next_stream()
-
-    def _init_s3_source(self, source: str):
+    def _init_s3_source(self, source: str, verbose: bool = True):
         """Initialize a source from S3."""
         source_prefix = f"{self.s3_prefix}{source}/"
 
-        # List TAR files
-        tar_files = self.manifest_loader.list_tar_files(self.s3_bucket, source_prefix)
+        # List TAR files (use SQLite cache to avoid repeated S3 list calls)
+        tar_files = self.manifest_loader.list_tar_files(
+            self.s3_bucket, source_prefix,
+            sqlite_cache=self._sqlite_cache,
+            source=source
+        )
         if not tar_files:
             logging.warning(f"[{self.lang}] No TAR files found in {source_prefix}")
             return
 
+        # Shard TAR files across workers
+        if self._num_workers > 1:
+            tar_files = [t for i, t in enumerate(tar_files) if i % self._num_workers == self._worker_id]
+            if verbose:
+                logging.info(f"[{self.lang}] {source}: Worker {self._worker_id}/{self._num_workers}: {len(tar_files)} TAR files (sharded)")
+        else:
+            if verbose:
+                logging.info(f"[{self.lang}] {source}: {len(tar_files)} TAR files")
+
         self._tar_files_by_source[source] = tar_files
-        logging.info(f"[{self.lang}] {source}: {len(tar_files)} TAR files")
 
         # Skip manifest loading if using SQLite cache
         if self._manifest_provider is not None:
@@ -160,11 +200,12 @@ class LanguageSourceManager:
         try:
             manifest = self.manifest_loader.load_manifest(self.s3_bucket, manifest_key)
             self._manifests_by_source[source] = manifest
-            logging.info(f"[{self.lang}] {source}: {len(manifest)} manifest entries")
+            if verbose:
+                logging.info(f"[{self.lang}] {source}: {len(manifest)} manifest entries")
         except Exception as e:
             logging.error(f"[{self.lang}] Failed to load manifest for {source}: {e}")
 
-    def _init_disk_source(self, source: str):
+    def _init_disk_source(self, source: str, verbose: bool = True):
         """Initialize a source from local disk."""
         source_dir = os.path.join(self.data_root, source)
 
@@ -172,14 +213,26 @@ class LanguageSourceManager:
             logging.warning(f"[{self.lang}] Source directory not found: {source_dir}")
             return
 
-        # List TAR files
-        tar_files = self.manifest_loader.list_tar_files(source_dir)
+        # List TAR files (use SQLite cache)
+        tar_files = self.manifest_loader.list_tar_files(
+            source_dir,
+            sqlite_cache=self._sqlite_cache,
+            source=source
+        )
         if not tar_files:
             logging.warning(f"[{self.lang}] No TAR files found in {source_dir}")
             return
 
+        # Shard TAR files across workers
+        if self._num_workers > 1:
+            tar_files = [t for i, t in enumerate(tar_files) if i % self._num_workers == self._worker_id]
+            if verbose:
+                logging.info(f"[{self.lang}] {source}: Worker {self._worker_id}/{self._num_workers}: {len(tar_files)} TAR files (sharded)")
+        else:
+            if verbose:
+                logging.info(f"[{self.lang}] {source}: {len(tar_files)} TAR files")
+
         self._tar_files_by_source[source] = tar_files
-        logging.info(f"[{self.lang}] {source}: {len(tar_files)} TAR files")
 
         # Skip manifest loading if using SQLite cache
         if self._manifest_provider is not None:
@@ -191,7 +244,8 @@ class LanguageSourceManager:
         try:
             manifest = self.manifest_loader.load_manifest(manifest_path)
             self._manifests_by_source[source] = manifest
-            logging.info(f"[{self.lang}] {source}: {len(manifest)} manifest entries")
+            if verbose:
+                logging.info(f"[{self.lang}] {source}: {len(manifest)} manifest entries")
         except Exception as e:
             logging.error(f"[{self.lang}] Failed to load manifest for {source}: {e}")
 
@@ -202,8 +256,21 @@ class LanguageSourceManager:
         Returns:
             True if successfully advanced, False if all sources exhausted
         """
+        # Check if we're in a DataLoader worker (reduce log verbosity)
+        import torch.utils.data
+        worker_info = torch.utils.data.get_worker_info()
+        in_worker = worker_info is not None
+
         while self._current_source_idx < len(self.sources):
             source = self.sources[self._current_source_idx]
+
+            # Lazy init: initialize source only when we need it
+            if source not in self._initialized_sources:
+                if self.storage_type == "s3":
+                    self._init_s3_source(source, verbose=not in_worker)
+                else:
+                    self._init_disk_source(source, verbose=not in_worker)
+                self._initialized_sources.add(source)
 
             if source not in self._tar_files_by_source:
                 self._current_source_idx += 1
@@ -310,15 +377,22 @@ class LanguageSourceManager:
         if not self._initialized:
             self._initialize()
 
+        # Track empty TARs to avoid downloading all TARs when manifest doesn't match
+        empty_tar_count = 0
+        max_empty_tars = 2  # Give up after 2 consecutive empty TARs
+        samples_from_current_tar = 0  # Track samples from current TAR stream
+
         while True:
             if self._current_stream is None:
                 if not self._advance_to_next_stream():
                     # All sources exhausted
                     self._exhausted = True
                     return None
+                samples_from_current_tar = 0  # Reset only when opening new TAR
 
             try:
                 sample = next(self._current_stream)
+                samples_from_current_tar += 1
 
                 # Apply filter
                 if not self.sample_filter(sample):
@@ -327,10 +401,19 @@ class LanguageSourceManager:
                 # Apply token augmentation
                 sample = self.token_augmenter(sample)
 
+                empty_tar_count = 0  # Reset on success
                 return sample
 
             except StopIteration:
-                # Current stream exhausted, try next
+                # Current stream exhausted
+                if samples_from_current_tar == 0:
+                    empty_tar_count += 1
+                    if empty_tar_count >= max_empty_tars:
+                        logging.warning(f"[{self.lang}] {empty_tar_count} consecutive empty TARs, giving up")
+                        self._exhausted = True
+                        return None
+                else:
+                    empty_tar_count = 0  # TAR had samples, reset
                 self._current_stream = None
                 continue
 
@@ -405,11 +488,11 @@ class SingleSourceManager:
         # S3 config
         s3_bucket: str = None,
         s3_prefix: str = None,
-        s3_client=None,
+        s3_endpoint_url: str = None,
         # Disk config
         data_root: str = None,
         # Common
-        prefetch_buffer_size: int = 100,
+        prefetch_buffer_size: int = 0,  # Disabled for true sequential streaming
         # SQLite manifest cache
         sqlite_cache_path: str = None,
     ):
@@ -424,7 +507,7 @@ class SingleSourceManager:
             storage_type: "s3" or "disk"
             s3_bucket: S3 bucket name (required for S3)
             s3_prefix: S3 prefix
-            s3_client: Boto3 S3 client (required for S3)
+            s3_endpoint_url: S3 endpoint URL (for R2, MinIO, etc.)
             data_root: Root directory for data (required for disk)
             prefetch_buffer_size: Number of samples to prefetch
             sqlite_cache_path: Path to SQLite manifest cache
@@ -438,12 +521,15 @@ class SingleSourceManager:
 
         # Storage-specific setup
         if storage_type == "s3":
-            if s3_bucket is None or s3_client is None:
-                raise ValueError("s3_bucket and s3_client required for S3 storage")
+            if s3_bucket is None:
+                raise ValueError("s3_bucket required for S3 storage")
             self.s3_bucket = s3_bucket
             self.s3_prefix = s3_prefix.rstrip('/') + '/' if s3_prefix else ''
-            self.s3_client = s3_client
-            self.manifest_loader = S3ManifestLoader(s3_client=s3_client)
+            self.s3_endpoint_url = s3_endpoint_url
+            # S3 client and manifest loader created lazily in _initialize()
+            # (boto3 clients are not fork-safe, so we create fresh ones in workers)
+            self.s3_client = None
+            self.manifest_loader = None
         elif storage_type == "disk":
             if data_root is None:
                 raise ValueError("data_root required for disk storage")
@@ -465,6 +551,7 @@ class SingleSourceManager:
         self._epoch = 0
         self._exhausted = False
         self._initialized = False
+        self._samples_yielded = 0  # Track samples for diagnostics
 
         # Prefetch buffer
         self._prefetch_buffer: Optional[PrefetchBuffer] = None
@@ -475,7 +562,35 @@ class SingleSourceManager:
         if self._initialized:
             return
 
-        logging.info(f"[{self.lang}:{self.source}] Initializing ({self.storage_type})...")
+        # Check if we're in a DataLoader worker (reduce log verbosity)
+        import torch.utils.data
+        worker_info = torch.utils.data.get_worker_info()
+        in_worker = worker_info is not None
+
+        # Worker sharding info
+        self._worker_id = worker_info.id if worker_info else 0
+        self._num_workers = worker_info.num_workers if worker_info else 1
+
+        if not in_worker:
+            logging.info(f"[{self.lang}:{self.source}] Initializing ({self.storage_type})...")
+
+        # Create S3 client if needed (fresh client per worker, boto3 is not fork-safe)
+        if self.storage_type == "s3" and self.s3_client is None:
+            try:
+                import boto3
+                from botocore.config import Config as BotoConfig
+                boto_config = BotoConfig(
+                    retries={'max_attempts': 3, 'mode': 'adaptive'},
+                    signature_version='s3v4',
+                )
+                client_kwargs = {'config': boto_config}
+                if self.s3_endpoint_url:
+                    client_kwargs['endpoint_url'] = self.s3_endpoint_url
+                self.s3_client = boto3.client('s3', **client_kwargs)
+                self.manifest_loader = S3ManifestLoader(s3_client=self.s3_client)
+            except Exception as e:
+                logging.error(f"[{self.lang}:{self.source}] Failed to create S3 client: {e}")
+                raise
 
         # Initialize SQLite cache if available
         if self.sqlite_cache_path and os.path.exists(self.sqlite_cache_path):
@@ -487,24 +602,38 @@ class SingleSourceManager:
                 logging.warning(f"[{self.lang}:{self.source}] Failed to open SQLite cache: {e}")
 
         if self.storage_type == "s3":
-            self._init_s3_source()
+            self._init_s3_source(verbose=not in_worker)
         else:
-            self._init_disk_source()
+            self._init_disk_source(verbose=not in_worker)
 
         self._initialized = True
-        self._advance_to_next_stream()
+        # NOTE: Don't call _advance_to_next_stream() here - let it be lazy
+        # The first call to get_next_sample() will open the stream when needed
 
-    def _init_s3_source(self):
+    def _init_s3_source(self, verbose: bool = True):
         """Initialize source from S3."""
         source_prefix = f"{self.s3_prefix}{self.source}/"
 
-        tar_files = self.manifest_loader.list_tar_files(self.s3_bucket, source_prefix)
+        # Use SQLite cache for TAR file listing to avoid repeated S3 list calls
+        tar_files = self.manifest_loader.list_tar_files(
+            self.s3_bucket, source_prefix,
+            sqlite_cache=self._sqlite_cache,
+            source=self.source
+        )
         if not tar_files:
             logging.warning(f"[{self.lang}:{self.source}] No TAR files found")
             return
 
+        # Shard TAR files across workers to avoid duplicate downloads
+        if self._num_workers > 1:
+            tar_files = [t for i, t in enumerate(tar_files) if i % self._num_workers == self._worker_id]
+            if verbose:
+                logging.info(f"[{self.lang}:{self.source}] Worker {self._worker_id}/{self._num_workers}: {len(tar_files)} TAR files (sharded)")
+        else:
+            if verbose:
+                logging.info(f"[{self.lang}:{self.source}] {len(tar_files)} TAR files")
+
         self._tar_files = tar_files
-        logging.info(f"[{self.lang}:{self.source}] {len(tar_files)} TAR files")
 
         if self._manifest_provider is not None:
             return
@@ -512,11 +641,12 @@ class SingleSourceManager:
         manifest_key = f"{source_prefix}tarred_audio_manifest.json"
         try:
             self._manifest = self.manifest_loader.load_manifest(self.s3_bucket, manifest_key)
-            logging.info(f"[{self.lang}:{self.source}] {len(self._manifest)} manifest entries")
+            if verbose:
+                logging.info(f"[{self.lang}:{self.source}] {len(self._manifest)} manifest entries")
         except Exception as e:
             logging.error(f"[{self.lang}:{self.source}] Failed to load manifest: {e}")
 
-    def _init_disk_source(self):
+    def _init_disk_source(self, verbose: bool = True):
         """Initialize source from local disk."""
         source_dir = os.path.join(self.data_root, self.source)
 
@@ -524,13 +654,26 @@ class SingleSourceManager:
             logging.warning(f"[{self.lang}:{self.source}] Directory not found: {source_dir}")
             return
 
-        tar_files = self.manifest_loader.list_tar_files(source_dir)
+        # Use SQLite cache for TAR file listing
+        tar_files = self.manifest_loader.list_tar_files(
+            source_dir,
+            sqlite_cache=self._sqlite_cache,
+            source=self.source
+        )
         if not tar_files:
             logging.warning(f"[{self.lang}:{self.source}] No TAR files found")
             return
 
+        # Shard TAR files across workers to avoid duplicate downloads
+        if self._num_workers > 1:
+            tar_files = [t for i, t in enumerate(tar_files) if i % self._num_workers == self._worker_id]
+            if verbose:
+                logging.info(f"[{self.lang}:{self.source}] Worker {self._worker_id}/{self._num_workers}: {len(tar_files)} TAR files (sharded)")
+        else:
+            if verbose:
+                logging.info(f"[{self.lang}:{self.source}] {len(tar_files)} TAR files")
+
         self._tar_files = tar_files
-        logging.info(f"[{self.lang}:{self.source}] {len(tar_files)} TAR files")
 
         if self._manifest_provider is not None:
             return
@@ -538,7 +681,8 @@ class SingleSourceManager:
         manifest_path = os.path.join(source_dir, "tarred_audio_manifest.json")
         try:
             self._manifest = self.manifest_loader.load_manifest(manifest_path)
-            logging.info(f"[{self.lang}:{self.source}] {len(self._manifest)} manifest entries")
+            if verbose:
+                logging.info(f"[{self.lang}:{self.source}] {len(self._manifest)} manifest entries")
         except Exception as e:
             logging.error(f"[{self.lang}:{self.source}] Failed to load manifest: {e}")
 
@@ -608,7 +752,9 @@ class SingleSourceManager:
                 self._prefetch_iter = iter(self._prefetch_buffer)
 
             try:
-                return next(self._prefetch_iter)
+                sample = next(self._prefetch_iter)
+                self._samples_yielded += 1
+                return sample
             except StopIteration:
                 self._exhausted = True
                 return None
@@ -616,22 +762,39 @@ class SingleSourceManager:
         if not self._initialized:
             self._initialize()
 
+        # Track empty TARs to avoid downloading all TARs when manifest doesn't match
+        empty_tar_count = 0
+        max_empty_tars = 2  # Give up after 2 empty TARs
+        samples_from_current_tar = 0  # Track samples from current TAR stream
+
         while True:
             if self._current_stream is None:
                 if not self._advance_to_next_stream():
                     self._exhausted = True
                     return None
+                samples_from_current_tar = 0  # Reset only when opening new TAR
 
             try:
                 sample = next(self._current_stream)
+                samples_from_current_tar += 1
 
                 if not self.sample_filter(sample):
                     continue
 
                 sample = self.token_augmenter(sample)
+                self._samples_yielded += 1
+                empty_tar_count = 0  # Reset on success
                 return sample
 
             except StopIteration:
+                if samples_from_current_tar == 0:
+                    empty_tar_count += 1
+                    if empty_tar_count >= max_empty_tars:
+                        logging.warning(f"[{self.lang}:{self.source}] {empty_tar_count} consecutive empty TARs, giving up")
+                        self._exhausted = True
+                        return None
+                else:
+                    empty_tar_count = 0  # TAR had samples, reset
                 self._current_stream = None
                 continue
 
@@ -645,8 +808,12 @@ class SingleSourceManager:
         self._current_tar_idx = 0
         self._current_stream = None
         self._exhausted = False
+        self._samples_yielded = 0
         self._epoch += 1
-        logging.info(f"[{self.lang}:{self.source}] Reset for epoch {self._epoch}")
+        # Only log reset in main process (not workers)
+        import torch.utils.data
+        if torch.utils.data.get_worker_info() is None:
+            logging.info(f"[{self.lang}:{self.source}] Reset for epoch {self._epoch}")
 
     @property
     def exhausted(self) -> bool:

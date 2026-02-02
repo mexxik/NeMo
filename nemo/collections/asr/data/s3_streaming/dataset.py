@@ -51,12 +51,18 @@ class ShuffleBuffer:
 
     def is_ready(self) -> bool:
         """Check if buffer is full enough to start yielding."""
+        if self.buffer_size == 0:
+            # Pass-through mode: ready if we have any items (no buffering)
+            return len(self.buffer) > 0
         return len(self.buffer) >= self.buffer_size
 
     def get_random(self):
         """Get and remove a random item from the buffer."""
         if not self.buffer:
             return None
+        if self.buffer_size == 0:
+            # Pass-through mode: just pop (no randomness needed)
+            return self.buffer.pop()
         idx = random.randint(0, len(self.buffer) - 1)
         # Swap with last and pop for O(1) removal
         self.buffer[idx], self.buffer[-1] = self.buffer[-1], self.buffer[idx]
@@ -128,14 +134,13 @@ class S3MultiLangStreamingDataset(IterableDataset):
         # Filtering
         min_duration: float = 0.5,
         max_duration: float = 15.0,
-        max_chars_per_sec: float = 25.0,
 
         # Token augmentation
         add_eou_token: bool = True,
         eou_token: str = "<eou>",
 
-        # Shuffle buffer
-        shuffle_buffer_size: int = 2000,
+        # Shuffle buffer (0 = no buffering, stream directly)
+        shuffle_buffer_size: int = 0,
 
         # Distributed training
         global_rank: int = 0,
@@ -160,9 +165,14 @@ class S3MultiLangStreamingDataset(IterableDataset):
         # Memory optimization
         use_sqlite_cache: bool = True,  # Use SQLite for manifest caching (saves RAM with multiple workers)
         sqlite_cache_dir: str = None,  # Custom cache directory (default: ~/.cache/nemo_manifest_cache)
+        sqlite_cache_path: str = None,  # Explicit cache file path (overrides auto-generated name)
 
         # Rotation mode
         rotation_level: str = "source",  # "source" or "language"
+        samples_per_source: int = 50,  # Samples to get from each source before rotating (reduces parallel TAR streams)
+
+        # Prefetch (background sample loading)
+        prefetch_buffer_size: int = 100,  # Number of samples to prefetch per source (0 to disable)
     ):
         """
         Initialize multi-language streaming dataset.
@@ -178,7 +188,6 @@ class S3MultiLangStreamingDataset(IterableDataset):
             sample_rate: Audio sample rate (default 16000)
             min_duration: Minimum sample duration in seconds
             max_duration: Maximum sample duration in seconds
-            max_chars_per_sec: Maximum characters per second (filter bad transcripts)
             add_eou_token: Whether to add <eou> token after sentence-ending punctuation
             eou_token: The EOU token string
             shuffle_buffer_size: Size of shuffle buffer for randomization
@@ -200,6 +209,8 @@ class S3MultiLangStreamingDataset(IterableDataset):
         if rotation_level not in ("language", "source"):
             raise ValueError(f"rotation_level must be 'language' or 'source', got: {rotation_level}")
         self.rotation_level = rotation_level
+        self.samples_per_source = samples_per_source
+        self.prefetch_buffer_size = prefetch_buffer_size
 
         # Determine storage type
         if data_root is not None:
@@ -209,6 +220,7 @@ class S3MultiLangStreamingDataset(IterableDataset):
             self.s3_prefix = None
             self.s3_endpoint_url = None
             self.s3_client = None
+            logging.info(f"[DATASET_INIT] Using DISK storage: {data_root}")
             if not os.path.isdir(data_root):
                 raise ValueError(f"data_root directory not found: {data_root}")
         elif s3_bucket is not None:
@@ -242,17 +254,12 @@ class S3MultiLangStreamingDataset(IterableDataset):
         self.use_start_end_token = use_start_end_token
         self.return_sample_id = return_sample_id
 
-        # Create filter with all the same filters as 01_gather.py
+        # Create filter (duration and text length bounds only)
         filter_config = FilterConfig(
             min_duration=min_duration,
             max_duration=max_duration,
-            min_chars_per_sec=3.0,  # Only applied for duration > 2s
-            max_chars_per_sec=max_chars_per_sec,
             min_chars=1,
             max_chars=500,
-            validate_text=True,  # Garbage/corrupted text detection
-            validate_chars=True,  # Per-language character validation
-            languages=list(language_sources.keys()),  # Languages for char validation
         )
         self.sample_filter = SampleFilter(filter_config)
 
@@ -314,18 +321,27 @@ class S3MultiLangStreamingDataset(IterableDataset):
         self.use_sqlite_cache = use_sqlite_cache
         self._sqlite_cache_path: Optional[str] = None
         if use_sqlite_cache:
-            cache_dir = sqlite_cache_dir or get_default_cache_dir()
-            # Create cache name from sorted source names (path-independent)
-            all_sources = sorted(
-                source for sources in language_sources.values() for source in sources
-            )
-            cache_name = "_".join(all_sources)
-            # Truncate if too long, but keep it readable
-            if len(cache_name) > 100:
-                import hashlib
-                cache_name = cache_name[:60] + "_" + hashlib.md5(cache_name.encode()).hexdigest()[:8]
-            self._sqlite_cache_path = os.path.join(cache_dir, f"manifest_{cache_name}.db")
-            os.makedirs(cache_dir, exist_ok=True)
+            if sqlite_cache_path:
+                # Use explicit cache path (allows train/validation to share same cache)
+                self._sqlite_cache_path = sqlite_cache_path
+                cache_dir = os.path.dirname(sqlite_cache_path)
+                if cache_dir:
+                    os.makedirs(cache_dir, exist_ok=True)
+                logging.info(f"Using explicit SQLite cache path: {sqlite_cache_path}")
+            else:
+                # Auto-generate cache name from source names
+                cache_dir = sqlite_cache_dir or get_default_cache_dir()
+                # Create cache name from sorted source names (path-independent)
+                all_sources = sorted(
+                    source for sources in language_sources.values() for source in sources
+                )
+                cache_name = "_".join(all_sources)
+                # Truncate if too long, but keep it readable
+                if len(cache_name) > 100:
+                    import hashlib
+                    cache_name = cache_name[:60] + "_" + hashlib.md5(cache_name.encode()).hexdigest()[:8]
+                self._sqlite_cache_path = os.path.join(cache_dir, f"manifest_{cache_name}.db")
+                os.makedirs(cache_dir, exist_ok=True)
 
         # Audio merger for multi-utterance training
         self.merge_config = MergeConfig(
@@ -340,10 +356,23 @@ class S3MultiLangStreamingDataset(IterableDataset):
         self.audio_merger = AudioMerger(self.merge_config, sample_rate=sample_rate)
 
         # Store samples_per_epoch for __len__
-        # If not provided, auto-calculate from manifest counts
+        # If not provided, try to get from existing cache, else calculate
         if samples_per_epoch is not None:
             self.samples_per_epoch = samples_per_epoch
             logging.info(f"Using provided samples_per_epoch: {samples_per_epoch}")
+        elif self._sqlite_cache_path and os.path.exists(self._sqlite_cache_path):
+            # Cache exists - just read count from it, no validation, no downloading
+            try:
+                from .sqlite_manifest import SQLiteManifestCache
+                cache = SQLiteManifestCache(self._sqlite_cache_path, read_only=True)
+                self.samples_per_epoch = cache.count_entries()
+                cache.close()
+                logging.info(f"Using existing SQLite cache: {self._sqlite_cache_path}")
+                logging.info(f"Samples per epoch from cache: {self.samples_per_epoch}")
+                logging.info("SKIPPING cache validation - trusting existing cache")
+            except Exception as e:
+                logging.warning(f"Failed to read cache, will calculate: {e}")
+                self.samples_per_epoch = self._calculate_total_samples()
         else:
             self.samples_per_epoch = self._calculate_total_samples()
             if self.samples_per_epoch > 0:
@@ -405,7 +434,13 @@ class S3MultiLangStreamingDataset(IterableDataset):
                     for sources in self.language_sources.values():
                         expected_sources.update(sources)
 
-                    if cached_sources == expected_sources:
+                    # Also check TAR file lists are cached
+                    tar_cache_valid = all(
+                        sqlite_cache.has_tar_files(source)
+                        for source in expected_sources
+                    )
+
+                    if cached_sources == expected_sources and tar_cache_valid:
                         # Cache is valid, just count from it
                         total = sqlite_cache.count_entries()
                         logging.info(f"Using existing SQLite manifest cache: {self._sqlite_cache_path}")
@@ -414,7 +449,8 @@ class S3MultiLangStreamingDataset(IterableDataset):
                         return total
                     else:
                         # Cache is stale, rebuild it
-                        logging.info(f"SQLite cache sources mismatch, rebuilding...")
+                        reason = "TAR file lists missing" if not tar_cache_valid else "sources mismatch"
+                        logging.info(f"SQLite cache invalid ({reason}), rebuilding...")
                         sqlite_cache.close()
                         os.remove(self._sqlite_cache_path)
                 except Exception as e:
@@ -428,50 +464,96 @@ class S3MultiLangStreamingDataset(IterableDataset):
             sqlite_cache = SQLiteManifestCache(self._sqlite_cache_path)
             logging.info(f"Building SQLite manifest cache: {self._sqlite_cache_path}")
 
+        # Count total sources for progress indicator
+        total_sources = sum(len(sources) for sources in self.language_sources.values())
+
+        # Build flat list of (lang, source) for progress bar
+        all_sources = [
+            (lang, source)
+            for lang, sources in self.language_sources.items()
+            for source in sources
+        ]
+
+        # Try to use tqdm for overall progress
+        try:
+            from tqdm import tqdm
+            sources_iterator = tqdm(
+                all_sources,
+                desc="Building manifest cache",
+                unit=" datasets",
+                ncols=100,
+            )
+            use_tqdm = True
+        except ImportError:
+            sources_iterator = all_sources
+            use_tqdm = False
+
         if self.storage_type == "s3":
             manifest_loader = S3ManifestLoader(s3_client=self.s3_client)
-            for lang, sources in self.language_sources.items():
-                for source in sources:
-                    source_prefix = f"{self.s3_prefix.rstrip('/') + '/' if self.s3_prefix else ''}{source}/"
-                    manifest_key = f"{source_prefix}tarred_audio_manifest.json"
-                    try:
-                        if sqlite_cache:
-                            # Load full manifest and add to cache
-                            manifest = manifest_loader.load_manifest(self.s3_bucket, manifest_key)
-                            count = sqlite_cache.add_entries_batch(manifest, source)
-                            total += count
-                            logging.info(f"[{lang}] {source}: {count} manifest entries (cached)")
-                        else:
-                            count = manifest_loader.count_manifest_entries(
-                                self.s3_bucket, manifest_key
-                            )
-                            total += count
-                            logging.info(f"[{lang}] {source}: {count} manifest entries")
-                    except Exception as e:
-                        logging.warning(f"[{lang}] Failed to load manifest for {source}: {e}")
+            for idx, (lang, source) in enumerate(sources_iterator):
+                if use_tqdm:
+                    sources_iterator.set_postfix_str(f"{lang}/{source}")
+                source_prefix = f"{self.s3_prefix.rstrip('/') + '/' if self.s3_prefix else ''}{source}/"
+                manifest_key = f"{source_prefix}tarred_audio_manifest.json"
+                try:
+                    if sqlite_cache:
+                        # Load full manifest and add to cache
+                        manifest = manifest_loader.load_manifest(self.s3_bucket, manifest_key)
+                        count = sqlite_cache.add_entries_batch(manifest, source)
+                        total += count
+                        # Also cache TAR file list to avoid S3 list calls in workers
+                        tar_files = manifest_loader.list_tar_files(
+                            self.s3_bucket, source_prefix,
+                            sqlite_cache=sqlite_cache, source=source
+                        )
+                        logging.info(f"[{idx+1}/{total_sources}] [{lang}] {source}: {count} entries, {len(tar_files)} TARs")
+                    else:
+                        count = manifest_loader.count_manifest_entries(
+                            self.s3_bucket, manifest_key
+                        )
+                        total += count
+                        logging.info(f"[{idx+1}/{total_sources}] [{lang}] {source}: {count} manifest entries")
+                except Exception as e:
+                    logging.warning(f"[{lang}] Failed to load manifest for {source}: {e}")
         else:
             # Disk storage
             manifest_loader = DiskManifestLoader()
-            for lang, sources in self.language_sources.items():
-                for source in sources:
-                    manifest_path = os.path.join(self.data_root, source, "tarred_audio_manifest.json")
-                    try:
-                        if sqlite_cache:
-                            # Load full manifest and add to cache
-                            manifest = manifest_loader.load_manifest(manifest_path)
-                            count = sqlite_cache.add_entries_batch(manifest, source)
-                            total += count
-                            logging.info(f"[{lang}] {source}: {count} manifest entries (cached)")
-                        else:
-                            count = manifest_loader.count_manifest_entries(manifest_path)
-                            total += count
-                            logging.info(f"[{lang}] {source}: {count} manifest entries")
-                    except Exception as e:
-                        logging.warning(f"[{lang}] Failed to load manifest for {source}: {e}")
+            for idx, (lang, source) in enumerate(sources_iterator):
+                if use_tqdm:
+                    sources_iterator.set_postfix_str(f"{lang}/{source}")
+                source_dir = os.path.join(self.data_root, source)
+                manifest_path = os.path.join(source_dir, "tarred_audio_manifest.json")
+                try:
+                    if sqlite_cache:
+                        # Load full manifest and add to cache
+                        manifest = manifest_loader.load_manifest(manifest_path)
+                        count = sqlite_cache.add_entries_batch(manifest, source)
+                        total += count
+                        # Also cache TAR file list
+                        tar_files = manifest_loader.list_tar_files(
+                            source_dir,
+                            sqlite_cache=sqlite_cache, source=source
+                        )
+                        logging.info(f"[{idx+1}/{total_sources}] [{lang}] {source}: {count} entries, {len(tar_files)} TARs")
+                    else:
+                        count = manifest_loader.count_manifest_entries(manifest_path)
+                        total += count
+                        logging.info(f"[{idx+1}/{total_sources}] [{lang}] {source}: {count} manifest entries")
+                except Exception as e:
+                    logging.warning(f"[{lang}] Failed to load manifest for {source}: {e}")
 
         if sqlite_cache:
+            # Checkpoint to ensure all data is flushed before workers read
+            sqlite_cache.checkpoint()
             sqlite_cache.close()
             logging.info(f"SQLite manifest cache built with {total} entries")
+            logging.info("=" * 60)
+            logging.info("CACHE BUILD COMPLETE - ready for training")
+            logging.info("=" * 60)
+            # Force flush to ensure logs appear before workers start
+            import sys
+            sys.stdout.flush()
+            sys.stderr.flush()
 
         return total
 
@@ -496,8 +578,9 @@ class S3MultiLangStreamingDataset(IterableDataset):
                     storage_type="s3",
                     s3_bucket=self.s3_bucket,
                     s3_prefix=self.s3_prefix,
-                    s3_client=self.s3_client,
+                    s3_endpoint_url=self.s3_endpoint_url,
                     sqlite_cache_path=self._sqlite_cache_path,
+                    prefetch_buffer_size=self.prefetch_buffer_size,
                 )
             else:
                 manager = LanguageSourceManager(
@@ -508,6 +591,7 @@ class S3MultiLangStreamingDataset(IterableDataset):
                     storage_type="disk",
                     data_root=self.data_root,
                     sqlite_cache_path=self._sqlite_cache_path,
+                    prefetch_buffer_size=self.prefetch_buffer_size,
                 )
             language_managers[lang] = manager
 
@@ -532,8 +616,9 @@ class S3MultiLangStreamingDataset(IterableDataset):
                         storage_type="s3",
                         s3_bucket=self.s3_bucket,
                         s3_prefix=self.s3_prefix,
-                        s3_client=self.s3_client,
+                        s3_endpoint_url=self.s3_endpoint_url,
                         sqlite_cache_path=self._sqlite_cache_path,
+                        prefetch_buffer_size=self.prefetch_buffer_size,
                     )
                 else:
                     manager = SingleSourceManager(
@@ -544,6 +629,7 @@ class S3MultiLangStreamingDataset(IterableDataset):
                         storage_type="disk",
                         data_root=self.data_root,
                         sqlite_cache_path=self._sqlite_cache_path,
+                        prefetch_buffer_size=self.prefetch_buffer_size,
                     )
                 source_managers[manager_key] = manager
 
@@ -551,6 +637,7 @@ class S3MultiLangStreamingDataset(IterableDataset):
             language_sources=self.language_sources,
             source_managers=source_managers,
             languages_order=sorted(self.language_sources.keys()),
+            samples_per_source=self.samples_per_source,
         )
 
     def __iter__(self) -> Iterator[Tuple[torch.Tensor, ...]]:
@@ -563,6 +650,10 @@ class S3MultiLangStreamingDataset(IterableDataset):
         """
         # Get worker info for multi-worker data loading
         worker_info = torch.utils.data.get_worker_info()
+        worker_id = worker_info.id if worker_info is not None else 0
+
+        logging.debug(f"[Worker {worker_id}] Starting iteration")
+
         if worker_info is not None:
             # In multi-worker mode, we could shard languages across workers
             # For now, each worker gets all languages but different random seeds

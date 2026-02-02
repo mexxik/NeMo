@@ -8,9 +8,15 @@ Supports two rotation modes:
 
 from typing import Dict, Iterator, List, Optional, Tuple
 
+import torch.utils.data
 from nemo.utils import logging
 
 from .lang_source_manager import LanguageSourceManager
+
+
+def _in_worker() -> bool:
+    """Check if we're running in a DataLoader worker process."""
+    return torch.utils.data.get_worker_info() is not None
 
 
 class RoundRobinInterleaver:
@@ -112,14 +118,16 @@ class RoundRobinInterleaver:
 
             # Language exhausted
             self._active_languages.discard(lang)
-            logging.info(f"[{lang}] Exhausted for epoch {self._epoch}")
+            if not _in_worker():
+                logging.info(f"[{lang}] Exhausted for epoch {self._epoch}")
 
         return None
 
     def _start_new_epoch(self):
         """Start a new epoch by resetting all language managers."""
         self._epoch += 1
-        logging.info(f"Starting epoch {self._epoch}")
+        if not _in_worker():
+            logging.info(f"Starting epoch {self._epoch}")
 
         for lang, manager in self.language_managers.items():
             manager.reset()
@@ -187,6 +195,7 @@ class SourceRoundRobinInterleaver:
         language_sources: Dict[str, List[str]],
         source_managers: Dict[str, 'SingleSourceManager'],
         languages_order: Optional[List[str]] = None,
+        samples_per_source: int = 50,
     ):
         """
         Initialize source-level round-robin interleaver.
@@ -196,9 +205,13 @@ class SourceRoundRobinInterleaver:
             source_managers: Dict mapping "lang:source" to SingleSourceManager
             languages_order: Optional explicit ordering of languages
                             (defaults to sorted order)
+            samples_per_source: Number of samples to get from each source before
+                               rotating to the next. Higher values = fewer parallel
+                               TAR streams but less fine-grained mixing. Default 50.
         """
         self.language_sources = language_sources
         self.source_managers = source_managers
+        self.samples_per_source = samples_per_source
 
         # Language order (sorted alphabetically by default)
         if languages_order is not None:
@@ -224,7 +237,7 @@ class SourceRoundRobinInterleaver:
         total_sources = sum(len(srcs) for srcs in self._sources_by_lang.values())
         logging.info(
             f"SourceRoundRobinInterleaver: {len(self.languages_order)} languages, "
-            f"{total_sources} sources total"
+            f"{total_sources} sources, {samples_per_source} samples/source batch"
         )
         for lang in self.languages_order:
             logging.info(f"  [{lang}] {len(self._sources_by_lang[lang])} sources: {self._sources_by_lang[lang]}")
@@ -256,10 +269,10 @@ class SourceRoundRobinInterleaver:
 
     def _get_next_sample(self) -> Optional[dict]:
         """
-        Get next sample using round-robin across languages and sources.
+        Get next sample using strict round-robin: 1 sample per language, rotating.
 
-        For each language visit, picks the next source in that language's
-        rotation. Sources wrap around when exhausted.
+        Order: ar→da→de→en→...→zh→ar→da→... (cycling through all languages)
+        Each language also rotates through its sources.
 
         Returns:
             Sample dict or None if all languages exhausted
@@ -267,16 +280,16 @@ class SourceRoundRobinInterleaver:
         if not self._active_languages:
             return None
 
-        # Try each language in order, starting from current index
+        # Try each language starting from current index
         attempts = 0
         max_attempts = len(self.languages_order)
 
         while attempts < max_attempts:
             lang = self.languages_order[self._current_lang_idx]
-            self._current_lang_idx = (self._current_lang_idx + 1) % len(self.languages_order)
             attempts += 1
 
             if lang not in self._active_languages:
+                self._current_lang_idx = (self._current_lang_idx + 1) % len(self.languages_order)
                 continue
 
             # Get current source for this language
@@ -284,10 +297,7 @@ class SourceRoundRobinInterleaver:
             source_idx = self._source_idx_by_lang[lang]
             src = sources[source_idx]
 
-            # Advance to next source for this language (round-robin)
-            self._source_idx_by_lang[lang] = (source_idx + 1) % len(sources)
-
-            # Get sample from this source
+            # Try to get sample from this source
             manager_key = f"{lang}:{src}"
             manager = self.source_managers[manager_key]
             sample = manager.get_next_sample()
@@ -295,15 +305,20 @@ class SourceRoundRobinInterleaver:
             if sample is not None:
                 sample['lang'] = lang
                 sample['source'] = src
+
+                # Rotate to next source for this language
+                self._source_idx_by_lang[lang] = (source_idx + 1) % len(sources)
+                # Rotate to next language
+                self._current_lang_idx = (self._current_lang_idx + 1) % len(self.languages_order)
+
                 return sample
 
-            # This specific source exhausted - mark language as needing check
-            # Try other sources in this language
+            # Source exhausted - try other sources for this language
             sources_tried = 1
             while sources_tried < len(sources):
+                self._source_idx_by_lang[lang] = (self._source_idx_by_lang[lang] + 1) % len(sources)
                 source_idx = self._source_idx_by_lang[lang]
                 src = sources[source_idx]
-                self._source_idx_by_lang[lang] = (source_idx + 1) % len(sources)
 
                 manager_key = f"{lang}:{src}"
                 manager = self.source_managers[manager_key]
@@ -312,20 +327,24 @@ class SourceRoundRobinInterleaver:
                 if sample is not None:
                     sample['lang'] = lang
                     sample['source'] = src
+                    # Rotate to next source and language
+                    self._source_idx_by_lang[lang] = (source_idx + 1) % len(sources)
+                    self._current_lang_idx = (self._current_lang_idx + 1) % len(self.languages_order)
                     return sample
 
                 sources_tried += 1
 
             # All sources for this language exhausted
             self._active_languages.discard(lang)
-            logging.info(f"[{lang}] All sources exhausted for epoch {self._epoch}")
+            self._current_lang_idx = (self._current_lang_idx + 1) % len(self.languages_order)
 
         return None
 
     def _start_new_epoch(self):
         """Start a new epoch by resetting all source managers."""
         self._epoch += 1
-        logging.info(f"Starting epoch {self._epoch}")
+        if not _in_worker():
+            logging.info(f"Starting epoch {self._epoch}")
 
         for manager in self.source_managers.values():
             manager.reset()

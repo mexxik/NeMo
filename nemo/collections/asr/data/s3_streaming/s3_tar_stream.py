@@ -134,11 +134,14 @@ class S3TarStream:
                 tar_stream = S3StreamWrapper(body)
 
                 # Open as tarfile in streaming mode
+                total_files_in_tar = 0
+                matched_files_in_tar = 0
                 with tarfile.open(fileobj=tar_stream, mode='r|*') as tar:
                     for member in tar:
                         if not member.isfile():
                             continue
 
+                        total_files_in_tar += 1
                         filename = member.name
 
                         # Skip already processed files (from previous retry)
@@ -147,8 +150,9 @@ class S3TarStream:
 
                         # Check if this file is in our manifest
                         if filename not in self.manifest_entries:
-                            # Skip files not in manifest (filtered out)
                             continue
+
+                        matched_files_in_tar += 1
 
                         # Extract audio bytes
                         try:
@@ -166,7 +170,6 @@ class S3TarStream:
                         # Parse WAV to float32
                         audio = fast_wav_to_float32(audio_bytes)
                         if audio is None:
-                            logging.debug(f"Failed to parse WAV: {filename}")
                             continue
 
                         # Get manifest entry
@@ -404,17 +407,27 @@ class S3ManifestLoader:
             logging.warning(f"Failed to count entries in s3://{s3_bucket}/{manifest_key}: {e}")
             return 0
 
-    def list_tar_files(self, s3_bucket: str, prefix: str) -> list:
+    def list_tar_files(self, s3_bucket: str, prefix: str, sqlite_cache=None, source: str = None) -> list:
         """
         List TAR files in an S3 prefix.
 
         Args:
             s3_bucket: S3 bucket name
             prefix: S3 prefix (e.g., "asr-data/common_en_train/")
+            sqlite_cache: Optional SQLiteManifestCache for caching TAR file lists
+            source: Source name for cache key (required if sqlite_cache is provided)
 
         Returns:
             List of TAR file keys sorted by name
         """
+        # Try to get from SQLite cache first
+        if sqlite_cache is not None and source is not None:
+            cached_tars = sqlite_cache.get_tar_files(source)
+            if cached_tars is not None:
+                logging.debug(f"[{source}] Using cached TAR file list ({len(cached_tars)} files)")
+                return cached_tars
+
+        # List from S3
         tar_files = []
         paginator = self.s3_client.get_paginator('list_objects_v2')
 
@@ -424,4 +437,14 @@ class S3ManifestLoader:
                 if key.endswith('.tar'):
                     tar_files.append(key)
 
-        return sorted(tar_files)
+        tar_files = sorted(tar_files)
+
+        # Cache to SQLite if available
+        if sqlite_cache is not None and source is not None and tar_files:
+            try:
+                sqlite_cache.add_tar_files(source, tar_files)
+                logging.debug(f"[{source}] Cached {len(tar_files)} TAR files to SQLite")
+            except Exception as e:
+                logging.warning(f"[{source}] Failed to cache TAR files: {e}")
+
+        return tar_files

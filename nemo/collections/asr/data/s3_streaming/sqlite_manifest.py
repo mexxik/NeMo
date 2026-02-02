@@ -48,19 +48,22 @@ class SQLiteManifestCache:
     - Single database file shared by all workers
     - WAL mode for concurrent reads
     - Indexed lookups by audio_filepath
+    - TAR file list caching (avoids repeated S3 list operations)
     - Automatic schema creation
 
     Usage:
         # Main process: build cache
         cache = SQLiteManifestCache(db_path)
         cache.add_entries(manifest_dict, source="common_en_train")
+        cache.add_tar_files("common_en_train", ["audio_0.tar", "audio_1.tar"])
 
         # Workers: query cache
         cache = SQLiteManifestCache(db_path, read_only=True)
         entry = cache.get("audio_0/sample_001.wav")
+        tar_files = cache.get_tar_files("common_en_train")
     """
 
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2  # Bumped for tar_files table
 
     def __init__(self, db_path: str, read_only: bool = False):
         """
@@ -81,6 +84,15 @@ class SQLiteManifestCache:
                 # Read-only mode for workers
                 uri = f"file:{self.db_path}?mode=ro"
                 self._conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
+                # Verify database integrity on first access
+                try:
+                    self._conn.execute("SELECT 1 FROM metadata LIMIT 1").fetchone()
+                except sqlite3.DatabaseError as e:
+                    self._conn.close()
+                    self._conn = None
+                    raise sqlite3.DatabaseError(
+                        f"SQLite cache corrupted: {e}. Delete cache with: rm -rf ~/.cache/nemo_manifest_cache/"
+                    )
             else:
                 self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
                 # WAL mode for concurrent reads
@@ -114,6 +126,19 @@ class SQLiteManifestCache:
                 key TEXT PRIMARY KEY,
                 value TEXT
             )
+        """)
+        # TAR file list cache - avoids repeated S3 list operations
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS tar_files (
+                source TEXT NOT NULL,
+                tar_path TEXT NOT NULL,
+                tar_order INTEGER NOT NULL,
+                PRIMARY KEY (source, tar_path)
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_tar_source
+            ON tar_files(source)
         """)
         # Store schema version
         conn.execute(
@@ -154,7 +179,13 @@ class SQLiteManifestCache:
 
         return count
 
-    def add_entries_batch(self, entries: Dict[str, dict], source: str, batch_size: int = 10000) -> int:
+    def add_entries_batch(
+        self,
+        entries: Dict[str, dict],
+        source: str,
+        batch_size: int = 10000,
+        show_progress: bool = True,
+    ) -> int:
         """
         Add manifest entries in batches for better performance with large manifests.
 
@@ -162,6 +193,7 @@ class SQLiteManifestCache:
             entries: Dict mapping audio_filepath to manifest entry
             source: Source name
             batch_size: Number of entries per batch
+            show_progress: Show tqdm progress bar for large datasets
 
         Returns:
             Number of entries added
@@ -169,8 +201,28 @@ class SQLiteManifestCache:
         conn = self._get_connection()
         count = 0
         batch = []
+        total_entries = len(entries)
 
-        for filepath, entry in entries.items():
+        # Use tqdm for large datasets (>50k entries)
+        use_tqdm = show_progress and total_entries > 50000
+        if use_tqdm:
+            try:
+                from tqdm import tqdm
+                iterator = tqdm(
+                    entries.items(),
+                    total=total_entries,
+                    desc=f"  Caching {source}",
+                    unit=" entries",
+                    leave=False,
+                    ncols=100,
+                )
+            except ImportError:
+                iterator = entries.items()
+                use_tqdm = False
+        else:
+            iterator = entries.items()
+
+        for filepath, entry in iterator:
             batch.append((
                 filepath,
                 source,
@@ -264,15 +316,101 @@ class SQLiteManifestCache:
         ).fetchall()
         return [row[0] for row in rows]
 
+    def get_filenames_for_source(self, source: str) -> set:
+        """
+        Get all audio filenames for a specific source.
+
+        This is much faster than individual lookups when streaming TAR files.
+
+        Args:
+            source: Source name (e.g., "common_en_train")
+
+        Returns:
+            Set of audio_filepath strings
+        """
+        conn = self._get_connection()
+        rows = conn.execute(
+            "SELECT audio_filepath FROM manifest_entries WHERE source = ?",
+            (source,)
+        ).fetchall()
+        return {row[0] for row in rows}
+
+    def add_tar_files(self, source: str, tar_files: list) -> int:
+        """
+        Add TAR file list for a source.
+
+        Args:
+            source: Source name (e.g., "common_en_train")
+            tar_files: List of TAR file paths
+
+        Returns:
+            Number of TAR files added, or 0 if read-only
+        """
+        if self.read_only:
+            return 0
+
+        conn = self._get_connection()
+        with conn:
+            # Clear existing entries for this source
+            conn.execute("DELETE FROM tar_files WHERE source = ?", (source,))
+            # Insert new entries with order
+            for idx, tar_path in enumerate(tar_files):
+                conn.execute(
+                    "INSERT INTO tar_files (source, tar_path, tar_order) VALUES (?, ?, ?)",
+                    (source, tar_path, idx)
+                )
+        return len(tar_files)
+
+    def get_tar_files(self, source: str) -> Optional[list]:
+        """
+        Get TAR file list for a source.
+
+        Args:
+            source: Source name (e.g., "common_en_train")
+
+        Returns:
+            List of TAR file paths in order, or None if not cached
+        """
+        conn = self._get_connection()
+        rows = conn.execute(
+            "SELECT tar_path FROM tar_files WHERE source = ? ORDER BY tar_order",
+            (source,)
+        ).fetchall()
+        if not rows:
+            return None
+        return [row[0] for row in rows]
+
+    def has_tar_files(self, source: str) -> bool:
+        """Check if TAR file list is cached for a source."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT 1 FROM tar_files WHERE source = ? LIMIT 1",
+            (source,)
+        ).fetchone()
+        return row is not None
+
     def clear(self):
         """Clear all entries from the cache."""
         conn = self._get_connection()
         with conn:
             conn.execute("DELETE FROM manifest_entries")
+            conn.execute("DELETE FROM tar_files")
+
+    def checkpoint(self):
+        """Force WAL checkpoint to ensure all data is written to main database file."""
+        if self._conn is not None and not self.read_only:
+            try:
+                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                logging.debug("SQLite WAL checkpoint completed")
+            except Exception as e:
+                logging.warning(f"WAL checkpoint failed: {e}")
 
     def close(self):
         """Close database connection."""
         if self._conn is not None:
+            # Checkpoint before closing to ensure data is flushed
+            if not self.read_only:
+                self.checkpoint()
             self._conn.close()
             self._conn = None
 

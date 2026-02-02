@@ -66,11 +66,47 @@ ALLOWED_CHARS: Dict[str, Set[str]] = {
         " '"  # space and apostrophe
         '.,!?;:-«»'  # punctuation
     ),
+    'da': set(
+        'abcdefghijklmnopqrstuvwxyz'
+        'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+        'æøå'
+        'ÆØÅ'
+        '0123456789'
+        " '"  # space and apostrophe
+        '.,!?;:-'  # punctuation
+    ),
+    'nl': set(
+        'abcdefghijklmnopqrstuvwxyz'
+        'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+        'àáâäèéêëïíîóôöúû'
+        'ÀÁÂÄÈÉÊËÏÍÎÓÔÖÚÛ'
+        '0123456789'
+        " '"  # space and apostrophe
+        '.,!?;:-'  # punctuation
+    ),
+    'sv': set(
+        'abcdefghijklmnopqrstuvwxyz'
+        'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+        'åäö'
+        'ÅÄÖ'
+        '0123456789'
+        " '"  # space and apostrophe
+        '.,!?;:-'  # punctuation
+    ),
+    'tr': set(
+        'abcdefghijklmnopqrstuvwxyz'
+        'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+        'çğıöşü'
+        'ÇĞİÖŞÜ'
+        '0123456789'
+        " '"  # space and apostrophe
+        '.,!?;:-'  # punctuation
+    ),
     'uk': set(
         'абвгґдеєжзиіїйклмнопрстуфхцчшщьюя'
         'АБВГҐДЕЄЖЗИІЇЙКЛМНОПРСТУФХЦЧШЩЬЮЯ'
         '0123456789'
-        " '"  # space and apostrophe
+        " 'ʼ'"  # space, ASCII apostrophe, Ukrainian apostrophe (U+02BC), right quote (U+2019)
         '.,!?;:-«»—'  # punctuation including Ukrainian quotes and dash
     ),
     'vi': set(
@@ -215,13 +251,8 @@ class FilterConfig:
     """Configuration for sample filtering."""
     min_duration: float = 0.5
     max_duration: float = 30.0
-    min_chars_per_sec: float = 3.0  # Only applied for duration > 2s
-    max_chars_per_sec: float = 40.0
     min_chars: int = 1
     max_chars: int = 500
-    validate_text: bool = True  # Enable is_valid_text() check
-    validate_chars: bool = True  # Enable has_valid_chars() check
-    languages: List[str] = field(default_factory=lambda: ['en'])
 
 
 class SampleFilter:
@@ -230,27 +261,18 @@ class SampleFilter:
 
     Filters:
     - Duration bounds (min/max)
-    - Character rate (chars per second, min and max)
-    - Text length bounds
-    - Text validity (garbage detection)
-    - Character validity (per-language allowed characters)
+    - Text length bounds (min/max chars)
     """
 
     def __init__(self, config: FilterConfig):
         self.config = config
-        self._allowed_chars = get_allowed_chars(config.languages) if config.validate_chars else set()
         self._stats = {
             'total': 0,
             'passed': 0,
             'rejected_min_duration': 0,
             'rejected_max_duration': 0,
-            'rejected_min_char_rate': 0,
-            'rejected_max_char_rate': 0,
-            'rejected_min_required_duration': 0,
             'rejected_min_chars': 0,
             'rejected_max_chars': 0,
-            'rejected_invalid_text': 0,
-            'rejected_invalid_chars': 0,
         }
 
     def __call__(self, sample: dict) -> bool:
@@ -287,40 +309,6 @@ class SampleFilter:
             self._stats['rejected_max_chars'] += 1
             return False
 
-        # Text validity check (garbage detection)
-        if self.config.validate_text and not is_valid_text(text):
-            self._stats['rejected_invalid_text'] += 1
-            return False
-
-        # Character validity check (per-language)
-        if self.config.validate_chars and self._allowed_chars:
-            if not has_valid_chars(text, self._allowed_chars):
-                self._stats['rejected_invalid_chars'] += 1
-                return False
-
-        # Character rate filters
-        if duration > 0:
-            chars_per_sec = len(text) / duration
-
-            # Too fast - likely misaligned or garbage
-            if chars_per_sec > self.config.max_chars_per_sec:
-                self._stats['rejected_max_char_rate'] += 1
-                return False
-
-            # Too slow - only apply for longer durations (> 2s)
-            # This allows short utterances like "Yes" or "No"
-            if duration > 2.0 and chars_per_sec < self.config.min_chars_per_sec:
-                self._stats['rejected_min_char_rate'] += 1
-                return False
-
-            # Check if audio is impossibly short for the text
-            # Assume max possible speech rate ~50 chars/sec (very fast)
-            # If audio < text_len * 0.02, it's physically impossible
-            min_required_duration = text_len * 0.02
-            if duration < min_required_duration:
-                self._stats['rejected_min_required_duration'] += 1
-                return False
-
         self._stats['passed'] += 1
         return True
 
@@ -340,10 +328,5 @@ class SampleFilter:
         logging.info(f"Filter stats: {passed}/{total} passed ({pass_rate:.1f}%)")
         logging.info(f"  Rejected min_duration: {self._stats['rejected_min_duration']}")
         logging.info(f"  Rejected max_duration: {self._stats['rejected_max_duration']}")
-        logging.info(f"  Rejected min_char_rate: {self._stats['rejected_min_char_rate']}")
-        logging.info(f"  Rejected max_char_rate: {self._stats['rejected_max_char_rate']}")
-        logging.info(f"  Rejected min_required_duration: {self._stats['rejected_min_required_duration']}")
         logging.info(f"  Rejected min_chars: {self._stats['rejected_min_chars']}")
         logging.info(f"  Rejected max_chars: {self._stats['rejected_max_chars']}")
-        logging.info(f"  Rejected invalid_text: {self._stats['rejected_invalid_text']}")
-        logging.info(f"  Rejected invalid_chars: {self._stats['rejected_invalid_chars']}")
