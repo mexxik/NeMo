@@ -320,10 +320,12 @@ class S3MultiLangStreamingDataset(IterableDataset):
         # SQLite manifest cache for memory-efficient multi-worker loading
         self.use_sqlite_cache = use_sqlite_cache
         self._sqlite_cache_path: Optional[str] = None
+        self._explicit_cache_path = False  # True if user provided cache path (trust it, don't rebuild)
         if use_sqlite_cache:
             if sqlite_cache_path:
                 # Use explicit cache path (allows train/validation to share same cache)
                 self._sqlite_cache_path = sqlite_cache_path
+                self._explicit_cache_path = True  # User provided - trust it completely
                 cache_dir = os.path.dirname(sqlite_cache_path)
                 if cache_dir:
                     os.makedirs(cache_dir, exist_ok=True)
@@ -425,10 +427,20 @@ class S3MultiLangStreamingDataset(IterableDataset):
         # Initialize SQLite cache if enabled
         sqlite_cache = None
         if self.use_sqlite_cache and self._sqlite_cache_path:
-            # Check if cache already exists and is valid
+            # Check if cache already exists
             if os.path.exists(self._sqlite_cache_path):
                 try:
                     sqlite_cache = SQLiteManifestCache(self._sqlite_cache_path, read_only=True)
+
+                    # If explicit cache path provided by user, trust it completely (don't validate/rebuild)
+                    if self._explicit_cache_path:
+                        total = sqlite_cache.count_entries()
+                        logging.info(f"Using pre-built SQLite cache (explicit path): {self._sqlite_cache_path}")
+                        logging.info(f"Total manifest entries from cache: {total}")
+                        sqlite_cache.close()
+                        return total
+
+                    # Auto-generated cache: validate it matches expected sources
                     cached_sources = set(sqlite_cache.get_sources())
                     expected_sources = set()
                     for sources in self.language_sources.values():
@@ -454,13 +466,24 @@ class S3MultiLangStreamingDataset(IterableDataset):
                         sqlite_cache.close()
                         os.remove(self._sqlite_cache_path)
                 except Exception as e:
-                    logging.warning(f"Failed to read existing cache, rebuilding: {e}")
+                    logging.warning(f"Failed to read existing cache: {e}")
                     if sqlite_cache:
                         sqlite_cache.close()
-                    if os.path.exists(self._sqlite_cache_path):
+                    # Only remove if not explicit (user-provided cache should not be deleted)
+                    if not self._explicit_cache_path and os.path.exists(self._sqlite_cache_path):
                         os.remove(self._sqlite_cache_path)
+                    elif self._explicit_cache_path:
+                        logging.error(f"Pre-built cache is corrupted or invalid: {self._sqlite_cache_path}")
+                        raise
 
-            # Create new cache
+            elif self._explicit_cache_path:
+                # User provided explicit cache path but file doesn't exist
+                raise FileNotFoundError(
+                    f"Explicit SQLite cache path provided but file not found: {self._sqlite_cache_path}\n"
+                    f"Build the cache first with: python build_cache.py --datasets-config <config> --output {self._sqlite_cache_path}"
+                )
+
+            # Create new cache (only for auto-generated paths)
             sqlite_cache = SQLiteManifestCache(self._sqlite_cache_path)
             logging.info(f"Building SQLite manifest cache: {self._sqlite_cache_path}")
 
