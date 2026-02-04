@@ -381,6 +381,9 @@ class S3MultiLangStreamingDataset(IterableDataset):
         )
         self.audio_merger = AudioMerger(self.merge_config, sample_rate=sample_rate)
 
+        # Track whether samples_per_epoch was explicitly provided by user
+        self._explicit_samples_per_epoch = samples_per_epoch is not None
+
         # Store samples_per_epoch for __len__
         # If not provided, try to get from existing cache, else calculate
         if samples_per_epoch is not None:
@@ -474,11 +477,47 @@ class S3MultiLangStreamingDataset(IterableDataset):
             total_hours = sum(source_hours.values())
             total_samples = sum(source_samples.values())
 
+            # Calculate expected epoch length with balancing
+            # Each source will repeat ceil(max_hours / source_hours) times
+            expected_epoch_samples = 0
+            for source, hours in source_hours.items():
+                repeats = max_hours / hours if hours > 0 else 0
+                expected_epoch_samples += source_samples[source] * repeats
+
             logging.info("=" * 70)
             logging.info("SOURCE BALANCING STRATEGY")
             logging.info("=" * 70)
-            logging.info(f"Total: {total_hours:.1f}h across {len(source_hours)} sources ({total_samples:,} samples)")
+            logging.info(f"Total data: {total_hours:.1f}h across {len(source_hours)} sources ({total_samples:,} samples)")
             logging.info(f"Target: {max_hours:.1f}h (largest source)")
+            logging.info("")
+            logging.info(f"Expected epoch length:")
+            logging.info(f"  Unique samples: {total_samples:,}")
+            logging.info(f"  With balancing: ~{int(expected_epoch_samples):,} samples (repeats included)")
+
+            # Check if epoch length will change with balancing
+            if expected_epoch_samples > total_samples * 1.05:  # 5% tolerance
+                increase_pct = (expected_epoch_samples - total_samples) / total_samples * 100
+
+                # Auto-adjust samples_per_epoch if not explicitly set by user
+                if not self._explicit_samples_per_epoch:
+                    logging.info(
+                        f"AUTO-ADJUSTING epoch length for balancing:\n"
+                        f"  Original (unique samples): {total_samples:,}\n"
+                        f"  With balancing: ~{int(expected_epoch_samples):,} samples (+{increase_pct:.0f}%)\n"
+                        f"  Updated samples_per_epoch: {int(expected_epoch_samples):,}"
+                    )
+                    self.samples_per_epoch = int(expected_epoch_samples)
+                else:
+                    # User explicitly set it - respect their choice
+                    logging.warning(
+                        f"EPOCH LENGTH MISMATCH with balancing:\n"
+                        f"  Unique samples: {total_samples:,}\n"
+                        f"  Expected with repeats: ~{int(expected_epoch_samples):,} samples (+{increase_pct:.0f}%)\n"
+                        f"  Your samples_per_epoch: {self.samples_per_epoch:,}\n"
+                        f"  \n"
+                        f"  Note: Epoch will stop at {self.samples_per_epoch:,} samples as configured,\n"
+                        f"        which may cut off repeated data from smaller sources."
+                    )
             logging.info("")
 
             # Per-language summary
@@ -504,12 +543,27 @@ class S3MultiLangStreamingDataset(IterableDataset):
 
             if repeated_sources:
                 for source, hours, samples, repeats in repeated_sources[:20]:  # Limit to top 20
-                    logging.info(f"  {source:40s}: {hours:6.1f}h ({samples:>8,} samples) -> {repeats:5.1f}x repeat")
+                    epoch_samples = int(samples * repeats)
+                    logging.info(
+                        f"  {source:40s}: {hours:6.1f}h ({samples:>8,} samples) -> "
+                        f"{repeats:5.1f}x repeat (~{epoch_samples:,} per epoch)"
+                    )
                 if len(repeated_sources) > 20:
                     logging.info(f"  ... and {len(repeated_sources) - 20} more sources")
             else:
                 logging.info("  (all sources have similar sizes, minimal repetition needed)")
 
+            logging.info("=" * 70)
+            if not self._explicit_samples_per_epoch:
+                logging.info(
+                    "EPOCH LENGTH: Automatically adjusted to include repeated data.\n"
+                    "              If you want different behavior, explicitly set samples_per_epoch."
+                )
+            else:
+                logging.info(
+                    "EPOCH LENGTH: Using your explicitly set samples_per_epoch value.\n"
+                    "              Epochs may stop mid-repetition if set lower than expected length."
+                )
             logging.info("=" * 70)
 
         except Exception as e:
@@ -958,9 +1012,23 @@ class S3MultiLangStreamingDataset(IterableDataset):
         Dataset length for epoch calculation.
 
         Returns samples_per_epoch, which is either:
-        - Explicitly provided by user
-        - Auto-calculated from manifest entry counts
+        - Explicitly provided by user (always respected)
+        - Auto-adjusted if balance_sources=True and not explicitly set
+        - Auto-calculated from manifest entry counts (if balance_sources=False)
         - Fallback estimate if manifest loading failed
+
+        Source Balancing Behavior:
+        If balance_sources=True:
+        - Underrepresented sources are repeated during training with augmentation
+        - If samples_per_epoch was NOT explicitly set, it's automatically adjusted
+          to include all repeated data (expected_epoch_samples)
+        - If samples_per_epoch WAS explicitly set, your value is respected
+          (epochs may stop mid-repetition if set lower than needed)
+
+        Example:
+            Total unique samples: 100
+            With auto-adjustment: 120 (includes repeats, __len__() returns 120)
+            With explicit setting: samples_per_epoch=100 (stops at 100)
         """
         return self.samples_per_epoch
 
