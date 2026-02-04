@@ -18,6 +18,7 @@ from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, NeuralT
 from nemo.utils import logging
 
 from .audio_merger import AudioMerger, MergeBuffer, MergeConfig
+from .augmentation import AudioAugmentor, AugmentationConfig
 from .disk_tar_stream import DiskManifestLoader
 from .filters import FilterConfig, SampleFilter
 from .lang_source_manager import LanguageSourceManager, SingleSourceManager
@@ -173,6 +174,13 @@ class S3MultiLangStreamingDataset(IterableDataset):
 
         # Prefetch (background sample loading)
         prefetch_buffer_size: int = 100,  # Number of samples to prefetch per source (0 to disable)
+
+        # Source balancing with augmentation
+        balance_sources: bool = True,  # Balance underrepresented sources by repeating with augmentation
+        augment_prob: float = 0.1,  # Base probability of augmentation for non-repeated samples
+        augment_speed: bool = True,  # Enable speed perturbation (0.9x-1.1x)
+        augment_gain: bool = True,  # Enable gain adjustment (+/-6dB)
+        augment_time_mask: bool = True,  # Enable time masking (zero out random segments)
     ):
         """
         Initialize multi-language streaming dataset.
@@ -211,6 +219,22 @@ class S3MultiLangStreamingDataset(IterableDataset):
         self.rotation_level = rotation_level
         self.samples_per_source = samples_per_source
         self.prefetch_buffer_size = prefetch_buffer_size
+        self.balance_sources = balance_sources
+
+        # Audio augmentation for source balancing
+        augment_config = AugmentationConfig(
+            enabled=balance_sources,  # Only enable if balancing is on
+            base_prob=augment_prob,
+            speed_enabled=augment_speed,
+            gain_enabled=augment_gain,
+            time_mask_enabled=augment_time_mask,
+        )
+        self.augmentor = AudioAugmentor(augment_config)
+        if balance_sources:
+            logging.info(
+                f"Source balancing enabled: augment_prob={augment_prob}, "
+                f"speed={augment_speed}, gain={augment_gain}, time_mask={augment_time_mask}"
+            )
 
         # Determine storage type
         if data_root is not None:
@@ -410,6 +434,86 @@ class S3MultiLangStreamingDataset(IterableDataset):
                 f"add_eou={add_eou_token}, "
                 f"merge_utterances={merge_utterances}"
             )
+
+        # Log balancing strategy if enabled
+        if self.balance_sources and self._sqlite_cache_path and os.path.exists(self._sqlite_cache_path):
+            self._log_balancing_strategy()
+
+    def _log_balancing_strategy(self):
+        """Log the source balancing strategy based on duration statistics."""
+        try:
+            from .sqlite_manifest import SQLiteManifestCache
+            cache = SQLiteManifestCache(self._sqlite_cache_path, read_only=True)
+            conn = cache._get_connection()
+
+            # Get hours per source
+            rows = conn.execute("""
+                SELECT source, SUM(duration) / 3600.0 as hours, COUNT(*) as samples
+                FROM manifest_entries
+                GROUP BY source
+                ORDER BY hours DESC
+            """).fetchall()
+
+            if not rows:
+                cache.close()
+                return
+
+            source_hours = {row['source']: row['hours'] for row in rows}
+            source_samples = {row['source']: row['samples'] for row in rows}
+
+            # Get hours per language
+            lang_rows = conn.execute("""
+                SELECT lang, SUM(duration) / 3600.0 as hours, COUNT(*) as samples
+                FROM manifest_entries
+                GROUP BY lang
+                ORDER BY hours DESC
+            """).fetchall()
+            cache.close()
+
+            max_hours = max(source_hours.values())
+            total_hours = sum(source_hours.values())
+            total_samples = sum(source_samples.values())
+
+            logging.info("=" * 70)
+            logging.info("SOURCE BALANCING STRATEGY")
+            logging.info("=" * 70)
+            logging.info(f"Total: {total_hours:.1f}h across {len(source_hours)} sources ({total_samples:,} samples)")
+            logging.info(f"Target: {max_hours:.1f}h (largest source)")
+            logging.info("")
+
+            # Per-language summary
+            logging.info("Per-language distribution:")
+            for row in lang_rows:
+                lang = row['lang'] or 'unknown'
+                hours = row['hours']
+                samples = row['samples']
+                pct = (hours / total_hours) * 100
+                repeats = max_hours / hours if hours > 0 else 0
+                logging.info(f"  {lang:6s}: {hours:7.1f}h ({pct:5.1f}%) - {samples:>10,} samples - ~{repeats:.1f}x repeat")
+
+            logging.info("")
+            logging.info("Per-source expected repeats (sources needing >1x repeat):")
+
+            # Show sources that will be repeated
+            repeated_sources = []
+            for source, hours in sorted(source_hours.items(), key=lambda x: x[1]):
+                repeats = max_hours / hours if hours > 0 else 0
+                if repeats > 1.1:  # Show sources that will repeat more than 10%
+                    samples = source_samples[source]
+                    repeated_sources.append((source, hours, samples, repeats))
+
+            if repeated_sources:
+                for source, hours, samples, repeats in repeated_sources[:20]:  # Limit to top 20
+                    logging.info(f"  {source:40s}: {hours:6.1f}h ({samples:>8,} samples) -> {repeats:5.1f}x repeat")
+                if len(repeated_sources) > 20:
+                    logging.info(f"  ... and {len(repeated_sources) - 20} more sources")
+            else:
+                logging.info("  (all sources have similar sizes, minimal repetition needed)")
+
+            logging.info("=" * 70)
+
+        except Exception as e:
+            logging.warning(f"Could not log balancing strategy: {e}")
 
     def _calculate_total_samples(self) -> int:
         """
@@ -661,6 +765,7 @@ class S3MultiLangStreamingDataset(IterableDataset):
             source_managers=source_managers,
             languages_order=sorted(self.language_sources.keys()),
             samples_per_source=self.samples_per_source,
+            balance_sources=self.balance_sources,
         )
 
     def __iter__(self) -> Iterator[Tuple[torch.Tensor, ...]]:
@@ -704,9 +809,12 @@ class S3MultiLangStreamingDataset(IterableDataset):
                 if result is not None:
                     sample_idx += 1
 
-                    # Log merge stats periodically
-                    if sample_idx % 10000 == 0 and self.merge_config.enabled:
-                        self.audio_merger.log_stats()
+                    # Log stats periodically
+                    if sample_idx % 10000 == 0:
+                        if self.merge_config.enabled:
+                            self.audio_merger.log_stats()
+                        if self.balance_sources:
+                            self.augmentor.log_stats()
 
                     return result
             return None
@@ -754,6 +862,11 @@ class S3MultiLangStreamingDataset(IterableDataset):
 
         if audio is None:
             return None
+
+        # Apply audio augmentation based on source cycle
+        source_cycle = sample.get('source_cycle', 0)
+        if self.augmentor.should_augment(source_cycle):
+            audio = self.augmentor(audio, self.sample_rate, force=True)
 
         # Audio tensor
         if isinstance(audio, np.ndarray):

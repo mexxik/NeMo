@@ -164,6 +164,12 @@ class SourceRoundRobinInterleaver:
     - Equal language representation per cycle
     - Equal source representation within each language over time
 
+    **Balancing with Augmentation:**
+    When a source is exhausted, it's immediately restarted and its cycle count
+    is incremented. Samples from cycle > 0 are marked for augmentation.
+    This naturally balances smaller sources by repeating them more often
+    with augmentation, giving them equal effective representation.
+
     Example with:
       ar: [common_ar_test, common_ar_train, masc_ar_train, yodas_ar_ar000]
       da: [common_da_train, sdp_da_train, yodas_da_da000]
@@ -175,19 +181,9 @@ class SourceRoundRobinInterleaver:
     - Sample 2:  common_da_train (da[0])
     - Sample 3:  common_de_test (de[0])
     - Sample 4:  spgispeech_en_test (en[0])
-    - Sample 5:  common_ar_train (ar[1])
-    - Sample 6:  sdp_da_train (da[1])
-    - Sample 7:  common_de_train (de[1])
-    - Sample 8:  spgispeech_en_train (en[1])
-    - Sample 9:  masc_ar_train (ar[2])
-    - Sample 10: yodas_da_da000 (da[2])
-    - Sample 11: mls_de_dev (de[2])
-    - Sample 12: yodas_en_en000 (en[2])
-    - Sample 13: yodas_ar_ar000 (ar[3])
-    - Sample 14: common_da_train (da[0] - wrapped)
-    - Sample 15: yodas_de_de000 (de[3])
-    - Sample 16: spgispeech_en_test (en[0] - wrapped)
     - ...
+
+    When a small source exhausts, it restarts with cycle=1 (augmented).
     """
 
     def __init__(
@@ -196,6 +192,7 @@ class SourceRoundRobinInterleaver:
         source_managers: Dict[str, 'SingleSourceManager'],
         languages_order: Optional[List[str]] = None,
         samples_per_source: int = 50,
+        balance_sources: bool = True,
     ):
         """
         Initialize source-level round-robin interleaver.
@@ -208,10 +205,13 @@ class SourceRoundRobinInterleaver:
             samples_per_source: Number of samples to get from each source before
                                rotating to the next. Higher values = fewer parallel
                                TAR streams but less fine-grained mixing. Default 50.
+            balance_sources: If True, restart exhausted sources immediately with
+                            augmentation. If False, wait for epoch end (old behavior).
         """
         self.language_sources = language_sources
         self.source_managers = source_managers
         self.samples_per_source = samples_per_source
+        self.balance_sources = balance_sources
 
         # Language order (sorted alphabetically by default)
         if languages_order is not None:
@@ -233,11 +233,19 @@ class SourceRoundRobinInterleaver:
         # Per-language source index (for round-robin within each language)
         self._source_idx_by_lang: Dict[str, int] = {lang: 0 for lang in self.languages_order}
 
+        # Per-source cycle count (for balancing/augmentation)
+        # Key: "lang:source", Value: number of times source has been fully cycled
+        self._source_cycles: Dict[str, int] = {}
+        for lang, sources in language_sources.items():
+            for src in sources:
+                self._source_cycles[f"{lang}:{src}"] = 0
+
         # Total sources for logging
         total_sources = sum(len(srcs) for srcs in self._sources_by_lang.values())
         logging.info(
             f"SourceRoundRobinInterleaver: {len(self.languages_order)} languages, "
-            f"{total_sources} sources, {samples_per_source} samples/source batch"
+            f"{total_sources} sources, {samples_per_source} samples/source batch, "
+            f"balance_sources={balance_sources}"
         )
         for lang in self.languages_order:
             logging.info(f"  [{lang}] {len(self._sources_by_lang[lang])} sources: {self._sources_by_lang[lang]}")
@@ -274,6 +282,10 @@ class SourceRoundRobinInterleaver:
         Order: ar→da→de→en→...→zh→ar→da→... (cycling through all languages)
         Each language also rotates through its sources.
 
+        When balance_sources=True:
+        - Exhausted sources are restarted immediately with incremented cycle count
+        - Sample includes 'source_cycle' for augmentation decision
+
         Returns:
             Sample dict or None if all languages exhausted
         """
@@ -296,15 +308,16 @@ class SourceRoundRobinInterleaver:
             sources = self._sources_by_lang[lang]
             source_idx = self._source_idx_by_lang[lang]
             src = sources[source_idx]
+            manager_key = f"{lang}:{src}"
 
             # Try to get sample from this source
-            manager_key = f"{lang}:{src}"
             manager = self.source_managers[manager_key]
             sample = manager.get_next_sample()
 
             if sample is not None:
                 sample['lang'] = lang
                 sample['source'] = src
+                sample['source_cycle'] = self._source_cycles[manager_key]
 
                 # Rotate to next source for this language
                 self._source_idx_by_lang[lang] = (source_idx + 1) % len(sources)
@@ -313,29 +326,58 @@ class SourceRoundRobinInterleaver:
 
                 return sample
 
-            # Source exhausted - try other sources for this language
+            # Source exhausted
+            if self.balance_sources:
+                # Balancing mode: restart source immediately with augmentation
+                self._source_cycles[manager_key] += 1
+                manager.reset()
+                if not _in_worker():
+                    logging.debug(
+                        f"[{lang}:{src}] Restarted (cycle {self._source_cycles[manager_key]})"
+                    )
+
+                # Try again with restarted source
+                sample = manager.get_next_sample()
+                if sample is not None:
+                    sample['lang'] = lang
+                    sample['source'] = src
+                    sample['source_cycle'] = self._source_cycles[manager_key]
+
+                    # Rotate to next source and language
+                    self._source_idx_by_lang[lang] = (source_idx + 1) % len(sources)
+                    self._current_lang_idx = (self._current_lang_idx + 1) % len(self.languages_order)
+                    return sample
+
+            # Try other sources for this language
             sources_tried = 1
             while sources_tried < len(sources):
                 self._source_idx_by_lang[lang] = (self._source_idx_by_lang[lang] + 1) % len(sources)
                 source_idx = self._source_idx_by_lang[lang]
                 src = sources[source_idx]
-
                 manager_key = f"{lang}:{src}"
+
                 manager = self.source_managers[manager_key]
                 sample = manager.get_next_sample()
 
                 if sample is not None:
                     sample['lang'] = lang
                     sample['source'] = src
+                    sample['source_cycle'] = self._source_cycles[manager_key]
                     # Rotate to next source and language
                     self._source_idx_by_lang[lang] = (source_idx + 1) % len(sources)
                     self._current_lang_idx = (self._current_lang_idx + 1) % len(self.languages_order)
                     return sample
 
+                # This source also exhausted
+                if self.balance_sources:
+                    self._source_cycles[manager_key] += 1
+                    manager.reset()
+
                 sources_tried += 1
 
-            # All sources for this language exhausted
-            self._active_languages.discard(lang)
+            # All sources for this language exhausted (shouldn't happen with balancing)
+            if not self.balance_sources:
+                self._active_languages.discard(lang)
             self._current_lang_idx = (self._current_lang_idx + 1) % len(self.languages_order)
 
         return None
@@ -344,6 +386,15 @@ class SourceRoundRobinInterleaver:
         """Start a new epoch by resetting all source managers."""
         self._epoch += 1
         if not _in_worker():
+            # Log cycle stats before reset
+            if self.balance_sources:
+                max_cycles = max(self._source_cycles.values()) if self._source_cycles else 0
+                sources_with_repeats = sum(1 for c in self._source_cycles.values() if c > 0)
+                logging.info(
+                    f"Epoch {self._epoch} - Source balancing: "
+                    f"{sources_with_repeats}/{len(self._source_cycles)} sources repeated, "
+                    f"max cycles: {max_cycles}"
+                )
             logging.info(f"Starting epoch {self._epoch}")
 
         for manager in self.source_managers.values():
@@ -353,6 +404,9 @@ class SourceRoundRobinInterleaver:
         self._current_lang_idx = 0
         # Reset source indices for all languages
         self._source_idx_by_lang = {lang: 0 for lang in self.languages_order}
+
+        # Note: We don't reset _source_cycles here - they accumulate across epochs
+        # This allows tracking total repeats for logging/debugging
 
     @property
     def epoch(self) -> int:
@@ -364,12 +418,24 @@ class SourceRoundRobinInterleaver:
         """Total samples yielded so far."""
         return self._samples_yielded
 
+    def get_source_cycles(self) -> Dict[str, int]:
+        """Get per-source cycle counts."""
+        return dict(self._source_cycles)
+
     def get_stats(self) -> dict:
         """Get interleaver statistics."""
-        return {
+        stats = {
             'epoch': self._epoch,
             'samples_yielded': self._samples_yielded,
             'active_languages': list(self._active_languages),
             'languages_order': self.languages_order,
             'source_indices': dict(self._source_idx_by_lang),
+            'balance_sources': self.balance_sources,
         }
+
+        if self.balance_sources:
+            stats['source_cycles'] = dict(self._source_cycles)
+            stats['max_source_cycle'] = max(self._source_cycles.values()) if self._source_cycles else 0
+            stats['sources_repeated'] = sum(1 for c in self._source_cycles.values() if c > 0)
+
+        return stats

@@ -10,6 +10,7 @@ Supports:
 """
 
 from .audio_merger import AudioMerger, MergeBuffer, MergeConfig
+from .augmentation import AudioAugmentor, AugmentationConfig
 from .dataset import S3MultiLangStreamingDataset
 from .disk_tar_stream import DiskManifestLoader, DiskTarStream
 from .filters import (
@@ -40,6 +41,9 @@ __all__ = [
     # Main dataset class
     'S3MultiLangStreamingDataset',
     'MultiLangStreamingDataset',  # Alias
+    # Audio augmentation
+    'AudioAugmentor',
+    'AugmentationConfig',
     # Audio merging
     'AudioMerger',
     'MergeBuffer',
