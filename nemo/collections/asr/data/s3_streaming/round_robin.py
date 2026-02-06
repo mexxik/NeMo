@@ -74,6 +74,17 @@ class RoundRobinInterleaver:
         Yields:
             Sample dict with added 'lang' key
         """
+        # Set worker-specific language offset (must be done in __iter__, not __init__)
+        # This prevents all workers from synchronizing on the same language
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is not None and len(self.languages_order) > 1:
+            self._current_idx = worker_info.id % len(self.languages_order)
+            if not _in_worker():
+                logging.info(
+                    f"Worker {worker_info.id} starting at language index {self._current_idx} "
+                    f"({self.languages_order[self._current_idx]})"
+                )
+
         while True:
             sample = self._get_next_sample()
             if sample is None:
@@ -262,6 +273,17 @@ class SourceRoundRobinInterleaver:
         Yields:
             Sample dict with added 'lang' and 'source' keys
         """
+        # Set worker-specific language offset (must be done in __iter__, not __init__)
+        # This prevents all workers from synchronizing on the same language
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is not None and len(self.languages_order) > 1:
+            self._current_lang_idx = worker_info.id % len(self.languages_order)
+            if not _in_worker():
+                logging.info(
+                    f"Worker {worker_info.id} starting at language index {self._current_lang_idx} "
+                    f"({self.languages_order[self._current_lang_idx]})"
+                )
+
         while True:
             sample = self._get_next_sample()
             if sample is None:

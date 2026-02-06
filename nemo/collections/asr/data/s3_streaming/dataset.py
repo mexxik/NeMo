@@ -394,7 +394,17 @@ class S3MultiLangStreamingDataset(IterableDataset):
             try:
                 from .sqlite_manifest import SQLiteManifestCache
                 cache = SQLiteManifestCache(self._sqlite_cache_path, read_only=True)
-                self.samples_per_epoch = cache.count_entries()
+
+                # Count only entries for configured sources, not all cache entries
+                all_sources = []
+                for lang_sources in language_sources.values():
+                    all_sources.extend(lang_sources)
+
+                total_count = 0
+                for source in all_sources:
+                    total_count += cache.count_entries(source=source)
+
+                self.samples_per_epoch = total_count
                 cache.close()
                 logging.info(f"Using existing SQLite cache: {self._sqlite_cache_path}")
                 logging.info(f"Samples per epoch from cache: {self.samples_per_epoch}")
@@ -473,22 +483,29 @@ class S3MultiLangStreamingDataset(IterableDataset):
             """).fetchall()
             cache.close()
 
-            max_hours = max(source_hours.values())
             total_hours = sum(source_hours.values())
             total_samples = sum(source_samples.values())
 
-            # Calculate expected epoch length with balancing
-            # Each source will repeat ceil(max_hours / source_hours) times
+            # Language-level balancing: each language repeats to match the largest language
+            lang_hours = {row['lang']: row['hours'] for row in lang_rows}
+            lang_samples = {row['lang']: row['samples'] for row in lang_rows}
+            max_lang_hours = max(lang_hours.values())
+            num_languages = len(lang_hours)
+
+            # Calculate expected epoch length with language-level balancing
+            # Each language repeats to match max_lang_hours
+            # Total epoch duration = max_lang_hours * num_languages
             expected_epoch_samples = 0
-            for source, hours in source_hours.items():
-                repeats = max_hours / hours if hours > 0 else 0
-                expected_epoch_samples += source_samples[source] * repeats
+            for lang, hours in lang_hours.items():
+                repeats = max_lang_hours / hours if hours > 0 else 0
+                expected_epoch_samples += lang_samples[lang] * repeats
 
             logging.info("=" * 70)
-            logging.info("SOURCE BALANCING STRATEGY")
+            logging.info("LANGUAGE BALANCING STRATEGY")
             logging.info("=" * 70)
-            logging.info(f"Total data: {total_hours:.1f}h across {len(source_hours)} sources ({total_samples:,} samples)")
-            logging.info(f"Target: {max_hours:.1f}h (largest source)")
+            logging.info(f"Total data: {total_hours:.1f}h across {num_languages} languages ({total_samples:,} samples)")
+            logging.info(f"Target per language: {max_lang_hours:.1f}h (largest language)")
+            logging.info(f"Total epoch duration: ~{max_lang_hours * num_languages:.1f}h ({num_languages} languages x {max_lang_hours:.1f}h)")
             logging.info("")
             logging.info(f"Expected epoch length:")
             logging.info(f"  Unique samples: {total_samples:,}")
@@ -527,31 +544,12 @@ class S3MultiLangStreamingDataset(IterableDataset):
                 hours = row['hours']
                 samples = row['samples']
                 pct = (hours / total_hours) * 100
-                repeats = max_hours / hours if hours > 0 else 0
-                logging.info(f"  {lang:6s}: {hours:7.1f}h ({pct:5.1f}%) - {samples:>10,} samples - ~{repeats:.1f}x repeat")
-
-            logging.info("")
-            logging.info("Per-source expected repeats (sources needing >1x repeat):")
-
-            # Show sources that will be repeated
-            repeated_sources = []
-            for source, hours in sorted(source_hours.items(), key=lambda x: x[1]):
-                repeats = max_hours / hours if hours > 0 else 0
-                if repeats > 1.1:  # Show sources that will repeat more than 10%
-                    samples = source_samples[source]
-                    repeated_sources.append((source, hours, samples, repeats))
-
-            if repeated_sources:
-                for source, hours, samples, repeats in repeated_sources[:20]:  # Limit to top 20
-                    epoch_samples = int(samples * repeats)
-                    logging.info(
-                        f"  {source:40s}: {hours:6.1f}h ({samples:>8,} samples) -> "
-                        f"{repeats:5.1f}x repeat (~{epoch_samples:,} per epoch)"
-                    )
-                if len(repeated_sources) > 20:
-                    logging.info(f"  ... and {len(repeated_sources) - 20} more sources")
-            else:
-                logging.info("  (all sources have similar sizes, minimal repetition needed)")
+                repeats = max_lang_hours / hours if hours > 0 else 0
+                epoch_samples = int(samples * repeats)
+                logging.info(
+                    f"  {lang:6s}: {hours:7.1f}h ({pct:5.1f}%) - {samples:>10,} samples - "
+                    f"~{repeats:.1f}x repeat (~{epoch_samples:,} per epoch)"
+                )
 
             logging.info("=" * 70)
             if not self._explicit_samples_per_epoch:
@@ -568,6 +566,71 @@ class S3MultiLangStreamingDataset(IterableDataset):
 
         except Exception as e:
             logging.warning(f"Could not log balancing strategy: {e}")
+
+    def _log_epoch_plan(self):
+        """Log a summary of the upcoming epoch: language stats, balancing, and expected steps."""
+        if not self._sqlite_cache_path or not os.path.exists(self._sqlite_cache_path):
+            return
+        try:
+            from .sqlite_manifest import SQLiteManifestCache
+            cache = SQLiteManifestCache(self._sqlite_cache_path, read_only=True)
+            conn = cache._get_connection()
+
+            lang_rows = conn.execute("""
+                SELECT lang, SUM(duration) / 3600.0 as hours, COUNT(*) as samples
+                FROM manifest_entries
+                GROUP BY lang
+                ORDER BY hours DESC
+            """).fetchall()
+            cache.close()
+
+            if not lang_rows:
+                return
+
+            lang_hours = {row['lang']: row['hours'] for row in lang_rows}
+            lang_samples = {row['lang']: row['samples'] for row in lang_rows}
+            max_lang = max(lang_hours, key=lang_hours.get)
+            max_lang_hours = lang_hours[max_lang]
+            num_languages = len(lang_hours)
+            total_hours = sum(lang_hours.values())
+
+            logging.info("")
+            logging.info("=" * 60)
+            logging.info("EPOCH PLAN")
+            logging.info("=" * 60)
+            logging.info(f"Languages: {num_languages} | Total unique data: {total_hours:.1f}h")
+            logging.info(f"Largest language: {max_lang} ({max_lang_hours:.1f}h)")
+            if self.balance_sources:
+                logging.info(f"Balancing target: {max_lang_hours:.1f}h per language")
+                logging.info(f"Expected epoch: ~{max_lang_hours * num_languages:.1f}h "
+                             f"({num_languages} x {max_lang_hours:.1f}h)")
+            logging.info("-" * 60)
+
+            for lang in sorted(lang_hours.keys()):
+                hours = lang_hours[lang]
+                samples = lang_samples[lang]
+                if self.balance_sources and max_lang_hours > 0:
+                    repeat = max_lang_hours / hours if hours > 0 else 0
+                    epoch_samples = int(samples * repeat)
+                    if repeat > 1.05:
+                        logging.info(
+                            f"  {lang}: {hours:.1f}h ({samples:,} samples) "
+                            f"-> {repeat:.1f}x repeat -> ~{epoch_samples:,} samples/epoch"
+                        )
+                    else:
+                        logging.info(
+                            f"  {lang}: {hours:.1f}h ({samples:,} samples) "
+                            f"-> 1.0x (largest)"
+                        )
+                else:
+                    logging.info(f"  {lang}: {hours:.1f}h ({samples:,} samples)")
+
+            logging.info("-" * 60)
+            logging.info(f"samples_per_epoch: {self.samples_per_epoch:,}")
+            logging.info("=" * 60)
+            logging.info("")
+        except Exception as e:
+            logging.debug(f"Could not log epoch plan: {e}")
 
     def _calculate_total_samples(self) -> int:
         """
@@ -835,6 +898,10 @@ class S3MultiLangStreamingDataset(IterableDataset):
         worker_id = worker_info.id if worker_info is not None else 0
 
         logging.debug(f"[Worker {worker_id}] Starting iteration")
+
+        # Log epoch plan from worker 0 only
+        if worker_id == 0 and self.global_rank == 0:
+            self._log_epoch_plan()
 
         if worker_info is not None:
             # In multi-worker mode, we could shard languages across workers

@@ -339,9 +339,13 @@ class SQLiteManifestCache:
         """
         Add TAR file list for a source.
 
+        Storage-agnostic: stores only filenames, not full paths.
+        Full paths are reconstructed at runtime based on current storage type.
+
         Args:
             source: Source name (e.g., "common_en_train")
-            tar_files: List of TAR file paths
+            tar_files: List of TAR file paths (can be S3 keys or disk paths)
+                      e.g., ["mls_es_dev/audio_0.tar"] or ["/workspace/data/mls_es_dev/audio_0.tar"]
 
         Returns:
             Number of TAR files added, or 0 if read-only
@@ -353,11 +357,16 @@ class SQLiteManifestCache:
         with conn:
             # Clear existing entries for this source
             conn.execute("DELETE FROM tar_files WHERE source = ?", (source,))
-            # Insert new entries with order
+            # Insert new entries with order (storing only the filename, not full path)
+            # This makes the cache storage-agnostic (works with both S3 and disk)
             for idx, tar_path in enumerate(tar_files):
+                # Extract just the filename (storage-agnostic)
+                # e.g., "mls_es_dev/audio_0.tar" -> "audio_0.tar"
+                # or "/workspace/data/mls_es_dev/audio_0.tar" -> "audio_0.tar"
+                tar_filename = tar_path.split('/')[-1]
                 conn.execute(
                     "INSERT INTO tar_files (source, tar_path, tar_order) VALUES (?, ?, ?)",
-                    (source, tar_path, idx)
+                    (source, tar_filename, idx)
                 )
         return len(tar_files)
 
@@ -365,20 +374,23 @@ class SQLiteManifestCache:
         """
         Get TAR file list for a source.
 
+        IMPORTANT: TAR file caching is disabled for storage-agnostic behavior.
+        TAR files are storage-specific (paths differ between S3 and disk),
+        so caching them would break when switching storage types.
+
+        Always returns None to force fresh listing from S3/disk.
+        This ensures compatibility with both storage types without rebuilding cache.
+
         Args:
             source: Source name (e.g., "common_en_train")
 
         Returns:
-            List of TAR file paths in order, or None if not cached
+            Always returns None (TAR file caching disabled)
         """
-        conn = self._get_connection()
-        rows = conn.execute(
-            "SELECT tar_path FROM tar_files WHERE source = ? ORDER BY tar_order",
-            (source,)
-        ).fetchall()
-        if not rows:
-            return None
-        return [row[0] for row in rows]
+        # Disabled: TAR file caching would break storage-type switching
+        # if sqlite_cache was built with disk paths, using it with S3 would fail
+        # Better to always list fresh from storage
+        return None
 
     def has_tar_files(self, source: str) -> bool:
         """Check if TAR file list is cached for a source."""
