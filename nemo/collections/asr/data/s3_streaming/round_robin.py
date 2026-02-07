@@ -244,12 +244,21 @@ class SourceRoundRobinInterleaver:
         # Per-language source index (for round-robin within each language)
         self._source_idx_by_lang: Dict[str, int] = {lang: 0 for lang in self.languages_order}
 
-        # Per-source cycle count (for balancing/augmentation)
-        # Key: "lang:source", Value: number of times source has been fully cycled
+        # Per-source restart count and cycle count (for balancing/augmentation)
+        # Key: "lang:source"
+        # _source_restarts: total number of times source was restarted
+        # _source_cycles: effective cycle count (restarts / num_workers, since TARs are sharded)
+        self._source_restarts: Dict[str, int] = {}
         self._source_cycles: Dict[str, int] = {}
         for lang, sources in language_sources.items():
             for src in sources:
+                self._source_restarts[f"{lang}:{src}"] = 0
                 self._source_cycles[f"{lang}:{src}"] = 0
+
+        # Get num_workers for cycle calculation (TARs are sharded across workers,
+        # so each worker exhausts its shard after 1/num_workers of the data)
+        worker_info = torch.utils.data.get_worker_info()
+        self._num_workers = worker_info.num_workers if worker_info is not None else 1
 
         # Total sources for logging
         total_sources = sum(len(srcs) for srcs in self._sources_by_lang.values())
@@ -350,12 +359,16 @@ class SourceRoundRobinInterleaver:
 
             # Source exhausted
             if self.balance_sources:
-                # Balancing mode: restart source immediately with augmentation
-                self._source_cycles[manager_key] += 1
+                # Balancing mode: restart source immediately
+                # Track restarts and compute effective cycle (TARs are sharded across workers,
+                # so each worker exhausts after 1/num_workers of the data)
+                self._source_restarts[manager_key] += 1
+                self._source_cycles[manager_key] = self._source_restarts[manager_key] // self._num_workers
                 manager.reset()
                 if not _in_worker():
                     logging.debug(
-                        f"[{lang}:{src}] Restarted (cycle {self._source_cycles[manager_key]})"
+                        f"[{lang}:{src}] Restarted (restart {self._source_restarts[manager_key]}, "
+                        f"cycle {self._source_cycles[manager_key]})"
                     )
 
                 # Try again with restarted source
@@ -392,7 +405,8 @@ class SourceRoundRobinInterleaver:
 
                 # This source also exhausted
                 if self.balance_sources:
-                    self._source_cycles[manager_key] += 1
+                    self._source_restarts[manager_key] += 1
+                    self._source_cycles[manager_key] = self._source_restarts[manager_key] // self._num_workers
                     manager.reset()
 
                 sources_tried += 1

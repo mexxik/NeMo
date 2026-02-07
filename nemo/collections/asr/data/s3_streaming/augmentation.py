@@ -144,34 +144,26 @@ class AudioAugmentor:
 
         self._augmented_calls += 1
 
-        # Convert to tensor for processing
-        was_numpy = isinstance(audio, np.ndarray)
-        if was_numpy:
-            audio_tensor = torch.from_numpy(audio).float()
-        else:
-            audio_tensor = audio.float()
+        # Apply augmentations in numpy (no torch conversion for gain/time_mask)
 
-        # Apply augmentations (stacked)
-
-        # 1. Speed perturbation
+        # 1. Speed perturbation (requires torch/torchaudio)
         if self.config.speed_enabled and random.random() < self.config.speed_prob:
+            audio_tensor = torch.from_numpy(audio).float()
             audio_tensor = self._speed_perturb(audio_tensor, sample_rate)
+            audio = audio_tensor.numpy()
             self._speed_applied += 1
 
-        # 2. Gain adjustment
+        # 2. Gain adjustment (pure numpy)
         if self.config.gain_enabled and random.random() < self.config.gain_prob:
-            audio_tensor = self._gain(audio_tensor)
+            audio = self._gain_np(audio)
             self._gain_applied += 1
 
-        # 3. Time masking
+        # 3. Time masking (pure numpy)
         if self.config.time_mask_enabled and random.random() < self.config.time_mask_prob:
-            audio_tensor = self._time_mask(audio_tensor)
+            audio = self._time_mask_np(audio)
             self._time_mask_applied += 1
 
-        # Convert back to numpy if input was numpy
-        if was_numpy:
-            return audio_tensor.numpy()
-        return audio_tensor
+        return audio
 
     def _speed_perturb(self, audio: torch.Tensor, sample_rate: int) -> torch.Tensor:
         """
@@ -196,19 +188,23 @@ class AudioAugmentor:
 
     def _gain(self, audio: torch.Tensor) -> torch.Tensor:
         """
-        Apply gain adjustment in dB.
-
-        Simple volume change - very fast.
+        Apply gain adjustment in dB (torch version).
         """
         gain_db = random.uniform(*self.config.gain_range_db)
         gain_linear = 10 ** (gain_db / 20)
         return audio * gain_linear
 
+    def _gain_np(self, audio: np.ndarray) -> np.ndarray:
+        """
+        Apply gain adjustment in dB (pure numpy).
+        """
+        gain_db = random.uniform(*self.config.gain_range_db)
+        gain_linear = 10 ** (gain_db / 20)
+        return (audio * gain_linear).astype(audio.dtype)
+
     def _time_mask(self, audio: torch.Tensor) -> torch.Tensor:
         """
-        Apply time masking by zeroing out a random segment.
-
-        Similar to SpecAugment time masking but on raw waveform.
+        Apply time masking by zeroing out a random segment (torch version).
         """
         length = audio.shape[-1]
         max_mask_len = int(length * self.config.time_mask_max_ratio)
@@ -220,6 +216,24 @@ class AudioAugmentor:
         start = random.randint(0, length - mask_len)
 
         audio = audio.clone()
+        audio[start:start + mask_len] = 0
+
+        return audio
+
+    def _time_mask_np(self, audio: np.ndarray) -> np.ndarray:
+        """
+        Apply time masking by zeroing out a random segment (pure numpy).
+        """
+        length = audio.shape[-1]
+        max_mask_len = int(length * self.config.time_mask_max_ratio)
+
+        if max_mask_len < 1:
+            return audio
+
+        mask_len = random.randint(1, max_mask_len)
+        start = random.randint(0, length - mask_len)
+
+        audio = audio.copy()
         audio[start:start + mask_len] = 0
 
         return audio

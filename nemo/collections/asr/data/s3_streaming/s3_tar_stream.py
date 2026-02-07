@@ -108,7 +108,9 @@ class S3TarStream:
         else:
             boto_config = BotoConfig(
                 region_name=aws_region,
-                retries={'max_attempts': max_retries, 'mode': 'adaptive'}
+                retries={'max_attempts': max_retries, 'mode': 'adaptive'},
+                connect_timeout=10,
+                read_timeout=30,
             )
             self.s3_client = boto3.client('s3', config=boto_config)
 

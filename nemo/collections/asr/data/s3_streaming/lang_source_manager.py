@@ -136,6 +136,8 @@ class LanguageSourceManager:
                 boto_config = BotoConfig(
                     retries={'max_attempts': 3, 'mode': 'adaptive'},
                     signature_version='s3v4',
+                    connect_timeout=10,
+                    read_timeout=30,
                 )
                 client_kwargs = {'config': boto_config}
                 if self.s3_endpoint_url:
@@ -582,6 +584,8 @@ class SingleSourceManager:
                 boto_config = BotoConfig(
                     retries={'max_attempts': 3, 'mode': 'adaptive'},
                     signature_version='s3v4',
+                    connect_timeout=10,
+                    read_timeout=30,
                 )
                 client_kwargs = {'config': boto_config}
                 if self.s3_endpoint_url:

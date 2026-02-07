@@ -173,13 +173,13 @@ class S3MultiLangStreamingDataset(IterableDataset):
         samples_per_source: int = 50,  # Samples to get from each source before rotating (reduces parallel TAR streams)
 
         # Prefetch (background sample loading)
-        prefetch_buffer_size: int = 100,  # Number of samples to prefetch per source (0 to disable)
+        prefetch_buffer_size: int = 0,  # Number of samples to prefetch per source (0 to disable)
 
         # Source balancing with augmentation
         balance_sources: bool = True,  # Balance underrepresented sources by repeating with augmentation
         augment_prob: float = 0.1,  # Base probability of augmentation for non-repeated samples
-        augment_speed: bool = True,  # Enable speed perturbation (0.9x-1.1x)
-        augment_gain: bool = True,  # Enable gain adjustment (+/-6dB)
+        augment_speed: bool = False,  # Enable speed perturbation (0.9x-1.1x)
+        augment_gain: bool = False,  # Enable gain adjustment (+/-6dB)
         augment_time_mask: bool = True,  # Enable time masking (zero out random segments)
     ):
         """
@@ -934,8 +934,6 @@ class S3MultiLangStreamingDataset(IterableDataset):
                     if sample_idx % 10000 == 0:
                         if self.merge_config.enabled:
                             self.audio_merger.log_stats()
-                        if self.balance_sources:
-                            self.augmentor.log_stats()
 
                     return result
             return None
@@ -984,10 +982,21 @@ class S3MultiLangStreamingDataset(IterableDataset):
         if audio is None:
             return None
 
-        # Apply audio augmentation based on source cycle
+        # Apply augmentation in-place for repeated data (source_cycle > 0 = always, cycle 0 = 10%)
         source_cycle = sample.get('source_cycle', 0)
-        if self.augmentor.should_augment(source_cycle):
-            audio = self.augmentor(audio, self.sample_rate, force=True)
+        if source_cycle > 0 or random.random() < 0.1:
+            # Gain adjustment: +/-6dB with 50% probability
+            if random.random() < 0.5:
+                gain_db = random.uniform(-6.0, 6.0)
+                audio *= 10 ** (gain_db / 20)
+            # Time masking: zero out up to 10% with 30% probability
+            if random.random() < 0.3:
+                length = audio.shape[-1]
+                max_mask = int(length * 0.1)
+                if max_mask > 0:
+                    mask_len = random.randint(1, max_mask)
+                    start = random.randint(0, length - mask_len)
+                    audio[start:start + mask_len] = 0
 
         # Audio tensor
         if isinstance(audio, np.ndarray):
