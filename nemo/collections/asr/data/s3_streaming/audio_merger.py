@@ -24,7 +24,7 @@ class MergeConfig:
     min_utterances: int = 2
     max_utterances: int = 3
     silence_min_sec: float = 0.5
-    silence_max_sec: float = 1.5
+    silence_max_sec: float = 2.0
     max_merged_duration: float = 30.0  # Max total duration after merge
     add_trailing_silence: bool = True  # Add silence after last utterance
     trailing_silence_min_sec: float = 0.3

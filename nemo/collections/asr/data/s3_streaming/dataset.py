@@ -139,6 +139,8 @@ class S3MultiLangStreamingDataset(IterableDataset):
         # Token augmentation
         add_eou_token: bool = True,
         eou_token: str = "<eou>",
+        add_eot_token: bool = False,
+        eot_token: str = "<eot>",
 
         # Shuffle buffer (0 = no buffering, stream directly)
         shuffle_buffer_size: int = 0,
@@ -325,6 +327,33 @@ class S3MultiLangStreamingDataset(IterableDataset):
                 if self.eou_token_id is None:
                     logging.warning(f"EOU token '{eou_token}' not found in vocabulary")
 
+        # Get EOT token ID from vocabulary (same approach as EOU)
+        self.add_eot_token = add_eot_token
+        self.eot_token = eot_token
+        self.eot_token_id = None
+        if add_eot_token and eot_token:
+            if hasattr(tokenizer, 'tokenizer') and hasattr(tokenizer.tokenizer, 'piece_to_id'):
+                sp = tokenizer.tokenizer
+                eot_id = sp.piece_to_id(eot_token)
+                if eot_id != sp.unk_id():
+                    self.eot_token_id = eot_id
+                    logging.info(f"EOT token '{eot_token}' found at ID {self.eot_token_id} (via piece_to_id)")
+                else:
+                    logging.warning(f"EOT token '{eot_token}' not found in vocabulary (piece_to_id returned unk)")
+            else:
+                for i in range(tokenizer.vocab_size):
+                    try:
+                        token = tokenizer.ids_to_tokens([i])
+                        if token and token[0] == eot_token:
+                            self.eot_token_id = i
+                            logging.info(f"EOT token '{eot_token}' found at ID {self.eot_token_id} (via search)")
+                            break
+                    except Exception:
+                        continue
+
+                if self.eot_token_id is None:
+                    logging.warning(f"EOT token '{eot_token}' not found in vocabulary")
+
         # BOS/EOS tokens
         # NeMo uses -1 to indicate "no BOS/EOS", so we need to check for >= 0
         if hasattr(tokenizer, 'bos_id') and tokenizer.bos_id is not None and tokenizer.bos_id >= 0:
@@ -436,6 +465,7 @@ class S3MultiLangStreamingDataset(IterableDataset):
                 f"sources={total_sources}, "
                 f"rotation_level={rotation_level}, "
                 f"add_eou={add_eou_token}, "
+                f"add_eot={add_eot_token}, "
                 f"merge_utterances={merge_utterances}"
             )
         else:
@@ -445,6 +475,7 @@ class S3MultiLangStreamingDataset(IterableDataset):
                 f"sources={total_sources}, "
                 f"rotation_level={rotation_level}, "
                 f"add_eou={add_eou_token}, "
+                f"add_eot={add_eot_token}, "
                 f"merge_utterances={merge_utterances}"
             )
 
@@ -1035,6 +1066,10 @@ class S3MultiLangStreamingDataset(IterableDataset):
             if should_add_eou:
                 tokens = tokens + [self.eou_token_id]
 
+            # Add EOT token at end of turn (before EOS)
+            if self.add_eot_token and self.eot_token_id is not None:
+                tokens = tokens + [self.eot_token_id]
+
             # Add EOS token if configured
             if self.eos_id is not None:
                 tokens = tokens + [self.eos_id]
@@ -1049,14 +1084,21 @@ class S3MultiLangStreamingDataset(IterableDataset):
 
     def _tokenize_merged(self, texts: List[str], eou_positions: List[int]) -> List[int]:
         """
-        Tokenize merged multi-utterance sample.
+        Tokenize merged multi-utterance/multi-turn sample.
+
+        When EOT mode is active (add_eot_token=True), each segment is a turn
+        and gets EOT appended. EOU is not used.
+        Example: BOS + tokens(turn1) + EOT + tokens(turn2) + EOT + EOS
+
+        When EOU mode is active (add_eou_token=True, add_eot_token=False),
+        EOU is inserted after segments with sentence-ending punctuation.
 
         Args:
             texts: List of text segments
             eou_positions: Indices of segments that should have EOU appended
 
         Returns:
-            Combined token list with EOU tokens inserted appropriately
+            Combined token list with special tokens inserted appropriately
         """
         tokens = []
 
@@ -1069,8 +1111,11 @@ class S3MultiLangStreamingDataset(IterableDataset):
             segment_tokens = self.tokenizer.text_to_ids(text)
             tokens.extend(segment_tokens)
 
-            # Add EOU after this segment if it's in eou_positions
-            if self.add_eou_token and self.eou_token_id is not None and i in eou_positions:
+            if self.add_eot_token and self.eot_token_id is not None:
+                # EOT mode: every segment is a turn, append EOT after each
+                tokens.append(self.eot_token_id)
+            elif self.add_eou_token and self.eou_token_id is not None and i in eou_positions:
+                # EOU mode: append EOU after segments with sentence-ending punctuation
                 tokens.append(self.eou_token_id)
 
         # Add EOS token if configured (only at the very end)
