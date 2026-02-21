@@ -7,6 +7,8 @@ Supports both S3 and local disk storage.
 
 import os
 import random
+import re
+import unicodedata
 from typing import Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
@@ -141,6 +143,9 @@ class S3MultiLangStreamingDataset(IterableDataset):
         eou_token: str = "<eou>",
         add_eot_token: bool = False,
         eot_token: str = "<eot>",
+
+        # Text normalization (remove punctuation and capitalization)
+        normalize_text: bool = False,
 
         # Shuffle buffer (0 = no buffering, stream directly)
         shuffle_buffer_size: int = 0,
@@ -297,6 +302,11 @@ class S3MultiLangStreamingDataset(IterableDataset):
         )
         self.add_eou_token = add_eou_token
         self.eou_token = eou_token
+
+        # Text normalization (remove PnC: punctuation and capitalization)
+        self.normalize_text = normalize_text
+        if normalize_text:
+            logging.info("Text normalization ENABLED: will lowercase and remove punctuation")
 
         # Get EOU token ID from vocabulary (for direct ID appending)
         # SentencePiece doesn't recognize USER_DEFINED tokens during encoding,
@@ -466,6 +476,7 @@ class S3MultiLangStreamingDataset(IterableDataset):
                 f"rotation_level={rotation_level}, "
                 f"add_eou={add_eou_token}, "
                 f"add_eot={add_eot_token}, "
+                f"normalize_text={normalize_text}, "
                 f"merge_utterances={merge_utterances}"
             )
         else:
@@ -476,6 +487,7 @@ class S3MultiLangStreamingDataset(IterableDataset):
                 f"rotation_level={rotation_level}, "
                 f"add_eou={add_eou_token}, "
                 f"add_eot={add_eot_token}, "
+                f"normalize_text={normalize_text}, "
                 f"merge_utterances={merge_utterances}"
             )
 
@@ -1048,12 +1060,16 @@ class S3MultiLangStreamingDataset(IterableDataset):
             # Regular sample
             text = sample.get('text', '')
 
-            # Check if we should add EOU token (based on sentence-ending punctuation)
+            # Check if we should add EOU token BEFORE normalization (punctuation check)
             should_add_eou = (
                 self.add_eou_token
                 and self.eou_token_id is not None
                 and self.token_augmenter.should_add_eou(text)
             )
+
+            # Normalize text if configured (remove punctuation and lowercase)
+            if self.normalize_text:
+                text = self._normalize_text(text)
 
             # Tokenize text (without <eou> - we'll append the ID directly)
             tokens = self.tokenizer.text_to_ids(text)
@@ -1107,6 +1123,10 @@ class S3MultiLangStreamingDataset(IterableDataset):
             tokens.append(self.bos_id)
 
         for i, text in enumerate(texts):
+            # Normalize text if configured (remove punctuation and lowercase)
+            if self.normalize_text:
+                text = self._normalize_text(text)
+
             # Tokenize this segment
             segment_tokens = self.tokenizer.text_to_ids(text)
             tokens.extend(segment_tokens)
@@ -1123,6 +1143,29 @@ class S3MultiLangStreamingDataset(IterableDataset):
             tokens.append(self.eos_id)
 
         return tokens
+
+    # Pre-compiled regex for punctuation removal (all Unicode punctuation categories)
+    _PUNCT_RE = re.compile(r'[\u0021-\u002F\u003A-\u0040\u005B-\u0060\u007B-\u007E'
+                           r'\u00A1-\u00BF\u2000-\u206F\u2E00-\u2E7F'
+                           r'\u3000-\u303F\uFE10-\uFE6F\uFF01-\uFF60'
+                           r'\u0600-\u060F\u061B-\u061F\u066A-\u066D'
+                           r'\u06D4\uFD3E\uFD3F]+')
+
+    def _normalize_text(self, text: str) -> str:
+        """
+        Normalize text by removing punctuation and lowercasing.
+
+        This produces "no PnC" (no Punctuation and Capitalization) text,
+        which is useful for training models that only need to predict
+        raw text without formatting.
+        """
+        # Lowercase
+        text = text.lower()
+        # Remove punctuation
+        text = self._PUNCT_RE.sub('', text)
+        # Collapse multiple spaces
+        text = ' '.join(text.split())
+        return text.strip()
 
     def collate_fn(self, batch):
         """Collate function for DataLoader."""
