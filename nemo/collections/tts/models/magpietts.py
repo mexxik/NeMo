@@ -3504,12 +3504,13 @@ class MagpieTTSModel(ModelPT):
         # Common mappings for tokenizer names
         language_tokenizer_map = {
             "en": ["english_phoneme", "english"],
-            "de": ["german_phoneme", "german"],
+            "de": ["german_phoneme", "german", "german_chartokenizer"],
             "es": ["spanish_phoneme", "spanish"],
             "fr": ["french_chartokenizer", "french"],
             "it": ["italian_phoneme", "italian"],
             "vi": ["vietnamese_phoneme", "vietnamese"],
             "zh": ["mandarin_phoneme", "mandarin", "chinese"],
+            "uk": ["french_chartokenizer", "ukrainian_chartokenizer", "ukrainian"],
         }
 
         # Find matching tokenizer

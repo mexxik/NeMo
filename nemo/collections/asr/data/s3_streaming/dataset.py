@@ -144,8 +144,8 @@ class S3MultiLangStreamingDataset(IterableDataset):
         add_eot_token: bool = False,
         eot_token: str = "<eot>",
 
-        # Text normalization (remove punctuation and capitalization)
-        normalize_text: bool = False,
+        # Text normalization: "none", "full" (lowercase + remove all punctuation), "soft" (keep casing + keep only . , ! ?)
+        normalize_text = "none",
 
         # Shuffle buffer (0 = no buffering, stream directly)
         shuffle_buffer_size: int = 0,
@@ -182,8 +182,8 @@ class S3MultiLangStreamingDataset(IterableDataset):
         # Prefetch (background sample loading)
         prefetch_buffer_size: int = 0,  # Number of samples to prefetch per source (0 to disable)
 
-        # Source balancing with augmentation
-        balance_sources: bool = True,  # Balance underrepresented sources by repeating with augmentation
+        # Source balancing mode: "none", "max", "min", "distributed"
+        balance_mode: str = "max",
         augment_prob: float = 0.1,  # Base probability of augmentation for non-repeated samples
         augment_speed: bool = False,  # Enable speed perturbation (0.9x-1.1x)
         augment_gain: bool = False,  # Enable gain adjustment (+/-6dB)
@@ -226,22 +226,32 @@ class S3MultiLangStreamingDataset(IterableDataset):
         self.rotation_level = rotation_level
         self.samples_per_source = samples_per_source
         self.prefetch_buffer_size = prefetch_buffer_size
-        self.balance_sources = balance_sources
 
-        # Audio augmentation for source balancing
+        # Balance mode: backward compat for old balance_sources bool
+        if balance_mode is True:
+            balance_mode = "max"
+        elif balance_mode is False:
+            balance_mode = "none"
+        if balance_mode not in ("none", "max", "min", "distributed"):
+            raise ValueError(f"balance_mode must be 'none', 'max', 'min', or 'distributed', got: {balance_mode}")
+        self.balance_mode = balance_mode
+
+        # Audio augmentation: only for "max" mode (repeated data gets augmented)
         augment_config = AugmentationConfig(
-            enabled=balance_sources,  # Only enable if balancing is on
+            enabled=(balance_mode == "max"),
             base_prob=augment_prob,
             speed_enabled=augment_speed,
             gain_enabled=augment_gain,
             time_mask_enabled=augment_time_mask,
         )
         self.augmentor = AudioAugmentor(augment_config)
-        if balance_sources:
+        if balance_mode == "max":
             logging.info(
-                f"Source balancing enabled: augment_prob={augment_prob}, "
+                f"Balance mode 'max': augment_prob={augment_prob}, "
                 f"speed={augment_speed}, gain={augment_gain}, time_mask={augment_time_mask}"
             )
+        else:
+            logging.info(f"Balance mode: {balance_mode}")
 
         # Determine storage type
         if data_root is not None:
@@ -303,10 +313,17 @@ class S3MultiLangStreamingDataset(IterableDataset):
         self.add_eou_token = add_eou_token
         self.eou_token = eou_token
 
-        # Text normalization (remove PnC: punctuation and capitalization)
+        # Text normalization mode: "none", "full", "soft"
+        # Backward compat: bool -> str
+        if normalize_text is True:
+            normalize_text = "full"
+        elif normalize_text is False:
+            normalize_text = "none"
+        if normalize_text not in ("none", "full", "soft"):
+            raise ValueError(f"normalize_text must be 'none', 'full', or 'soft', got: {normalize_text}")
         self.normalize_text = normalize_text
-        if normalize_text:
-            logging.info("Text normalization ENABLED: will lowercase and remove punctuation")
+        if normalize_text != "none":
+            logging.info(f"Text normalization: {normalize_text}")
 
         # Get EOU token ID from vocabulary (for direct ID appending)
         # SentencePiece doesn't recognize USER_DEFINED tokens during encoding,
@@ -491,9 +508,47 @@ class S3MultiLangStreamingDataset(IterableDataset):
                 f"merge_utterances={merge_utterances}"
             )
 
+        # Compute per-language sample counts (needed for min/distributed modes and logging)
+        self._lang_sample_counts: Optional[Dict[str, int]] = None
+        if self._sqlite_cache_path and os.path.exists(self._sqlite_cache_path):
+            self._lang_sample_counts = self._get_lang_sample_counts()
+
         # Log balancing strategy if enabled
-        if self.balance_sources and self._sqlite_cache_path and os.path.exists(self._sqlite_cache_path):
+        if self.balance_mode != "none" and self._sqlite_cache_path and os.path.exists(self._sqlite_cache_path):
             self._log_balancing_strategy()
+
+    def _get_lang_sample_counts(self) -> Optional[Dict[str, int]]:
+        """Get per-language sample counts from SQLite cache."""
+        if not self._sqlite_cache_path or not os.path.exists(self._sqlite_cache_path):
+            return None
+        try:
+            from .sqlite_manifest import SQLiteManifestCache
+            cache = SQLiteManifestCache(self._sqlite_cache_path, read_only=True)
+            conn = cache._get_connection()
+
+            # Only count entries for configured sources
+            all_sources = []
+            for lang, sources in self.language_sources.items():
+                all_sources.extend(sources)
+
+            # Get per-language counts by summing over configured sources
+            lang_counts: Dict[str, int] = {}
+            for lang, sources in self.language_sources.items():
+                lang_total = 0
+                for source in sources:
+                    row = conn.execute(
+                        "SELECT COUNT(*) as cnt FROM manifest_entries WHERE source = ?",
+                        (source,)
+                    ).fetchone()
+                    if row:
+                        lang_total += row['cnt']
+                lang_counts[lang] = lang_total
+
+            cache.close()
+            return lang_counts
+        except Exception as e:
+            logging.warning(f"Could not get lang sample counts: {e}")
+            return None
 
     def _log_balancing_strategy(self):
         """Log the source balancing strategy based on duration statistics."""
@@ -501,21 +556,6 @@ class S3MultiLangStreamingDataset(IterableDataset):
             from .sqlite_manifest import SQLiteManifestCache
             cache = SQLiteManifestCache(self._sqlite_cache_path, read_only=True)
             conn = cache._get_connection()
-
-            # Get hours per source
-            rows = conn.execute("""
-                SELECT source, SUM(duration) / 3600.0 as hours, COUNT(*) as samples
-                FROM manifest_entries
-                GROUP BY source
-                ORDER BY hours DESC
-            """).fetchall()
-
-            if not rows:
-                cache.close()
-                return
-
-            source_hours = {row['source']: row['hours'] for row in rows}
-            source_samples = {row['source']: row['samples'] for row in rows}
 
             # Get hours per language
             lang_rows = conn.execute("""
@@ -526,58 +566,52 @@ class S3MultiLangStreamingDataset(IterableDataset):
             """).fetchall()
             cache.close()
 
-            total_hours = sum(source_hours.values())
-            total_samples = sum(source_samples.values())
+            if not lang_rows:
+                return
 
-            # Language-level balancing: each language repeats to match the largest language
             lang_hours = {row['lang']: row['hours'] for row in lang_rows}
             lang_samples = {row['lang']: row['samples'] for row in lang_rows}
-            max_lang_hours = max(lang_hours.values())
+            total_hours = sum(lang_hours.values())
+            total_samples = sum(lang_samples.values())
             num_languages = len(lang_hours)
+            max_lang_hours = max(lang_hours.values())
+            min_lang_samples = min(lang_samples.values()) if lang_samples else 0
 
-            # Calculate expected epoch length with language-level balancing
-            # Each language repeats to match max_lang_hours
-            # Total epoch duration = max_lang_hours * num_languages
-            expected_epoch_samples = 0
-            for lang, hours in lang_hours.items():
-                repeats = max_lang_hours / hours if hours > 0 else 0
-                expected_epoch_samples += lang_samples[lang] * repeats
+            # Calculate expected epoch samples based on balance mode
+            if self.balance_mode == "max":
+                expected_epoch_samples = 0
+                for lang, hours in lang_hours.items():
+                    repeats = max_lang_hours / hours if hours > 0 else 0
+                    expected_epoch_samples += lang_samples[lang] * repeats
+            elif self.balance_mode == "min":
+                expected_epoch_samples = min_lang_samples * num_languages
+            elif self.balance_mode == "distributed":
+                expected_epoch_samples = total_samples
+            else:
+                expected_epoch_samples = total_samples
 
             logging.info("=" * 70)
-            logging.info("LANGUAGE BALANCING STRATEGY")
+            logging.info(f"LANGUAGE BALANCING STRATEGY (mode: {self.balance_mode})")
             logging.info("=" * 70)
             logging.info(f"Total data: {total_hours:.1f}h across {num_languages} languages ({total_samples:,} samples)")
-            logging.info(f"Target per language: {max_lang_hours:.1f}h (largest language)")
-            logging.info(f"Total epoch duration: ~{max_lang_hours * num_languages:.1f}h ({num_languages} languages x {max_lang_hours:.1f}h)")
+
+            if self.balance_mode == "max":
+                logging.info(f"Target per language: {max_lang_hours:.1f}h (largest language)")
+            elif self.balance_mode == "min":
+                logging.info(f"Target per language: {min_lang_samples:,} samples (smallest language)")
+            elif self.balance_mode == "distributed":
+                logging.info(f"Proportional distribution: each language uses its own data, spread evenly")
+
             logging.info("")
-            logging.info(f"Expected epoch length:")
+            logging.info(f"Expected epoch length: ~{int(expected_epoch_samples):,} samples")
             logging.info(f"  Unique samples: {total_samples:,}")
-            logging.info(f"  With balancing: ~{int(expected_epoch_samples):,} samples (repeats included)")
 
-            # Check if epoch length will change with balancing
-            if expected_epoch_samples > total_samples * 1.05:  # 5% tolerance
-                increase_pct = (expected_epoch_samples - total_samples) / total_samples * 100
-
-                # Auto-adjust samples_per_epoch if not explicitly set by user
-                if not self._explicit_samples_per_epoch:
-                    logging.info(
-                        f"AUTO-ADJUSTING epoch length for balancing:\n"
-                        f"  Original (unique samples): {total_samples:,}\n"
-                        f"  With balancing: ~{int(expected_epoch_samples):,} samples (+{increase_pct:.0f}%)\n"
-                        f"  Updated samples_per_epoch: {int(expected_epoch_samples):,}"
-                    )
-                    self.samples_per_epoch = int(expected_epoch_samples)
-                else:
-                    # User explicitly set it - respect their choice
-                    logging.warning(
-                        f"EPOCH LENGTH MISMATCH with balancing:\n"
-                        f"  Unique samples: {total_samples:,}\n"
-                        f"  Expected with repeats: ~{int(expected_epoch_samples):,} samples (+{increase_pct:.0f}%)\n"
-                        f"  Your samples_per_epoch: {self.samples_per_epoch:,}\n"
-                        f"  \n"
-                        f"  Note: Epoch will stop at {self.samples_per_epoch:,} samples as configured,\n"
-                        f"        which may cut off repeated data from smaller sources."
-                    )
+            # Auto-adjust samples_per_epoch if not explicitly set by user
+            if expected_epoch_samples != total_samples and not self._explicit_samples_per_epoch:
+                self.samples_per_epoch = int(expected_epoch_samples)
+                logging.info(f"  Auto-adjusted samples_per_epoch: {self.samples_per_epoch:,}")
+            elif self._explicit_samples_per_epoch:
+                logging.info(f"  User-set samples_per_epoch: {self.samples_per_epoch:,}")
             logging.info("")
 
             # Per-language summary
@@ -586,25 +620,27 @@ class S3MultiLangStreamingDataset(IterableDataset):
                 lang = row['lang'] or 'unknown'
                 hours = row['hours']
                 samples = row['samples']
-                pct = (hours / total_hours) * 100
-                repeats = max_lang_hours / hours if hours > 0 else 0
-                epoch_samples = int(samples * repeats)
-                logging.info(
-                    f"  {lang:6s}: {hours:7.1f}h ({pct:5.1f}%) - {samples:>10,} samples - "
-                    f"~{repeats:.1f}x repeat (~{epoch_samples:,} per epoch)"
-                )
+                pct = (hours / total_hours) * 100 if total_hours > 0 else 0
 
-            logging.info("=" * 70)
-            if not self._explicit_samples_per_epoch:
-                logging.info(
-                    "EPOCH LENGTH: Automatically adjusted to include repeated data.\n"
-                    "              If you want different behavior, explicitly set samples_per_epoch."
-                )
-            else:
-                logging.info(
-                    "EPOCH LENGTH: Using your explicitly set samples_per_epoch value.\n"
-                    "              Epochs may stop mid-repetition if set lower than expected length."
-                )
+                if self.balance_mode == "max":
+                    repeats = max_lang_hours / hours if hours > 0 else 0
+                    epoch_samples = int(samples * repeats)
+                    logging.info(
+                        f"  {lang:6s}: {hours:7.1f}h ({pct:5.1f}%) - {samples:>10,} samples - "
+                        f"~{repeats:.1f}x repeat (~{epoch_samples:,} per epoch)"
+                    )
+                elif self.balance_mode == "min":
+                    epoch_samples = min_lang_samples
+                    logging.info(
+                        f"  {lang:6s}: {hours:7.1f}h ({pct:5.1f}%) - {samples:>10,} samples - "
+                        f"capped at {epoch_samples:,}"
+                    )
+                elif self.balance_mode == "distributed":
+                    logging.info(
+                        f"  {lang:6s}: {hours:7.1f}h ({pct:5.1f}%) - {samples:>10,} samples - "
+                        f"proportional"
+                    )
+
             logging.info("=" * 70)
 
         except Exception as e:
@@ -642,9 +678,9 @@ class S3MultiLangStreamingDataset(IterableDataset):
             logging.info("EPOCH PLAN")
             logging.info("=" * 60)
             logging.info(f"Languages: {num_languages} | Total unique data: {total_hours:.1f}h")
-            logging.info(f"Largest language: {max_lang} ({max_lang_hours:.1f}h)")
-            if self.balance_sources:
-                logging.info(f"Balancing target: {max_lang_hours:.1f}h per language")
+            logging.info(f"Balance mode: {self.balance_mode}")
+            if self.balance_mode == "max":
+                logging.info(f"Largest language: {max_lang} ({max_lang_hours:.1f}h)")
                 logging.info(f"Expected epoch: ~{max_lang_hours * num_languages:.1f}h "
                              f"({num_languages} x {max_lang_hours:.1f}h)")
             logging.info("-" * 60)
@@ -652,7 +688,7 @@ class S3MultiLangStreamingDataset(IterableDataset):
             for lang in sorted(lang_hours.keys()):
                 hours = lang_hours[lang]
                 samples = lang_samples[lang]
-                if self.balance_sources and max_lang_hours > 0:
+                if self.balance_mode == "max" and max_lang_hours > 0:
                     repeat = max_lang_hours / hours if hours > 0 else 0
                     epoch_samples = int(samples * repeat)
                     if repeat > 1.05:
@@ -925,7 +961,8 @@ class S3MultiLangStreamingDataset(IterableDataset):
             source_managers=source_managers,
             languages_order=sorted(self.language_sources.keys()),
             samples_per_source=self.samples_per_source,
-            balance_sources=self.balance_sources,
+            balance_mode=self.balance_mode,
+            lang_sample_counts=self._lang_sample_counts,
         )
 
     def __iter__(self) -> Iterator[Tuple[torch.Tensor, ...]]:
@@ -1025,21 +1062,22 @@ class S3MultiLangStreamingDataset(IterableDataset):
         if audio is None:
             return None
 
-        # Apply augmentation in-place for repeated data (source_cycle > 0 = always, cycle 0 = 10%)
-        source_cycle = sample.get('source_cycle', 0)
-        if source_cycle > 0 or random.random() < 0.1:
-            # Gain adjustment: +/-6dB with 50% probability
-            if random.random() < 0.5:
-                gain_db = random.uniform(-6.0, 6.0)
-                audio *= 10 ** (gain_db / 20)
-            # Time masking: zero out up to 10% with 30% probability
-            if random.random() < 0.3:
-                length = audio.shape[-1]
-                max_mask = int(length * 0.1)
-                if max_mask > 0:
-                    mask_len = random.randint(1, max_mask)
-                    start = random.randint(0, length - mask_len)
-                    audio[start:start + mask_len] = 0
+        # Apply augmentation only in "max" balance mode (repeated data gets augmented)
+        if self.balance_mode == "max":
+            source_cycle = sample.get('source_cycle', 0)
+            if source_cycle > 0 or random.random() < 0.1:
+                # Gain adjustment: +/-6dB with 50% probability
+                if random.random() < 0.5:
+                    gain_db = random.uniform(-6.0, 6.0)
+                    audio *= 10 ** (gain_db / 20)
+                # Time masking: zero out up to 10% with 30% probability
+                if random.random() < 0.3:
+                    length = audio.shape[-1]
+                    max_mask = int(length * 0.1)
+                    if max_mask > 0:
+                        mask_len = random.randint(1, max_mask)
+                        start = random.randint(0, length - mask_len)
+                        audio[start:start + mask_len] = 0
 
         # Audio tensor
         if isinstance(audio, np.ndarray):
@@ -1067,9 +1105,11 @@ class S3MultiLangStreamingDataset(IterableDataset):
                 and self.token_augmenter.should_add_eou(text)
             )
 
-            # Normalize text if configured (remove punctuation and lowercase)
-            if self.normalize_text:
+            # Normalize text if configured
+            if self.normalize_text == "full":
                 text = self._normalize_text(text)
+            elif self.normalize_text == "soft":
+                text = self._soft_normalize_text(text)
 
             # Tokenize text (without <eou> - we'll append the ID directly)
             tokens = self.tokenizer.text_to_ids(text)
@@ -1123,9 +1163,11 @@ class S3MultiLangStreamingDataset(IterableDataset):
             tokens.append(self.bos_id)
 
         for i, text in enumerate(texts):
-            # Normalize text if configured (remove punctuation and lowercase)
-            if self.normalize_text:
+            # Normalize text if configured
+            if self.normalize_text == "full":
                 text = self._normalize_text(text)
+            elif self.normalize_text == "soft":
+                text = self._soft_normalize_text(text)
 
             # Tokenize this segment
             segment_tokens = self.tokenizer.text_to_ids(text)
@@ -1153,17 +1195,26 @@ class S3MultiLangStreamingDataset(IterableDataset):
 
     def _normalize_text(self, text: str) -> str:
         """
-        Normalize text by removing punctuation and lowercasing.
+        Full normalization: remove all punctuation and lowercase.
 
-        This produces "no PnC" (no Punctuation and Capitalization) text,
-        which is useful for training models that only need to predict
-        raw text without formatting.
+        Produces "no PnC" (no Punctuation and Capitalization) text.
         """
-        # Lowercase
         text = text.lower()
-        # Remove punctuation
         text = self._PUNCT_RE.sub('', text)
-        # Collapse multiple spaces
+        text = ' '.join(text.split())
+        return text.strip()
+
+    # Regex for soft normalization: remove everything that's not word chars, whitespace, or . , ! ?
+    _SOFT_PUNCT_RE = re.compile(r'[^\w\s.,!?]', re.UNICODE)
+
+    def _soft_normalize_text(self, text: str) -> str:
+        """
+        Soft normalization: keep capitalization, keep only . , ! ? punctuation.
+
+        Removes all other punctuation marks (colons, semicolons, quotes,
+        brackets, dashes, etc.) while preserving the original casing.
+        """
+        text = self._SOFT_PUNCT_RE.sub('', text)
         text = ' '.join(text.split())
         return text.strip()
 
@@ -1177,12 +1228,12 @@ class S3MultiLangStreamingDataset(IterableDataset):
 
         Returns samples_per_epoch, which is either:
         - Explicitly provided by user (always respected)
-        - Auto-adjusted if balance_sources=True and not explicitly set
-        - Auto-calculated from manifest entry counts (if balance_sources=False)
+        - Auto-adjusted based on balance_mode if not explicitly set
+        - Auto-calculated from manifest entry counts
         - Fallback estimate if manifest loading failed
 
         Source Balancing Behavior:
-        If balance_sources=True:
+        If balance_mode="max":
         - Underrepresented sources are repeated during training with augmentation
         - If samples_per_epoch was NOT explicitly set, it's automatically adjusted
           to include all repeated data (expected_epoch_samples)
