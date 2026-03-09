@@ -73,6 +73,9 @@ class DynamicBatchingDataset(IterableDataset):
             yield _speech_collate_fn(batch, pad_id=0)
 
     def __len__(self):
+        # Return total samples (not batches). The SampleProgressBar callback
+        # increments by actual batch size each step, so the progress bar
+        # shows samples_processed / total_samples accurately.
         return len(self.inner_dataset)
 
 
