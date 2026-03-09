@@ -11,9 +11,9 @@ Key insight: VRAM cost is proportional to batch_size × longest_sample
 the sum of durations.
 
 Also provides a VRAM probing function that runs synthetic forward+backward
-passes to find the memory cost per padded-second, then computes a safe
-budget. Never risks OOM — critical for shared-memory GPUs where OOM
-freezes the system.
+passes at the actual worst-case sample length (max_duration from config)
+to measure per-sample VRAM cost. Never risks OOM — critical for
+shared-memory GPUs where OOM freezes the system.
 """
 
 import torch
@@ -102,22 +102,22 @@ def _run_probe_step(model, num_samples, per_sample_len, token_count, vocab_size)
     return peak_gb
 
 
-def probe_max_batch_duration(model, target_vram_gb: float, sample_rate: int = 16000):
+def probe_max_batch_duration(model, target_vram_gb: float, max_sample_duration: float = 45.0, sample_rate: int = 16000):
     """
     Probe GPU memory to find the maximum padded batch budget that fits
     within target_vram_gb.
 
-    VRAM for a batch = f(batch_size × max_sample_length) because all
-    samples are padded to the longest one. We probe with uniform-length
-    batches (where total_padded = batch_size × sample_length) at two
-    different sizes to measure the linear relationship, then extrapolate.
+    Probes at the ACTUAL worst-case sample length (max_sample_duration)
+    with batch_size=1 and batch_size=2. This directly measures VRAM cost
+    at the real padding length, so extrapolation is accurate.
 
-    Uses two small safe probes — never risks OOM. Critical for
-    shared-memory GPUs (e.g., GB10) where OOM freezes the system.
+    Uses `torch.cuda.mem_get_info()` to verify safety before each probe.
+    Never risks OOM — critical for shared-memory GPUs (e.g., GB10).
 
     Args:
         model: ASR model (on CUDA)
         target_vram_gb: Target VRAM usage in GB
+        max_sample_duration: Max sample duration from config (seconds)
         sample_rate: Audio sample rate
 
     Returns:
@@ -131,8 +131,9 @@ def probe_max_batch_duration(model, target_vram_gb: float, sample_rate: int = 16
 
     logging.info("=" * 60)
     logging.info("VRAM PROBE — Finding max padded batch budget")
-    logging.info(f"  Target VRAM:   {target_vram_gb:.1f} GB")
-    logging.info(f"  Sample rate:   {sample_rate}")
+    logging.info(f"  Target VRAM:       {target_vram_gb:.1f} GB")
+    logging.info(f"  Max sample dur:    {max_sample_duration:.1f}s")
+    logging.info(f"  Sample rate:       {sample_rate}")
     logging.info("=" * 60)
 
     # Freeze encoder if it will be frozen during early training
@@ -150,55 +151,71 @@ def probe_max_batch_duration(model, target_vram_gb: float, sample_rate: int = 16
     model.log_dict = lambda *a, **kw: None
 
     model.train()
-
-    # Measure baseline VRAM (model + optimizer, no batch)
-    torch.cuda.reset_peak_memory_stats()
     torch.cuda.empty_cache()
-    base_gb = torch.cuda.memory_allocated() / (1024 ** 3)
-    logging.info(f"  Base VRAM (model+optimizer): {base_gb:.2f} GB")
-    logging.info(f"  Available for batches: {target_vram_gb - base_gb:.2f} GB")
 
-    # Two probes with different padded costs (batch_size × sample_length)
-    # Probe 1: 4 samples × 5s = 20 padded-seconds
-    # Probe 2: 4 samples × 10s = 40 padded-seconds
-    # Both are small enough to never OOM
-    probes = [
-        (4, 5.0),   # (num_samples, per_sample_sec)
-        (4, 10.0),
-    ]
-    padded_costs = []  # padded-seconds
-    peak_vrams = []    # GB
+    # Check total GPU memory
+    free_bytes, total_bytes = torch.cuda.mem_get_info()
+    total_gb = total_bytes / (1024 ** 3)
+    free_gb = free_bytes / (1024 ** 3)
+    used_gb = total_gb - free_gb
+    logging.info(f"  GPU total:         {total_gb:.2f} GB")
+    logging.info(f"  GPU used:          {used_gb:.2f} GB")
+    logging.info(f"  GPU free:          {free_gb:.2f} GB")
 
-    for num_samples, per_sample_sec in probes:
-        per_sample_len = int(per_sample_sec * sample_rate)
-        token_count = max(1, int(per_sample_sec * 10))
-        padded_sec = num_samples * per_sample_sec
+    # Probe at actual worst-case sample length with batch_size=1 and 2
+    # This measures real per-sample VRAM cost at the padding length
+    # that will actually occur in training
+    per_sample_len = int(max_sample_duration * sample_rate)
+    token_count = max(1, int(max_sample_duration * 10))  # ~10 BPE tokens/sec
 
-        peak_gb = _run_probe_step(model, num_samples, per_sample_len, token_count, vocab_size)
-        padded_costs.append(padded_sec)
-        peak_vrams.append(peak_gb)
-        logging.info(f"  Probe: {num_samples} × {per_sample_sec:.0f}s = {padded_sec:.0f} padded-sec -> {peak_gb:.2f} GB")
+    # Safety check: estimate if even batch_size=1 fits
+    # A rough estimate: 1 sample of 45s at 16kHz = 720K floats = ~2.7 MB raw
+    # But activations + gradients can be 100-1000x that. We check free VRAM.
+    min_needed_gb = 3.0  # need at least 3 GB free for a single sample probe
+    if free_gb < min_needed_gb:
+        logging.error(f"  Only {free_gb:.1f} GB free, need at least {min_needed_gb:.1f} GB for probing")
+        # Fall back to a very conservative budget
+        safe_budget = max_sample_duration * 2  # just 2 samples at max duration
+        logging.warning(f"  Falling back to conservative budget: {safe_budget:.0f} padded-sec")
+        model.log = _orig_log
+        model.log_dict = _orig_log_dict
+        if encoder_frozen and hasattr(model, 'encoder'):
+            for param in model.encoder.parameters():
+                param.requires_grad = True
+        return safe_budget
 
-    # Linear extrapolation: peak_vram = base_cost + rate * padded_seconds
-    pc1, pc2 = padded_costs
-    pv1, pv2 = peak_vrams
-    rate_gb_per_padded_sec = (pv2 - pv1) / (pc2 - pc1)
-    base_cost = pv1 - rate_gb_per_padded_sec * pc1
+    # Probe 1: batch_size=1 at max_sample_duration
+    peak_1 = _run_probe_step(model, 1, per_sample_len, token_count, vocab_size)
+    logging.info(f"  Probe: 1 × {max_sample_duration:.0f}s -> {peak_1:.2f} GB")
 
-    logging.info(f"  Memory model: {base_cost:.2f} GB fixed + {rate_gb_per_padded_sec:.4f} GB/padded-sec")
+    # Check if batch_size=2 is safe before probing
+    # Estimate: peak_2 ≈ peak_1 + (peak_1 - base_used) where base_used is without batch
+    torch.cuda.empty_cache()
+    base_used_gb = torch.cuda.memory_allocated() / (1024 ** 3)
+    per_sample_cost_est = peak_1 - base_used_gb
+    estimated_peak_2 = peak_1 + per_sample_cost_est
 
-    max_duration = 0.0
-    if rate_gb_per_padded_sec <= 0:
-        safe_duration = pc2
-        logging.warning(f"  Rate <= 0, falling back to {safe_duration:.0f} padded-sec")
+    if estimated_peak_2 > total_gb * 0.85:
+        # batch_size=2 would be risky, extrapolate from single probe
+        logging.info(f"  Skipping batch_size=2 probe (estimated {estimated_peak_2:.1f} GB, too close to limit)")
+        per_sample_vram = per_sample_cost_est
     else:
-        # Extrapolate: target_vram = base_cost + rate * max_padded
-        max_padded = (target_vram_gb - base_cost) / rate_gb_per_padded_sec
-        max_duration = max_padded
-        # Apply 95% safety margin
-        safe_duration = max_padded * 0.95
-        # Clamp to reasonable range
-        safe_duration = max(10.0, min(safe_duration, 5000.0))
+        # Probe 2: batch_size=2 at max_sample_duration
+        peak_2 = _run_probe_step(model, 2, per_sample_len, token_count, vocab_size)
+        logging.info(f"  Probe: 2 × {max_sample_duration:.0f}s -> {peak_2:.2f} GB")
+        per_sample_vram = peak_2 - peak_1  # marginal cost of one more sample
+
+    logging.info(f"  Per-sample VRAM at {max_sample_duration:.0f}s: {per_sample_vram:.2f} GB")
+    logging.info(f"  Base VRAM (model+opt): {base_used_gb:.2f} GB")
+
+    # Calculate max batch size that fits in target VRAM
+    available_gb = target_vram_gb - base_used_gb
+    max_batch_size = max(1, int(available_gb / per_sample_vram))
+
+    # Padded budget = max_batch_size × max_sample_duration
+    # Apply 95% safety margin
+    raw_budget = max_batch_size * max_sample_duration
+    safe_budget = raw_budget * 0.95
 
     # Restore model state
     model.log = _orig_log
@@ -209,17 +226,14 @@ def probe_max_batch_duration(model, target_vram_gb: float, sample_rate: int = 16
     model.zero_grad(set_to_none=True)
     torch.cuda.empty_cache()
 
-    # Show what this means in practice
-    max_duration_cfg = 45.0  # typical max_duration from config
-    typical_batch = int(safe_duration / max_duration_cfg)
-
     logging.info("=" * 60)
     logging.info(f"VRAM PROBE COMPLETE")
-    logging.info(f"  Extrapolated max:    {max_duration:.0f} padded-sec" if rate_gb_per_padded_sec > 0 else "  Extrapolation: N/A")
-    logging.info(f"  Safe budget:         {safe_duration:.0f} padded-sec (95% margin)")
+    logging.info(f"  Max batch size at {max_sample_duration:.0f}s: {max_batch_size}")
+    logging.info(f"  Raw budget:          {raw_budget:.0f} padded-sec")
+    logging.info(f"  Safe budget:         {safe_budget:.0f} padded-sec (95% margin)")
     logging.info(f"  Target VRAM:         {target_vram_gb:.1f} GB")
-    logging.info(f"  Example: {typical_batch} × {max_duration_cfg:.0f}s = {typical_batch * max_duration_cfg:.0f} padded-sec (worst case)")
-    logging.info(f"  Example: {int(safe_duration / 10)} × 10s = {int(safe_duration / 10) * 10} padded-sec (avg case)")
+    logging.info(f"  Worst case: {max_batch_size} × {max_sample_duration:.0f}s samples")
+    logging.info(f"  Typical:    {int(safe_budget / 10)} × 10s samples")
     logging.info("=" * 60)
 
-    return safe_duration
+    return safe_budget
