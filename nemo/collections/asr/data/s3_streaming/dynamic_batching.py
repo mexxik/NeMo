@@ -61,13 +61,38 @@ class DynamicBatchingDataset(IterableDataset):
         return len(self.inner_dataset)
 
 
+def _run_probe_step(model, num_samples, per_sample_len, token_count, vocab_size):
+    """Run a single forward+backward probe and return peak VRAM in GB."""
+    torch.cuda.reset_peak_memory_stats()
+
+    audio = torch.randn(num_samples, per_sample_len, device='cuda')
+    audio_len = torch.full((num_samples,), per_sample_len, dtype=torch.long, device='cuda')
+    tokens = torch.randint(0, vocab_size, (num_samples, token_count), device='cuda')
+    tokens_len = torch.full((num_samples,), token_count, dtype=torch.long, device='cuda')
+    batch = (audio, audio_len, tokens, tokens_len)
+
+    result = model.training_step(batch, 0)
+    loss = result['loss'] if isinstance(result, dict) else result
+    loss.backward()
+
+    peak_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
+
+    del audio, audio_len, tokens, tokens_len, batch, result, loss
+    model.zero_grad(set_to_none=True)
+    torch.cuda.empty_cache()
+
+    return peak_gb
+
+
 def probe_max_batch_duration(model, target_vram_gb: float, sample_rate: int = 16000):
     """
     Probe GPU memory to find the maximum total batch duration that fits
     within target_vram_gb.
 
-    Uses binary search with synthetic forward+backward passes. The model
-    must already be on CUDA with optimizer loaded.
+    Uses two small safe probes to measure VRAM-per-second of audio, then
+    extrapolates to find the maximum duration. Never risks OOM — critical
+    for shared-memory GPUs (e.g., GB10) where OOM freezes the system
+    instead of throwing a catchable exception.
 
     Args:
         model: ASR model (on CUDA)
@@ -103,59 +128,50 @@ def probe_max_batch_duration(model, target_vram_gb: float, sample_rate: int = 16
     model.log_dict = lambda *a, **kw: None
 
     model.train()
+
+    # Measure baseline VRAM (model + optimizer, no batch)
     torch.cuda.reset_peak_memory_stats()
+    torch.cuda.empty_cache()
+    base_gb = torch.cuda.memory_allocated() / (1024 ** 3)
+    logging.info(f"  Base VRAM (model+optimizer): {base_gb:.2f} GB")
+    logging.info(f"  Available for batches: {target_vram_gb - base_gb:.2f} GB")
 
-    # Binary search over total duration range
-    lo = 10.0    # 10 seconds minimum
-    hi = 600.0   # 600 seconds maximum
-    best_duration = lo
-    num_iterations = 6
+    # Two small safe probes to measure VRAM scaling
+    # Use small durations that are guaranteed to fit
+    num_samples = 10
+    probe_durations = [30.0, 60.0]  # seconds total batch duration
+    probe_peaks = []
 
-    for i in range(num_iterations):
-        test_duration = (lo + hi) / 2.0
-
-        # Create synthetic batch: ~10 equal-length samples summing to test_duration
-        num_samples = 10
-        per_sample_sec = test_duration / num_samples
+    for dur in probe_durations:
+        per_sample_sec = dur / num_samples
         per_sample_len = int(per_sample_sec * sample_rate)
-        token_count = max(1, int(per_sample_sec * 10))  # ~10 BPE tokens/sec
+        token_count = max(1, int(per_sample_sec * 10))
 
-        try:
-            torch.cuda.reset_peak_memory_stats()
+        peak_gb = _run_probe_step(model, num_samples, per_sample_len, token_count, vocab_size)
+        probe_peaks.append(peak_gb)
+        logging.info(f"  Probe: {dur:.0f}s -> {peak_gb:.2f} GB")
 
-            audio = torch.randn(num_samples, per_sample_len, device='cuda')
-            audio_len = torch.full((num_samples,), per_sample_len, dtype=torch.long, device='cuda')
-            tokens = torch.randint(0, vocab_size, (num_samples, token_count), device='cuda')
-            tokens_len = torch.full((num_samples,), token_count, dtype=torch.long, device='cuda')
-            batch = (audio, audio_len, tokens, tokens_len)
+    # Linear extrapolation: peak = base_cost + rate * duration
+    # Solve from two points: rate = (peak2 - peak1) / (dur2 - dur1)
+    d1, d2 = probe_durations
+    p1, p2 = probe_peaks
+    rate_gb_per_sec = (p2 - p1) / (d2 - d1)
+    base_cost = p1 - rate_gb_per_sec * d1  # Fixed cost (model, optimizer, activations overhead)
 
-            result = model.training_step(batch, 0)
-            loss = result['loss'] if isinstance(result, dict) else result
-            loss.backward()
+    logging.info(f"  Memory model: {base_cost:.2f} GB fixed + {rate_gb_per_sec:.4f} GB/sec")
 
-            peak_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
-
-            # Clean up
-            del audio, audio_len, tokens, tokens_len, batch, result, loss
-            model.zero_grad(set_to_none=True)
-            torch.cuda.empty_cache()
-
-            if peak_gb <= target_vram_gb:
-                best_duration = test_duration
-                lo = test_duration
-                status = "OK"
-            else:
-                hi = test_duration
-                status = "OOM-risk"
-
-            logging.info(f"  Probe {i+1}/{num_iterations}: {test_duration:.0f}s -> {peak_gb:.2f} GB [{status}]")
-
-        except torch.cuda.OutOfMemoryError:
-            # Clean up after OOM
-            model.zero_grad(set_to_none=True)
-            torch.cuda.empty_cache()
-            hi = test_duration
-            logging.info(f"  Probe {i+1}/{num_iterations}: {test_duration:.0f}s -> OOM")
+    if rate_gb_per_sec <= 0:
+        # Edge case: rate is zero or negative (very small model or measurement noise)
+        # Fall back to the larger probe duration as our safe max
+        safe_duration = d2
+        logging.warning(f"  Rate <= 0, falling back to {safe_duration:.0f}s")
+    else:
+        # Extrapolate: target_vram = base_cost + rate * max_duration
+        max_duration = (target_vram_gb - base_cost) / rate_gb_per_sec
+        # Apply 85% safety margin (accounts for variable sample lengths, fragmentation)
+        safe_duration = max_duration * 0.85
+        # Clamp to reasonable range
+        safe_duration = max(10.0, min(safe_duration, 1200.0))
 
     # Restore model state
     model.log = _orig_log
@@ -166,14 +182,11 @@ def probe_max_batch_duration(model, target_vram_gb: float, sample_rate: int = 16
     model.zero_grad(set_to_none=True)
     torch.cuda.empty_cache()
 
-    # Apply 90% safety margin
-    safe_duration = best_duration * 0.9
-
     logging.info("=" * 60)
     logging.info(f"VRAM PROBE COMPLETE")
-    logging.info(f"  Max duration (raw):  {best_duration:.0f}s")
-    logging.info(f"  Max duration (safe): {safe_duration:.0f}s (90% margin)")
-    logging.info(f"  Target VRAM:         {target_vram_gb:.1f} GB")
+    logging.info(f"  Extrapolated max: {max_duration:.0f}s" if rate_gb_per_sec > 0 else "  Extrapolation: N/A")
+    logging.info(f"  Safe duration:    {safe_duration:.0f}s (85% margin)")
+    logging.info(f"  Target VRAM:      {target_vram_gb:.1f} GB")
     logging.info("=" * 60)
 
     return safe_duration
