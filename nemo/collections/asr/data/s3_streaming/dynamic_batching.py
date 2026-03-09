@@ -29,22 +29,51 @@ class DynamicBatchingDataset(IterableDataset):
     where the padded cost (num_samples × max_duration_in_batch) does not
     exceed max_padded_budget_sec.
 
+    Uses length bucketing: accumulates samples into a sort buffer, sorts
+    by duration, then greedily packs similar-length samples into batches.
+    This minimizes padding waste and maximizes GPU utilization.
+
     The DataLoader should use batch_size=None when using this wrapper
     (each __iter__ yield IS a complete collated batch).
     """
 
-    def __init__(self, inner_dataset, max_padded_budget_sec: float, sample_rate: int = 16000):
+    def __init__(self, inner_dataset, max_padded_budget_sec: float,
+                 sample_rate: int = 16000, sort_buffer_size: int = 500):
         super().__init__()
         self.inner_dataset = inner_dataset
         self.max_padded_budget_sec = max_padded_budget_sec
         self.sample_rate = sample_rate
+        self.sort_buffer_size = sort_buffer_size
 
-    def __iter__(self):
+    def _pack_batches(self, samples):
+        """
+        Pack sorted samples into batches greedily.
+        Samples must be sorted by duration (ascending).
+        Yields collated batch tuples.
+        """
         batch = []
         max_dur_in_batch = 0.0
 
+        for sample, duration in samples:
+            new_max_dur = max(max_dur_in_batch, duration)
+            new_count = len(batch) + 1
+            new_padded_cost = new_count * new_max_dur
+
+            if batch and new_padded_cost > self.max_padded_budget_sec:
+                yield _speech_collate_fn(batch, pad_id=0)
+                batch = []
+                max_dur_in_batch = 0.0
+
+            batch.append(sample)
+            max_dur_in_batch = max(max_dur_in_batch, duration)
+
+        if batch:
+            yield _speech_collate_fn(batch, pad_id=0)
+
+    def __iter__(self):
+        sort_buffer = []  # list of (sample, duration)
+
         for sample in self.inner_dataset:
-            # sample is (audio_tensor, audio_len, tokens_tensor, tokens_len)
             audio_len = sample[1].item() if hasattr(sample[1], 'item') else sample[1]
             duration = audio_len / self.sample_rate
 
@@ -52,25 +81,18 @@ class DynamicBatchingDataset(IterableDataset):
             if duration > self.max_padded_budget_sec:
                 continue
 
-            # Calculate what the padded cost would be if we add this sample
-            new_max_dur = max(max_dur_in_batch, duration)
-            new_count = len(batch) + 1
-            new_padded_cost = new_count * new_max_dur
+            sort_buffer.append((sample, duration))
 
-            # If adding this sample would exceed budget, yield current batch
-            if batch and new_padded_cost > self.max_padded_budget_sec:
-                yield _speech_collate_fn(batch, pad_id=0)
-                batch = []
-                max_dur_in_batch = 0.0
-                # Recalculate for fresh batch
-                new_max_dur = duration
+            # When buffer is full, sort by duration and pack into batches
+            if len(sort_buffer) >= self.sort_buffer_size:
+                sort_buffer.sort(key=lambda x: x[1])
+                yield from self._pack_batches(sort_buffer)
+                sort_buffer = []
 
-            batch.append(sample)
-            max_dur_in_batch = max(max_dur_in_batch, duration)
-
-        # Yield remaining samples
-        if batch:
-            yield _speech_collate_fn(batch, pad_id=0)
+        # Drain remaining buffer
+        if sort_buffer:
+            sort_buffer.sort(key=lambda x: x[1])
+            yield from self._pack_batches(sort_buffer)
 
     def __len__(self):
         # Return total samples (not batches). The SampleProgressBar callback
