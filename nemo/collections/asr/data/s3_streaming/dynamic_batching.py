@@ -168,8 +168,8 @@ def probe_max_batch_duration(model, target_vram_gb: float, sample_rate: int = 16
     else:
         # Extrapolate: target_vram = base_cost + rate * max_duration
         max_duration = (target_vram_gb - base_cost) / rate_gb_per_sec
-        # Apply 85% safety margin (accounts for variable sample lengths, fragmentation)
-        safe_duration = max_duration * 0.85
+        # Apply 95% safety margin (accounts for variable sample lengths, fragmentation)
+        safe_duration = max_duration * 0.95
         # Clamp to reasonable range
         safe_duration = max(10.0, min(safe_duration, 1200.0))
 
@@ -185,7 +185,7 @@ def probe_max_batch_duration(model, target_vram_gb: float, sample_rate: int = 16
     logging.info("=" * 60)
     logging.info(f"VRAM PROBE COMPLETE")
     logging.info(f"  Extrapolated max: {max_duration:.0f}s" if rate_gb_per_sec > 0 else "  Extrapolation: N/A")
-    logging.info(f"  Safe duration:    {safe_duration:.0f}s (85% margin)")
+    logging.info(f"  Safe duration:    {safe_duration:.0f}s (95% margin)")
     logging.info(f"  Target VRAM:      {target_vram_gb:.1f} GB")
     logging.info("=" * 60)
 
