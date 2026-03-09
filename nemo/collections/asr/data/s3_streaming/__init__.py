@@ -12,6 +12,7 @@ Supports:
 from .audio_merger import AudioMerger, MergeBuffer, MergeConfig
 from .augmentation import AudioAugmentor, AugmentationConfig
 from .dataset import S3MultiLangStreamingDataset
+from .dynamic_batching import DynamicBatchingDataset, probe_max_batch_duration
 from .disk_tar_stream import DiskManifestLoader, DiskTarStream
 from .filters import (
     ALLOWED_CHARS,
@@ -63,6 +64,9 @@ __all__ = [
     # S3 streaming
     'S3ManifestLoader',
     'S3TarStream',
+    # Dynamic batching
+    'DynamicBatchingDataset',
+    'probe_max_batch_duration',
     # Disk streaming
     'DiskManifestLoader',
     'DiskTarStream',
