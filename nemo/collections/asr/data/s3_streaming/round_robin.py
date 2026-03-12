@@ -71,8 +71,8 @@ class RoundRobinInterleaver:
         """
         Iterate over samples in round-robin order.
 
-        Yields:
-            Sample dict with added 'lang' key
+        Yields one epoch of samples, then returns (raises StopIteration).
+        PyTorch Lightning calls __iter__ again for the next epoch.
         """
         # Set worker-specific language offset (must be done in __iter__, not __init__)
         # This prevents all workers from synchronizing on the same language
@@ -85,15 +85,16 @@ class RoundRobinInterleaver:
                     f"({self.languages_order[self._current_idx]})"
                 )
 
+        # Reset state for this epoch
+        self._active_languages = set(self.languages_order)
+
         while True:
             sample = self._get_next_sample()
             if sample is None:
-                # All languages exhausted, start new epoch
+                # All languages exhausted — epoch is done
+                # Reset for next __iter__ call
                 self._start_new_epoch()
-                sample = self._get_next_sample()
-                if sample is None:
-                    # Still nothing, stop iteration
-                    break
+                break
 
             self._samples_yielded += 1
             yield sample
@@ -297,8 +298,8 @@ class SourceRoundRobinInterleaver:
         """
         Iterate over samples in round-robin order across languages and sources.
 
-        Yields:
-            Sample dict with added 'lang' and 'source' keys
+        Yields one epoch of samples, then returns (raises StopIteration).
+        PyTorch Lightning calls __iter__ again for the next epoch.
         """
         # Set worker-specific language offset (must be done in __iter__, not __init__)
         worker_info = torch.utils.data.get_worker_info()
@@ -310,14 +311,17 @@ class SourceRoundRobinInterleaver:
                     f"({self.languages_order[self._current_lang_idx]})"
                 )
 
+        # Reset state for this epoch
+        self._active_languages = set(self.languages_order)
+        self._lang_yielded = {lang: 0 for lang in self.languages_order}
+
         while True:
             sample = self._get_next_sample()
             if sample is None:
-                # All languages exhausted, start new epoch
+                # All languages exhausted — epoch is done
+                # Reset for next __iter__ call
                 self._start_new_epoch()
-                sample = self._get_next_sample()
-                if sample is None:
-                    break
+                break
 
             self._samples_yielded += 1
             yield sample
