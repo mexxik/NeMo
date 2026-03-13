@@ -182,9 +182,11 @@ class SourceRoundRobinInterleaver:
     - "min": Cap all languages at the minimum language's sample count.
       No restarts, no augmentation.
     - "distributed": Spread underrepresented languages evenly across the epoch.
-      Uses progress-ratio-based language selection instead of round-robin.
-      Sources restart when exhausted (to cycle smaller languages), but no
-      augmentation. Each language's budget = its unique sample count.
+      Uses progress-ratio-based source selection instead of round-robin.
+      Each source has a budget = its sample count. The source with the lowest
+      completion ratio (yielded / budget) gets picked next. Sources never
+      restart — each is seen exactly once per epoch. Smaller sources are
+      spread evenly across the epoch.
     """
 
     def __init__(
@@ -195,6 +197,7 @@ class SourceRoundRobinInterleaver:
         samples_per_source: int = 50,
         balance_mode: str = "max",
         lang_sample_counts: Optional[Dict[str, int]] = None,
+        source_sample_counts: Optional[Dict[str, int]] = None,
     ):
         """
         Initialize source-level round-robin interleaver.
@@ -206,7 +209,9 @@ class SourceRoundRobinInterleaver:
             samples_per_source: Number of samples to get from each source before
                                rotating to the next.
             balance_mode: "none", "max", "min", or "distributed"
-            lang_sample_counts: Per-language sample counts (required for "min" and "distributed")
+            lang_sample_counts: Per-language sample counts (required for "min")
+            source_sample_counts: Per-source sample counts "lang:source" -> count
+                                  (required for "distributed")
         """
         self.language_sources = language_sources
         self.source_managers = source_managers
@@ -253,23 +258,42 @@ class SourceRoundRobinInterleaver:
         worker_info = torch.utils.data.get_worker_info()
         self._num_workers = worker_info.num_workers if worker_info is not None else 1
 
-        # Per-language budgets and yield tracking for "min" and "distributed" modes
+        # Per-language budgets (for "min" mode)
         self._lang_budget: Dict[str, int] = {}
         self._lang_yielded: Dict[str, int] = {lang: 0 for lang in self.languages_order}
-        if balance_mode in ("min", "distributed") and lang_sample_counts:
-            if balance_mode == "min":
+
+        # Per-source budgets and yield tracking (for "distributed" mode)
+        # Each source has its own budget = its sample count. Never restarts.
+        # Source with lowest completion ratio gets picked next.
+        self._source_budget: Dict[str, int] = {}    # "lang:source" -> total samples
+        self._source_yielded: Dict[str, int] = {}   # "lang:source" -> yielded so far
+        self._active_sources: set = set()            # active "lang:source" keys
+
+        if balance_mode == "distributed":
+            if source_sample_counts:
+                for key in source_managers:
+                    self._source_budget[key] = source_sample_counts.get(key, 0)
+                    self._source_yielded[key] = 0
+                self._active_sources = set(
+                    k for k, v in self._source_budget.items() if v > 0
+                )
+            else:
+                logging.warning(
+                    "balance_mode='distributed' requires source_sample_counts but none provided. "
+                    "Falling back to 'none' mode."
+                )
+                self.balance_mode = "none"
+        elif balance_mode == "min":
+            if lang_sample_counts:
                 min_count = min(lang_sample_counts[l] for l in self.languages_order)
                 for lang in self.languages_order:
                     self._lang_budget[lang] = min_count
-            elif balance_mode == "distributed":
-                for lang in self.languages_order:
-                    self._lang_budget[lang] = lang_sample_counts.get(lang, 0)
-        elif balance_mode in ("min", "distributed"):
-            logging.warning(
-                f"balance_mode='{balance_mode}' requires lang_sample_counts but none provided. "
-                f"Falling back to 'none' mode."
-            )
-            self.balance_mode = "none"
+            else:
+                logging.warning(
+                    "balance_mode='min' requires lang_sample_counts but none provided. "
+                    "Falling back to 'none' mode."
+                )
+                self.balance_mode = "none"
 
         # Total sources for logging
         total_sources = sum(len(srcs) for srcs in self._sources_by_lang.values())
@@ -278,12 +302,14 @@ class SourceRoundRobinInterleaver:
             f"{total_sources} sources, {samples_per_source} samples/source batch, "
             f"balance_mode={self.balance_mode}"
         )
-        if self._lang_budget:
+        if self.balance_mode == "distributed":
+            for key in sorted(self._source_budget.keys()):
+                logging.info(f"  [{key}] budget={self._source_budget[key]:,}")
+        elif self._lang_budget:
             for lang in self.languages_order:
                 budget = self._lang_budget.get(lang, 0)
-                total = lang_sample_counts.get(lang, 0) if lang_sample_counts else 0
                 logging.info(f"  [{lang}] {len(self._sources_by_lang[lang])} sources, "
-                             f"budget={budget:,} (unique={total:,})")
+                             f"budget={budget:,}")
         else:
             for lang in self.languages_order:
                 logging.info(f"  [{lang}] {len(self._sources_by_lang[lang])} sources: "
@@ -292,6 +318,7 @@ class SourceRoundRobinInterleaver:
         self._current_lang_idx = 0
         self._epoch = 0
         self._samples_yielded = 0
+        self._sample_log_done = False
         self._active_languages = set(self.languages_order)
 
     def __iter__(self) -> Iterator[dict]:
@@ -315,15 +342,35 @@ class SourceRoundRobinInterleaver:
         self._active_languages = set(self.languages_order)
         self._lang_yielded = {lang: 0 for lang in self.languages_order}
 
+        # Reset distributed source tracking
+        if self.balance_mode == "distributed":
+            self._source_yielded = {k: 0 for k in self._source_budget}
+            self._active_sources = set(
+                k for k, v in self._source_budget.items() if v > 0
+            )
+
         while True:
             sample = self._get_next_sample()
             if sample is None:
-                # All languages exhausted — epoch is done
-                # Reset for next __iter__ call
+                # All sources exhausted — epoch is done
                 self._start_new_epoch()
                 break
 
             self._samples_yielded += 1
+
+            # Log first 100 samples from worker 0 only, once
+            if not self._sample_log_done:
+                wi = torch.utils.data.get_worker_info()
+                if wi is None or wi.id == 0:
+                    if self._samples_yielded <= 300:
+                        src_key = f"{sample.get('lang', '?')}:{sample.get('source', '?')}"
+                        logging.info(f"[sample {self._samples_yielded:>3}] {src_key}")
+                    if self._samples_yielded >= 300:
+                        logging.info("... (sample logging stopped after 300)")
+                        self._sample_log_done = True
+                else:
+                    self._sample_log_done = True
+
             yield sample
 
     def _get_next_sample(self) -> Optional[dict]:
@@ -369,41 +416,82 @@ class SourceRoundRobinInterleaver:
 
     def _get_next_sample_weighted(self) -> Optional[dict]:
         """
-        Progress-ratio-based language selection (for "min" and "distributed" modes).
+        Progress-ratio-based selection for "min" and "distributed" modes.
 
-        Picks the language with the lowest completion ratio (yielded / budget),
-        ensuring underrepresented languages are spread evenly across the epoch.
+        "distributed": picks the SOURCE with the lowest completion ratio
+        (yielded / budget). Each source is seen exactly once — never restarts.
+        Smaller sources get spread evenly across the epoch.
+
+        "min": picks the LANGUAGE with the lowest completion ratio, capped
+        at min(lang_counts). No restarts.
         """
+        if self.balance_mode == "distributed":
+            return self._get_next_sample_distributed()
+
+        # "min" mode — language-level weighted
         if not self._active_languages:
             return None
 
-        # Pick language with lowest completion ratio
         next_lang = min(
             self._active_languages,
             key=lambda l: self._lang_yielded[l] / max(self._lang_budget[l], 1)
         )
 
-        # In distributed mode, restart exhausted sources (to cycle smaller languages)
-        # In min mode, no restart needed (all languages have enough data for min budget)
-        restart_sources = (self.balance_mode == "distributed")
-
-        sample = self._get_sample_from_lang(next_lang, restart_sources=restart_sources)
+        sample = self._get_sample_from_lang(next_lang, restart_sources=False)
         if sample is not None:
             self._lang_yielded[next_lang] += 1
             if self._lang_yielded[next_lang] >= self._lang_budget[next_lang]:
                 self._active_languages.discard(next_lang)
-                if not _in_worker():
-                    logging.debug(f"[{next_lang}] Reached budget {self._lang_budget[next_lang]:,}")
             return sample
 
-        # Language couldn't produce a sample — remove it
         self._active_languages.discard(next_lang)
-        if not _in_worker():
-            logging.debug(f"[{next_lang}] Exhausted at {self._lang_yielded[next_lang]:,} samples")
-
-        # Try again with remaining languages
         if self._active_languages:
             return self._get_next_sample_weighted()
+        return None
+
+    def _get_next_sample_distributed(self) -> Optional[dict]:
+        """
+        Source-level distributed interleaving.
+
+        Picks the source with the lowest completion ratio (yielded / budget).
+        Never restarts — each source is seen exactly once per epoch.
+        Smaller sources are spread evenly across the epoch.
+        """
+        if not self._active_sources:
+            return None
+
+        # Pick source with lowest completion ratio
+        next_key = min(
+            self._active_sources,
+            key=lambda k: self._source_yielded[k] / max(self._source_budget[k], 1)
+        )
+
+        manager = self.source_managers[next_key]
+        sample = manager.get_next_sample()
+
+        if sample is not None:
+            # Parse lang:source from key
+            lang, src = next_key.split(':', 1)
+            sample['lang'] = lang
+            sample['source'] = src
+            sample['source_cycle'] = 0  # no restarts in distributed mode
+
+            self._source_yielded[next_key] += 1
+            # Remove source when it runs out of data (not when budget reached,
+            # because the real data may differ slightly from the counted budget)
+            return sample
+
+        # Source exhausted — remove it
+        self._active_sources.discard(next_key)
+        if not _in_worker():
+            logging.debug(
+                f"[{next_key}] Exhausted at {self._source_yielded[next_key]:,}"
+                f"/{self._source_budget[next_key]:,} samples"
+            )
+
+        # Try again with remaining sources
+        if self._active_sources:
+            return self._get_next_sample_distributed()
         return None
 
     def _get_sample_from_lang(self, lang: str, restart_sources: bool = False) -> Optional[dict]:
@@ -412,7 +500,7 @@ class SourceRoundRobinInterleaver:
 
         Args:
             lang: Language code
-            restart_sources: If True, restart exhausted sources (for max/distributed modes)
+            restart_sources: If True, restart exhausted sources (for "max" mode)
 
         Returns:
             Sample dict with 'lang', 'source', 'source_cycle' keys, or None
@@ -472,9 +560,21 @@ class SourceRoundRobinInterleaver:
                     f"{sources_with_repeats}/{len(self._source_cycles)} sources repeated, "
                     f"max cycles: {max_cycles}"
                 )
-            elif self.balance_mode in ("min", "distributed"):
+            elif self.balance_mode == "distributed":
+                total_yielded = sum(self._source_yielded.values())
+                total_budget = sum(self._source_budget.values())
                 logging.info(
-                    f"Epoch {self._epoch} - Balance mode '{self.balance_mode}': "
+                    f"Epoch {self._epoch} done - distributed: "
+                    f"{total_yielded:,}/{total_budget:,} samples across "
+                    f"{len(self._source_budget)} sources"
+                )
+                for key in sorted(self._source_yielded.keys()):
+                    y = self._source_yielded[key]
+                    b = self._source_budget[key]
+                    logging.info(f"  [{key}] {y:,}/{b:,}")
+            elif self.balance_mode == "min":
+                logging.info(
+                    f"Epoch {self._epoch} - Balance mode 'min': "
                     f"per-lang yields: {dict(self._lang_yielded)}"
                 )
             logging.info(f"Starting epoch {self._epoch}")

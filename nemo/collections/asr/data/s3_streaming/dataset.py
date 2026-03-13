@@ -508,31 +508,28 @@ class S3MultiLangStreamingDataset(IterableDataset):
                 f"merge_utterances={merge_utterances}"
             )
 
-        # Compute per-language sample counts (needed for min/distributed modes and logging)
+        # Compute per-language and per-source sample counts (needed for min/distributed modes)
         self._lang_sample_counts: Optional[Dict[str, int]] = None
+        self._source_sample_counts: Optional[Dict[str, int]] = None
         if self._sqlite_cache_path and os.path.exists(self._sqlite_cache_path):
-            self._lang_sample_counts = self._get_lang_sample_counts()
+            self._lang_sample_counts, self._source_sample_counts = self._get_sample_counts()
 
         # Log balancing strategy if enabled
         if self.balance_mode != "none" and self._sqlite_cache_path and os.path.exists(self._sqlite_cache_path):
             self._log_balancing_strategy()
 
-    def _get_lang_sample_counts(self) -> Optional[Dict[str, int]]:
-        """Get per-language sample counts from SQLite cache."""
+    def _get_sample_counts(self):
+        """Get per-language and per-source sample counts from SQLite cache."""
         if not self._sqlite_cache_path or not os.path.exists(self._sqlite_cache_path):
-            return None
+            return None, None
         try:
             from .sqlite_manifest import SQLiteManifestCache
             cache = SQLiteManifestCache(self._sqlite_cache_path, read_only=True)
             conn = cache._get_connection()
 
-            # Only count entries for configured sources
-            all_sources = []
-            for lang, sources in self.language_sources.items():
-                all_sources.extend(sources)
-
-            # Get per-language counts by summing over configured sources
             lang_counts: Dict[str, int] = {}
+            source_counts: Dict[str, int] = {}  # "lang:source" -> count
+
             for lang, sources in self.language_sources.items():
                 lang_total = 0
                 for source in sources:
@@ -540,15 +537,16 @@ class S3MultiLangStreamingDataset(IterableDataset):
                         "SELECT COUNT(*) as cnt FROM manifest_entries WHERE source = ?",
                         (source,)
                     ).fetchone()
-                    if row:
-                        lang_total += row['cnt']
+                    count = row['cnt'] if row else 0
+                    lang_total += count
+                    source_counts[f"{lang}:{source}"] = count
                 lang_counts[lang] = lang_total
 
             cache.close()
-            return lang_counts
+            return lang_counts, source_counts
         except Exception as e:
-            logging.warning(f"Could not get lang sample counts: {e}")
-            return None
+            logging.warning(f"Could not get sample counts: {e}")
+            return None, None
 
     def _log_balancing_strategy(self):
         """Log the source balancing strategy based on duration statistics."""
@@ -963,6 +961,7 @@ class S3MultiLangStreamingDataset(IterableDataset):
             samples_per_source=self.samples_per_source,
             balance_mode=self.balance_mode,
             lang_sample_counts=self._lang_sample_counts,
+            source_sample_counts=self._source_sample_counts,
         )
 
     def __iter__(self) -> Iterator[Tuple[torch.Tensor, ...]]:
