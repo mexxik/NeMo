@@ -73,7 +73,7 @@ class DynamicBatchingDataset(IterableDataset):
             max_dur_in_batch = max(max_dur_in_batch, duration)
 
         if batch:
-            yield self._pad_to_fixed(_speech_collate_fn(batch, pad_id=0))
+            yield _speech_collate_fn(batch, pad_id=0)
 
     def __iter__(self):
         sort_buffer = []  # list of (sample, duration)
