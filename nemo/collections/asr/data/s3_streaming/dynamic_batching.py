@@ -33,12 +33,17 @@ class DynamicBatchingDataset(IterableDataset):
     by duration, then greedily packs similar-length samples into batches.
     This minimizes padding waste and maximizes GPU utilization.
 
+    On unified-memory GPUs (e.g. GB10), all batches are padded to a fixed
+    max_audio_len so the CUDA allocator sees identical tensor shapes every
+    step and reuses memory instead of reserving ever-larger blocks.
+
     The DataLoader should use batch_size=None when using this wrapper
     (each __iter__ yield IS a complete collated batch).
     """
 
     def __init__(self, inner_dataset, max_padded_budget_sec: float,
-                 sample_rate: int = 16000, sort_buffer_size: int = 500):
+                 sample_rate: int = 16000, sort_buffer_size: int = 500,
+                 max_duration_sec: float = None):
         super().__init__()
         self.inner_dataset = inner_dataset
         self.max_padded_budget_sec = max_padded_budget_sec
@@ -68,7 +73,7 @@ class DynamicBatchingDataset(IterableDataset):
             max_dur_in_batch = max(max_dur_in_batch, duration)
 
         if batch:
-            yield _speech_collate_fn(batch, pad_id=0)
+            yield self._pad_to_fixed(_speech_collate_fn(batch, pad_id=0))
 
     def __iter__(self):
         sort_buffer = []  # list of (sample, duration)
