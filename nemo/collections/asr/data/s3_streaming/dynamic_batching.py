@@ -1,103 +1,121 @@
 """
 Dynamic Batching for ASR Training.
 
-Provides a dataset wrapper that creates variable-size batches based on
-padded VRAM cost (num_samples × max_sample_duration) rather than a fixed
-sample count. This avoids OOM by ensuring each batch stays within GPU
-memory limits.
+Uses streaming bucket batching: as samples arrive from the TAR stream,
+each is routed to a duration bucket.  When a bucket fills (its padded
+cost reaches the budget), the batch is yielded immediately.  No sort
+buffer, no accumulation delay — the GPU always has work.
 
-Key insight: VRAM cost is proportional to batch_size × longest_sample
-(because all samples are padded to the max length in the batch), NOT to
-the sum of durations.
+Bucket ceilings are fixed (e.g. 5s, 10s, 15s, 20s, 30s, …) so the CUDA
+allocator sees only a few distinct tensor shapes and reuses memory.
 
 Also provides a VRAM probing function that runs synthetic forward+backward
 passes at the actual worst-case sample length (max_duration from config)
-to measure per-sample VRAM cost. Never risks OOM — critical for
-shared-memory GPUs where OOM freezes the system.
+to measure per-sample VRAM cost.
 """
 
+import math
 import torch
 from torch.utils.data import IterableDataset
 
 from nemo.collections.asr.data.audio_to_text import _speech_collate_fn
 from nemo.utils import logging
 
+# Default bucket boundaries in seconds.
+# Samples are routed to the smallest bucket that fits their duration.
+DEFAULT_BUCKET_BOUNDARIES = [2, 5, 10, 15, 20, 30, 45, 60, 90, 120, 180, 250]
+
 
 class DynamicBatchingDataset(IterableDataset):
     """
-    Wraps an inner streaming dataset and yields pre-collated batches
-    where the padded cost (num_samples × max_duration_in_batch) does not
-    exceed max_padded_budget_sec.
+    Streaming bucket batcher for ASR training.
 
-    Uses length bucketing: accumulates samples into a sort buffer, sorts
-    by duration, then greedily packs similar-length samples into batches.
-    This minimizes padding waste and maximizes GPU utilization.
+    Samples arrive one at a time from an IterableDataset (TAR stream).
+    Each sample is instantly routed to its duration bucket.  When a
+    bucket's padded cost (num_samples × bucket_ceiling) reaches the
+    budget, the batch is collated and yielded.
 
-    On unified-memory GPUs (e.g. GB10), all batches are padded to a fixed
-    max_audio_len so the CUDA allocator sees identical tensor shapes every
-    step and reuses memory instead of reserving ever-larger blocks.
+    Benefits over sort-buffer approach:
+    - Zero accumulation delay — batches yield as soon as any bucket fills
+    - Fixed tensor shapes per bucket — CUDA allocator reuses memory
+    - Continuous flow — GPU never starves waiting for a sort buffer
 
     The DataLoader should use batch_size=None when using this wrapper
     (each __iter__ yield IS a complete collated batch).
     """
 
     def __init__(self, inner_dataset, max_padded_budget_sec: float,
-                 sample_rate: int = 16000, sort_buffer_size: int = 500,
+                 sample_rate: int = 16000,
+                 bucket_boundaries: list = None,
                  max_duration_sec: float = None):
         super().__init__()
         self.inner_dataset = inner_dataset
         self.max_padded_budget_sec = max_padded_budget_sec
         self.sample_rate = sample_rate
-        self.sort_buffer_size = sort_buffer_size
 
-    def _pack_batches(self, samples):
-        """
-        Pack sorted samples into batches greedily.
-        Samples must be sorted by duration (ascending).
-        Yields collated batch tuples.
-        """
-        batch = []
-        max_dur_in_batch = 0.0
+        # Build bucket ceilings: only keep boundaries ≤ max_duration
+        boundaries = bucket_boundaries or DEFAULT_BUCKET_BOUNDARIES
+        if max_duration_sec is not None:
+            boundaries = [b for b in boundaries if b <= max_duration_sec]
+            # Ensure the max duration itself is a boundary
+            if not boundaries or boundaries[-1] < max_duration_sec:
+                boundaries.append(max_duration_sec)
+        self.bucket_ceilings = sorted(boundaries)
 
-        for sample, duration in samples:
-            new_max_dur = max(max_dur_in_batch, duration)
-            new_count = len(batch) + 1
-            new_padded_cost = new_count * new_max_dur
+        # Pre-compute max batch size per bucket
+        # batch_size = floor(budget / ceiling)
+        self.bucket_max_batch = {
+            ceil: max(1, int(max_padded_budget_sec / ceil))
+            for ceil in self.bucket_ceilings
+        }
 
-            if batch and new_padded_cost > self.max_padded_budget_sec:
-                yield _speech_collate_fn(batch, pad_id=0)
-                batch = []
-                max_dur_in_batch = 0.0
-
-            batch.append(sample)
-            max_dur_in_batch = max(max_dur_in_batch, duration)
-
-        if batch:
-            yield _speech_collate_fn(batch, pad_id=0)
+    def _get_bucket(self, duration):
+        """Return the bucket ceiling for a given duration."""
+        for ceil in self.bucket_ceilings:
+            if duration <= ceil:
+                return ceil
+        return None  # exceeds all buckets — skip
 
     def __iter__(self):
-        sort_buffer = []  # list of (sample, duration)
+        # Log bucket config once
+        logging.info(f"BucketBatcher: budget={self.max_padded_budget_sec:.0f}s, "
+                     f"buckets={self.bucket_ceilings}, "
+                     f"max_batch_per_bucket={self.bucket_max_batch}")
+
+        # Each bucket holds a list of samples
+        buckets = {ceil: [] for ceil in self.bucket_ceilings}
+        batch_count = {ceil: 0 for ceil in self.bucket_ceilings}
+        skipped = 0
+        total_samples = 0
 
         for sample in self.inner_dataset:
             audio_len = sample[1].item() if hasattr(sample[1], 'item') else sample[1]
             duration = audio_len / self.sample_rate
+            total_samples += 1
 
-            # Skip samples that alone exceed the budget
-            if duration > self.max_padded_budget_sec:
-                continue
+            ceil = self._get_bucket(duration)
+            if ceil is None:
+                skipped += 1
+                continue  # sample exceeds max bucket — skip
 
-            sort_buffer.append((sample, duration))
+            buckets[ceil].append(sample)
 
-            # When buffer is full, sort by duration and pack into batches
-            if len(sort_buffer) >= self.sort_buffer_size:
-                sort_buffer.sort(key=lambda x: x[1])
-                yield from self._pack_batches(sort_buffer)
-                sort_buffer = []
+            # Yield batch as soon as bucket is full
+            if len(buckets[ceil]) >= self.bucket_max_batch[ceil]:
+                yield _speech_collate_fn(buckets[ceil], pad_id=0)
+                batch_count[ceil] += 1
+                buckets[ceil] = []
 
-        # Drain remaining buffer
-        if sort_buffer:
-            sort_buffer.sort(key=lambda x: x[1])
-            yield from self._pack_batches(sort_buffer)
+        # Drain remaining samples from all buckets
+        for ceil in self.bucket_ceilings:
+            if buckets[ceil]:
+                yield _speech_collate_fn(buckets[ceil], pad_id=0)
+                batch_count[ceil] += 1
+
+        # Log summary
+        active = {k: v for k, v in batch_count.items() if v > 0}
+        logging.info(f"BucketBatcher epoch done: {total_samples} samples, "
+                     f"{skipped} skipped, batches_per_bucket={active}")
 
     def __len__(self):
         # Return total samples (not batches). The SampleProgressBar callback
@@ -190,19 +208,14 @@ def probe_max_batch_duration(model, target_vram_gb: float, max_sample_duration: 
     logging.info(f"  GPU free:          {free_gb:.2f} GB")
 
     # Probe at actual worst-case sample length with batch_size=1 and 2
-    # This measures real per-sample VRAM cost at the padding length
-    # that will actually occur in training
     per_sample_len = int(max_sample_duration * sample_rate)
     token_count = max(1, int(max_sample_duration * 10))  # ~10 BPE tokens/sec
 
     # Safety check: estimate if even batch_size=1 fits
-    # A rough estimate: 1 sample of 45s at 16kHz = 720K floats = ~2.7 MB raw
-    # But activations + gradients can be 100-1000x that. We check free VRAM.
-    min_needed_gb = 3.0  # need at least 3 GB free for a single sample probe
+    min_needed_gb = 3.0
     if free_gb < min_needed_gb:
         logging.error(f"  Only {free_gb:.1f} GB free, need at least {min_needed_gb:.1f} GB for probing")
-        # Fall back to a very conservative budget
-        safe_budget = max_sample_duration * 2  # just 2 samples at max duration
+        safe_budget = max_sample_duration * 2
         logging.warning(f"  Falling back to conservative budget: {safe_budget:.0f} padded-sec")
         model.log = _orig_log
         model.log_dict = _orig_log_dict
@@ -216,21 +229,19 @@ def probe_max_batch_duration(model, target_vram_gb: float, max_sample_duration: 
     logging.info(f"  Probe: 1 × {max_sample_duration:.0f}s -> {peak_1:.2f} GB")
 
     # Check if batch_size=2 is safe before probing
-    # Estimate: peak_2 ≈ peak_1 + (peak_1 - base_used) where base_used is without batch
     torch.cuda.empty_cache()
     base_used_gb = torch.cuda.memory_allocated() / (1024 ** 3)
     per_sample_cost_est = peak_1 - base_used_gb
     estimated_peak_2 = peak_1 + per_sample_cost_est
 
     if estimated_peak_2 > total_gb * 0.85:
-        # batch_size=2 would be risky, extrapolate from single probe
         logging.info(f"  Skipping batch_size=2 probe (estimated {estimated_peak_2:.1f} GB, too close to limit)")
         per_sample_vram = per_sample_cost_est
     else:
         # Probe 2: batch_size=2 at max_sample_duration
         peak_2 = _run_probe_step(model, 2, per_sample_len, token_count, vocab_size)
         logging.info(f"  Probe: 2 × {max_sample_duration:.0f}s -> {peak_2:.2f} GB")
-        per_sample_vram = peak_2 - peak_1  # marginal cost of one more sample
+        per_sample_vram = peak_2 - peak_1
 
     logging.info(f"  Per-sample VRAM at {max_sample_duration:.0f}s: {per_sample_vram:.2f} GB")
     logging.info(f"  Base VRAM (model+opt): {base_used_gb:.2f} GB")
