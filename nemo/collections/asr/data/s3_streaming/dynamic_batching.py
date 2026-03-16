@@ -1,121 +1,98 @@
 """
 Dynamic Batching for ASR Training.
 
-Uses streaming bucket batching: as samples arrive from the TAR stream,
-each is routed to a duration bucket.  When a bucket fills (its padded
-cost reaches the budget), the batch is yielded immediately.  No sort
-buffer, no accumulation delay — the GPU always has work.
+Provides a dataset wrapper that creates variable-size batches based on
+padded VRAM cost (num_samples × max_sample_duration) rather than a fixed
+sample count. This avoids OOM by ensuring each batch stays within GPU
+memory limits.
 
-Bucket ceilings are fixed (e.g. 5s, 10s, 15s, 20s, 30s, …) so the CUDA
-allocator sees only a few distinct tensor shapes and reuses memory.
+Key insight: VRAM cost is proportional to batch_size × longest_sample
+(because all samples are padded to the max length in the batch), NOT to
+the sum of durations.
 
 Also provides a VRAM probing function that runs synthetic forward+backward
 passes at the actual worst-case sample length (max_duration from config)
-to measure per-sample VRAM cost.
+to measure per-sample VRAM cost. Never risks OOM — critical for
+shared-memory GPUs where OOM freezes the system.
 """
 
-import math
 import torch
 from torch.utils.data import IterableDataset
 
 from nemo.collections.asr.data.audio_to_text import _speech_collate_fn
 from nemo.utils import logging
 
-# Default bucket boundaries in seconds.
-# Samples are routed to the smallest bucket that fits their duration.
-DEFAULT_BUCKET_BOUNDARIES = [2, 5, 10, 15, 20, 30, 45, 60, 90, 120, 180, 250]
-
 
 class DynamicBatchingDataset(IterableDataset):
     """
-    Streaming bucket batcher for ASR training.
+    Wraps an inner streaming dataset and yields pre-collated batches
+    where the padded cost (num_samples × max_duration_in_batch) does not
+    exceed max_padded_budget_sec.
 
-    Samples arrive one at a time from an IterableDataset (TAR stream).
-    Each sample is instantly routed to its duration bucket.  When a
-    bucket's padded cost (num_samples × bucket_ceiling) reaches the
-    budget, the batch is collated and yielded.
-
-    Benefits over sort-buffer approach:
-    - Zero accumulation delay — batches yield as soon as any bucket fills
-    - Fixed tensor shapes per bucket — CUDA allocator reuses memory
-    - Continuous flow — GPU never starves waiting for a sort buffer
+    Uses length bucketing: accumulates samples into a sort buffer, sorts
+    by duration, then greedily packs similar-length samples into batches.
+    This minimizes padding waste and maximizes GPU utilization.
 
     The DataLoader should use batch_size=None when using this wrapper
     (each __iter__ yield IS a complete collated batch).
     """
 
     def __init__(self, inner_dataset, max_padded_budget_sec: float,
-                 sample_rate: int = 16000,
-                 bucket_boundaries: list = None,
-                 max_duration_sec: float = None):
+                 sample_rate: int = 16000, sort_buffer_size: int = 500):
         super().__init__()
         self.inner_dataset = inner_dataset
         self.max_padded_budget_sec = max_padded_budget_sec
         self.sample_rate = sample_rate
+        self.sort_buffer_size = sort_buffer_size
 
-        # Build bucket ceilings: only keep boundaries ≤ max_duration
-        boundaries = bucket_boundaries or DEFAULT_BUCKET_BOUNDARIES
-        if max_duration_sec is not None:
-            boundaries = [b for b in boundaries if b <= max_duration_sec]
-            # Ensure the max duration itself is a boundary
-            if not boundaries or boundaries[-1] < max_duration_sec:
-                boundaries.append(max_duration_sec)
-        self.bucket_ceilings = sorted(boundaries)
+    def _pack_batches(self, samples):
+        """
+        Pack sorted samples into batches greedily.
+        Samples must be sorted by duration (ascending).
+        Yields collated batch tuples.
+        """
+        batch = []
+        max_dur_in_batch = 0.0
 
-        # Pre-compute max batch size per bucket
-        # batch_size = floor(budget / ceiling)
-        self.bucket_max_batch = {
-            ceil: max(1, int(max_padded_budget_sec / ceil))
-            for ceil in self.bucket_ceilings
-        }
+        for sample, duration in samples:
+            new_max_dur = max(max_dur_in_batch, duration)
+            new_count = len(batch) + 1
+            new_padded_cost = new_count * new_max_dur
 
-    def _get_bucket(self, duration):
-        """Return the bucket ceiling for a given duration."""
-        for ceil in self.bucket_ceilings:
-            if duration <= ceil:
-                return ceil
-        return None  # exceeds all buckets — skip
+            if batch and new_padded_cost > self.max_padded_budget_sec:
+                yield _speech_collate_fn(batch, pad_id=0)
+                batch = []
+                max_dur_in_batch = 0.0
+
+            batch.append(sample)
+            max_dur_in_batch = max(max_dur_in_batch, duration)
+
+        if batch:
+            yield _speech_collate_fn(batch, pad_id=0)
 
     def __iter__(self):
-        # Log bucket config once
-        logging.info(f"BucketBatcher: budget={self.max_padded_budget_sec:.0f}s, "
-                     f"buckets={self.bucket_ceilings}, "
-                     f"max_batch_per_bucket={self.bucket_max_batch}")
-
-        # Each bucket holds a list of samples
-        buckets = {ceil: [] for ceil in self.bucket_ceilings}
-        batch_count = {ceil: 0 for ceil in self.bucket_ceilings}
-        skipped = 0
-        total_samples = 0
+        sort_buffer = []  # list of (sample, duration)
 
         for sample in self.inner_dataset:
             audio_len = sample[1].item() if hasattr(sample[1], 'item') else sample[1]
             duration = audio_len / self.sample_rate
-            total_samples += 1
 
-            ceil = self._get_bucket(duration)
-            if ceil is None:
-                skipped += 1
-                continue  # sample exceeds max bucket — skip
+            # Skip samples that alone exceed the budget
+            if duration > self.max_padded_budget_sec:
+                continue
 
-            buckets[ceil].append(sample)
+            sort_buffer.append((sample, duration))
 
-            # Yield batch as soon as bucket is full
-            if len(buckets[ceil]) >= self.bucket_max_batch[ceil]:
-                yield _speech_collate_fn(buckets[ceil], pad_id=0)
-                batch_count[ceil] += 1
-                buckets[ceil] = []
+            # When buffer is full, sort by duration and pack into batches
+            if len(sort_buffer) >= self.sort_buffer_size:
+                sort_buffer.sort(key=lambda x: x[1])
+                yield from self._pack_batches(sort_buffer)
+                sort_buffer = []
 
-        # Drain remaining samples from all buckets
-        for ceil in self.bucket_ceilings:
-            if buckets[ceil]:
-                yield _speech_collate_fn(buckets[ceil], pad_id=0)
-                batch_count[ceil] += 1
-
-        # Log summary
-        active = {k: v for k, v in batch_count.items() if v > 0}
-        logging.info(f"BucketBatcher epoch done: {total_samples} samples, "
-                     f"{skipped} skipped, batches_per_bucket={active}")
+        # Drain remaining buffer
+        if sort_buffer:
+            sort_buffer.sort(key=lambda x: x[1])
+            yield from self._pack_batches(sort_buffer)
 
     def __len__(self):
         # Return total samples (not batches). The SampleProgressBar callback
