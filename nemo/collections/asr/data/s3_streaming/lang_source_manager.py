@@ -540,6 +540,10 @@ class SingleSourceManager:
         else:
             raise ValueError(f"Unknown storage_type: {storage_type}")
 
+        # TAR prefetch cache (S3 only — downloads TARs to local disk ahead of time)
+        self._tar_prefetch = None
+        self._current_local_tar_path = None  # Track current local file for cleanup
+
         # SQLite manifest cache
         self.sqlite_cache_path = sqlite_cache_path
         self._sqlite_cache: Optional[SQLiteManifestCache] = None
@@ -639,6 +643,26 @@ class SingleSourceManager:
 
         self._tar_files = tar_files
 
+        # Start TAR prefetch cache — downloads TARs to local disk in background
+        # Skip if only 1 TAR (no benefit to prefetching) or if disabled via env
+        if len(tar_files) > 1 and os.environ.get('TAR_PREFETCH_DISABLE', '') != '1':
+            from .tar_prefetch import TarPrefetchCache
+            prefetch_ahead = int(os.environ.get('TAR_PREFETCH_AHEAD', '4'))
+            cache_dir = os.path.join(
+                os.environ.get('TAR_CACHE_DIR', '/tmp/tar_prefetch'),
+                f"worker_{self._worker_id}",
+                f"{self.lang}_{self.source}",
+            )
+            self._tar_prefetch = TarPrefetchCache(
+                s3_client=self.s3_client,
+                s3_bucket=self.s3_bucket,
+                prefetch_ahead=prefetch_ahead,
+                cache_dir=cache_dir,
+                name=f"{self.lang}:{self.source}:w{self._worker_id}",
+            )
+            self._tar_prefetch.set_tar_files(tar_files)
+            self._tar_prefetch.start()
+
         if self._manifest_provider is not None:
             return
 
@@ -692,25 +716,46 @@ class SingleSourceManager:
 
     def _advance_to_next_stream(self) -> bool:
         """Advance to the next TAR file stream."""
+        # Release previous local TAR file (if prefetched from S3)
+        if self._current_local_tar_path is not None and self._tar_prefetch is not None:
+            self._tar_prefetch.release(self._current_local_tar_path)
+            self._current_local_tar_path = None
+
         if self._current_tar_idx >= len(self._tar_files):
             return False
 
-        tar_path = self._tar_files[self._current_tar_idx]
-
         manifest_entries = self._manifest_provider if self._manifest_provider else self._manifest
 
-        logging.debug(f"[{self.lang}:{self.source}] Opening stream: {tar_path}")
+        if self.storage_type == "s3" and self._tar_prefetch is not None:
+            # Use prefetched local file instead of streaming from S3
+            local_path = self._tar_prefetch.get_next()
+            if local_path is None:
+                return False
 
-        if self.storage_type == "s3":
+            from .disk_tar_stream import DiskTarStream
+            logging.debug(f"[{self.lang}:{self.source}] Opening prefetched: {local_path}")
+            stream = DiskTarStream(
+                tar_path=local_path,
+                manifest_entries=manifest_entries,
+            )
+            self._current_local_tar_path = local_path
+
+        elif self.storage_type == "s3":
+            # Fallback: direct S3 streaming (no prefetch)
+            tar_path = self._tar_files[self._current_tar_idx]
             from .s3_tar_stream import S3TarStream
+            logging.debug(f"[{self.lang}:{self.source}] Opening stream: {tar_path}")
             stream = S3TarStream(
                 s3_bucket=self.s3_bucket,
                 tar_key=tar_path,
                 manifest_entries=manifest_entries,
                 s3_client=self.s3_client,
             )
+
         else:
+            tar_path = self._tar_files[self._current_tar_idx]
             from .disk_tar_stream import DiskTarStream
+            logging.debug(f"[{self.lang}:{self.source}] Opening stream: {tar_path}")
             stream = DiskTarStream(
                 tar_path=tar_path,
                 manifest_entries=manifest_entries,
@@ -809,6 +854,15 @@ class SingleSourceManager:
             self._prefetch_buffer = None
             self._prefetch_iter = None
 
+        # Release current local TAR and restart prefetch for new epoch
+        if self._current_local_tar_path is not None and self._tar_prefetch is not None:
+            self._tar_prefetch.release(self._current_local_tar_path)
+            self._current_local_tar_path = None
+        if self._tar_prefetch is not None:
+            self._tar_prefetch.stop()
+            self._tar_prefetch.set_tar_files(self._tar_files)
+            self._tar_prefetch.start()
+
         self._current_tar_idx = 0
         self._current_stream = None
         self._exhausted = False
@@ -829,6 +883,9 @@ class SingleSourceManager:
 
     def stop(self):
         """Stop and cleanup resources."""
+        if self._tar_prefetch is not None:
+            self._tar_prefetch.stop()
+            self._tar_prefetch = None
         if self._prefetch_buffer is not None:
             self._prefetch_buffer.stop()
             self._prefetch_buffer = None

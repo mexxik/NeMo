@@ -38,12 +38,14 @@ class DynamicBatchingDataset(IterableDataset):
     """
 
     def __init__(self, inner_dataset, max_padded_budget_sec: float,
-                 sample_rate: int = 16000, sort_buffer_size: int = 500):
+                 sample_rate: int = 16000, sort_buffer_size: int = 500,
+                 max_batch_size: int = 64):
         super().__init__()
         self.inner_dataset = inner_dataset
         self.max_padded_budget_sec = max_padded_budget_sec
         self.sample_rate = sample_rate
         self.sort_buffer_size = sort_buffer_size
+        self.max_batch_size = max_batch_size
 
     def _pack_batches(self, samples):
         """
@@ -59,7 +61,8 @@ class DynamicBatchingDataset(IterableDataset):
             new_count = len(batch) + 1
             new_padded_cost = new_count * new_max_dur
 
-            if batch and new_padded_cost > self.max_padded_budget_sec:
+            if batch and (new_padded_cost > self.max_padded_budget_sec
+                          or len(batch) >= self.max_batch_size):
                 yield _speech_collate_fn(batch, pad_id=0)
                 batch = []
                 max_dur_in_batch = 0.0
