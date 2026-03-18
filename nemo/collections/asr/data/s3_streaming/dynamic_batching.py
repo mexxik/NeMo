@@ -39,13 +39,18 @@ class DynamicBatchingDataset(IterableDataset):
 
     def __init__(self, inner_dataset, max_padded_budget_sec: float,
                  sample_rate: int = 16000, sort_buffer_size: int = 500,
-                 max_batch_size: int = 64):
+                 max_batch_size: int = 64, max_sample_duration: float = None):
         super().__init__()
         self.inner_dataset = inner_dataset
         self.max_padded_budget_sec = max_padded_budget_sec
         self.sample_rate = sample_rate
         self.sort_buffer_size = sort_buffer_size
         self.max_batch_size = max_batch_size
+        # Hard cap on individual sample duration.  RNNT joint cost is O(T×U),
+        # which is roughly quadratic in duration — a single 150s sample uses
+        # far more VRAM than 15×10s samples even though both have the same
+        # padded budget cost (150 padded-sec).
+        self.max_sample_duration = max_sample_duration
 
     def _pack_batches(self, samples):
         """
@@ -80,7 +85,9 @@ class DynamicBatchingDataset(IterableDataset):
             audio_len = sample[1].item() if hasattr(sample[1], 'item') else sample[1]
             duration = audio_len / self.sample_rate
 
-            # Skip samples that alone exceed the budget
+            # Skip samples that exceed the hard duration cap or the budget
+            if self.max_sample_duration is not None and duration > self.max_sample_duration:
+                continue
             if duration > self.max_padded_budget_sec:
                 continue
 
