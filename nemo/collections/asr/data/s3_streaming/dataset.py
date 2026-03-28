@@ -137,6 +137,7 @@ class S3MultiLangStreamingDataset(IterableDataset):
         # Filtering
         min_duration: float = 0.5,
         max_duration: float = 15.0,
+        max_chars: int = 50000,
 
         # Token augmentation
         add_eou_token: bool = True,
@@ -300,7 +301,7 @@ class S3MultiLangStreamingDataset(IterableDataset):
             min_duration=min_duration,
             max_duration=max_duration,
             min_chars=1,
-            max_chars=500,
+            max_chars=max_chars,
         )
         self.sample_filter = SampleFilter(filter_config)
 
