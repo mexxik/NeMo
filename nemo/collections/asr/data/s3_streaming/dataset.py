@@ -237,22 +237,22 @@ class S3MultiLangStreamingDataset(IterableDataset):
             raise ValueError(f"balance_mode must be 'none', 'max', 'min', or 'distributed', got: {balance_mode}")
         self.balance_mode = balance_mode
 
-        # Audio augmentation: only for "max" mode (repeated data gets augmented)
+        # Audio augmentation
+        augment_any = augment_speed or augment_gain or augment_time_mask
         augment_config = AugmentationConfig(
-            enabled=(balance_mode == "max"),
+            enabled=augment_any,
             base_prob=augment_prob,
             speed_enabled=augment_speed,
             gain_enabled=augment_gain,
             time_mask_enabled=augment_time_mask,
         )
         self.augmentor = AudioAugmentor(augment_config)
-        if balance_mode == "max":
+        if augment_any:
             logging.info(
-                f"Balance mode 'max': augment_prob={augment_prob}, "
+                f"Augmentation enabled: prob={augment_prob}, "
                 f"speed={augment_speed}, gain={augment_gain}, time_mask={augment_time_mask}"
             )
-        else:
-            logging.info(f"Balance mode: {balance_mode}")
+        logging.info(f"Balance mode: {balance_mode}")
 
         # Determine storage type
         if data_root is not None:
@@ -1062,22 +1062,10 @@ class S3MultiLangStreamingDataset(IterableDataset):
         if audio is None:
             return None
 
-        # Apply augmentation only in "max" balance mode (repeated data gets augmented)
-        if self.balance_mode == "max":
-            source_cycle = sample.get('source_cycle', 0)
-            if source_cycle > 0 or random.random() < 0.1:
-                # Gain adjustment: +/-6dB with 50% probability
-                if random.random() < 0.5:
-                    gain_db = random.uniform(-6.0, 6.0)
-                    audio *= 10 ** (gain_db / 20)
-                # Time masking: zero out up to 10% with 30% probability
-                if random.random() < 0.3:
-                    length = audio.shape[-1]
-                    max_mask = int(length * 0.1)
-                    if max_mask > 0:
-                        mask_len = random.randint(1, max_mask)
-                        start = random.randint(0, length - mask_len)
-                        audio[start:start + mask_len] = 0
+        # Apply augmentation based on source cycle and configured probability
+        source_cycle = sample.get('source_cycle', 0)
+        if self.augmentor.should_augment(source_cycle):
+            audio = self.augmentor(audio, sample_rate=16000, force=True)
 
         # Audio tensor
         if isinstance(audio, np.ndarray):
