@@ -39,18 +39,22 @@ class DynamicBatchingDataset(IterableDataset):
 
     def __init__(self, inner_dataset, max_padded_budget_sec: float,
                  sample_rate: int = 16000, sort_buffer_size: int = 500,
-                 max_batch_size: int = 64, max_sample_duration: float = None):
+                 max_batch_size: int = 64, max_sample_duration: float = None,
+                 rnnt_budget: float = 0):
         super().__init__()
         self.inner_dataset = inner_dataset
         self.max_padded_budget_sec = max_padded_budget_sec
         self.sample_rate = sample_rate
         self.sort_buffer_size = sort_buffer_size
         self.max_batch_size = max_batch_size
-        # Hard cap on individual sample duration.  RNNT joint cost is O(T×U),
-        # which is roughly quadratic in duration — a single 150s sample uses
-        # far more VRAM than 15×10s samples even though both have the same
-        # padded budget cost (150 padded-sec).
         self.max_sample_duration = max_sample_duration
+        # RNNT memory budget: caps B × max_dur² to prevent OOM.
+        # RNNT joint memory is O(B × T × U × V) where T,U ∝ duration,
+        # so real VRAM cost ≈ O(B × dur²). When set > 0, dynamically limits
+        # batch size based on the longest sample in the batch.
+        # max_padded_budget_sec (linear) still controls total audio seconds.
+        # Whichever limit hits first wins.
+        self.rnnt_budget = rnnt_budget
 
     def _pack_batches(self, samples):
         """
@@ -64,10 +68,8 @@ class DynamicBatchingDataset(IterableDataset):
         for sample, duration in samples:
             new_max_dur = max(max_dur_in_batch, duration)
             new_count = len(batch) + 1
-            new_padded_cost = new_count * new_max_dur
 
-            if batch and (new_padded_cost > self.max_padded_budget_sec
-                          or len(batch) >= self.max_batch_size):
+            if batch and self._batch_full(new_count, new_max_dur):
                 yield _speech_collate_fn(batch, pad_id=0)
                 batch = []
                 max_dur_in_batch = 0.0
@@ -88,6 +90,19 @@ class DynamicBatchingDataset(IterableDataset):
             # Sort-buffer mode: accumulate, sort by duration, then pack.
             yield from self._iter_sorted()
 
+    def _batch_full(self, count, max_dur):
+        """Check if adding one more sample would exceed any limit."""
+        # Linear budget: total padded seconds
+        if count * max_dur > self.max_padded_budget_sec:
+            return True
+        # RNNT memory budget: B × max_dur²
+        if self.rnnt_budget > 0 and count * max_dur * max_dur > self.rnnt_budget:
+            return True
+        # Hard batch size cap
+        if count > self.max_batch_size:
+            return True
+        return False
+
     def _iter_greedy(self):
         """Greedy packing: accumulate samples and emit when budget exceeded."""
         batch = []
@@ -99,15 +114,11 @@ class DynamicBatchingDataset(IterableDataset):
 
             if self.max_sample_duration is not None and duration > self.max_sample_duration:
                 continue
-            if duration > self.max_padded_budget_sec:
-                continue
 
             new_max_dur = max(max_dur_in_batch, duration)
             new_count = len(batch) + 1
-            new_padded_cost = new_count * new_max_dur
 
-            if batch and (new_padded_cost > self.max_padded_budget_sec
-                          or len(batch) >= self.max_batch_size):
+            if batch and self._batch_full(new_count, new_max_dur):
                 yield _speech_collate_fn(batch, pad_id=0)
                 batch = []
                 max_dur_in_batch = 0.0

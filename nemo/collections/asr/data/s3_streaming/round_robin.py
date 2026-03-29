@@ -458,18 +458,8 @@ class SourceRoundRobinInterleaver:
         self._start_new_epoch()
 
     def _log_sample(self, sample: dict):
-        """Log first N samples for debugging."""
-        if not self._sample_log_done:
-            wi = torch.utils.data.get_worker_info()
-            if wi is None or wi.id == 0:
-                if self._samples_yielded <= 300:
-                    src_key = f"{sample.get('lang', '?')}:{sample.get('source', '?')}"
-                    logging.info(f"[sample {self._samples_yielded:>3}] {src_key}")
-                if self._samples_yielded >= 300:
-                    logging.info("... (sample logging stopped after 300)")
-                    self._sample_log_done = True
-            else:
-                self._sample_log_done = True
+        """Log sample (no-op after initial samples)."""
+        pass
 
     def _get_next_sample(self) -> Optional[dict]:
         """Dispatch to mode-specific sample selection."""
