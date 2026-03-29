@@ -6,12 +6,19 @@ Supports two rotation modes:
 - Source-level: Cycles through languages AND sources (each language round-robins its own sources)
 """
 
+import re
 from typing import Dict, Iterator, List, Optional, Tuple
 
 import torch.utils.data
 from nemo.utils import logging
 
 from .lang_source_manager import LanguageSourceManager
+
+
+def _parse_bucket_from_source(source_name: str) -> Optional[int]:
+    """Extract bucket number from source name like 'filter5_en' -> 5."""
+    m = re.match(r'filter(\d+)_', source_name)
+    return int(m.group(1)) if m else None
 
 
 def _in_worker() -> bool:
@@ -198,6 +205,7 @@ class SourceRoundRobinInterleaver:
         balance_mode: str = "max",
         lang_sample_counts: Optional[Dict[str, int]] = None,
         source_sample_counts: Optional[Dict[str, int]] = None,
+        curriculum_buckets: bool = False,
     ):
         """
         Initialize source-level round-robin interleaver.
@@ -295,6 +303,34 @@ class SourceRoundRobinInterleaver:
                 )
                 self.balance_mode = "none"
 
+        # Curriculum bucketing: group sources by duration bucket, process sequentially
+        self.curriculum_buckets = curriculum_buckets
+        self._bucket_order: List[int] = []
+        self._bucket_sources: Dict[int, set] = {}  # bucket -> set of "lang:source" keys
+        self._current_bucket_idx = 0
+
+        if curriculum_buckets:
+            # Parse bucket from each source name
+            for key in source_managers:
+                _lang, src = key.split(':', 1)
+                bucket = _parse_bucket_from_source(src)
+                if bucket is not None:
+                    if bucket not in self._bucket_sources:
+                        self._bucket_sources[bucket] = set()
+                    self._bucket_sources[bucket].add(key)
+                else:
+                    logging.warning(f"Curriculum buckets: could not parse bucket from '{src}', skipping")
+
+            self._bucket_order = sorted(self._bucket_sources.keys())
+            if not self._bucket_order:
+                logging.warning("Curriculum buckets enabled but no filterN_ sources found, disabling")
+                self.curriculum_buckets = False
+            else:
+                logging.info(f"Curriculum buckets: {self._bucket_order}")
+                for b in self._bucket_order:
+                    keys = sorted(self._bucket_sources[b])
+                    logging.info(f"  Bucket {b}s: {len(keys)} sources — {keys}")
+
         # Total sources for logging
         total_sources = sum(len(srcs) for srcs in self._sources_by_lang.values())
         logging.info(
@@ -349,29 +385,91 @@ class SourceRoundRobinInterleaver:
                 k for k, v in self._source_budget.items() if v > 0
             )
 
+        if self.curriculum_buckets:
+            yield from self._iter_curriculum()
+        else:
+            yield from self._iter_normal()
+
+    def _iter_normal(self) -> Iterator[dict]:
+        """Standard iteration (no curriculum)."""
         while True:
             sample = self._get_next_sample()
             if sample is None:
-                # All sources exhausted — epoch is done
                 self._start_new_epoch()
                 break
 
             self._samples_yielded += 1
-
-            # Log first 100 samples from worker 0 only, once
-            if not self._sample_log_done:
-                wi = torch.utils.data.get_worker_info()
-                if wi is None or wi.id == 0:
-                    if self._samples_yielded <= 300:
-                        src_key = f"{sample.get('lang', '?')}:{sample.get('source', '?')}"
-                        logging.info(f"[sample {self._samples_yielded:>3}] {src_key}")
-                    if self._samples_yielded >= 300:
-                        logging.info("... (sample logging stopped after 300)")
-                        self._sample_log_done = True
-                else:
-                    self._sample_log_done = True
-
+            self._log_sample(sample)
             yield sample
+
+    def _iter_curriculum(self) -> Iterator[dict]:
+        """
+        Bucket-stride curriculum: cycle through buckets 5→10→15→20→25→30→5→10→...
+        yielding one sample per bucket per round (with distributed language balancing
+        within each bucket). This produces mixed-duration output so each dynamic batch
+        gets a natural mix of short and long samples, keeping B moderate and memory stable.
+        """
+        # Initialize per-bucket distributed tracking
+        bucket_active = {}  # bucket -> set of active source keys
+        bucket_yielded_counts = {}  # bucket -> count for logging
+        for bucket in self._bucket_order:
+            keys = self._bucket_sources[bucket]
+            bucket_active[bucket] = set(
+                k for k in keys if self._source_budget.get(k, 0) > 0
+            )
+            bucket_yielded_counts[bucket] = 0
+            # Reset per-source yield counters
+            for k in keys:
+                self._source_yielded[k] = 0
+
+        if not _in_worker():
+            logging.info(f"Curriculum bucket-stride: cycling {self._bucket_order}")
+
+        exhausted_buckets = set()
+
+        while len(exhausted_buckets) < len(self._bucket_order):
+            for bucket in self._bucket_order:
+                if bucket in exhausted_buckets:
+                    continue
+
+                # Temporarily set active_sources to this bucket's sources
+                self._active_sources = bucket_active[bucket]
+
+                sample = self._get_next_sample_distributed()
+                if sample is None:
+                    exhausted_buckets.add(bucket)
+                    if not _in_worker():
+                        logging.info(
+                            f"  Bucket {bucket}s exhausted: "
+                            f"{bucket_yielded_counts[bucket]:,} samples"
+                        )
+                    continue
+
+                self._samples_yielded += 1
+                bucket_yielded_counts[bucket] += 1
+                self._log_sample(sample)
+                yield sample
+
+        # All buckets done — epoch complete
+        if not _in_worker():
+            logging.info("Curriculum epoch summary:")
+            for bucket in self._bucket_order:
+                logging.info(f"  Bucket {bucket}s: {bucket_yielded_counts[bucket]:,} samples")
+        self._start_new_epoch()
+
+    def _log_sample(self, sample: dict):
+        """Log first N samples for debugging."""
+        if not self._sample_log_done:
+            wi = torch.utils.data.get_worker_info()
+            if wi is None or wi.id == 0:
+                if self._samples_yielded <= 300:
+                    src_key = f"{sample.get('lang', '?')}:{sample.get('source', '?')}"
+                    logging.info(f"[sample {self._samples_yielded:>3}] {src_key}")
+                if self._samples_yielded >= 300:
+                    logging.info("... (sample logging stopped after 300)")
+                    self._sample_log_done = True
+            else:
+                self._sample_log_done = True
 
     def _get_next_sample(self) -> Optional[dict]:
         """Dispatch to mode-specific sample selection."""
@@ -508,10 +606,24 @@ class SourceRoundRobinInterleaver:
         sources = self._sources_by_lang[lang]
         sources_tried = 0
 
+        # When curriculum is active, only consider sources in the current bucket
+        if self.curriculum_buckets and self._bucket_order:
+            current_bucket = self._bucket_order[self._current_bucket_idx]
+            allowed_keys = self._bucket_sources[current_bucket]
+        else:
+            allowed_keys = None
+
         while sources_tried < len(sources):
             source_idx = self._source_idx_by_lang[lang]
             src = sources[source_idx]
             manager_key = f"{lang}:{src}"
+
+            # Skip sources not in current bucket
+            if allowed_keys is not None and manager_key not in allowed_keys:
+                self._source_idx_by_lang[lang] = (source_idx + 1) % len(sources)
+                sources_tried += 1
+                continue
+
             manager = self.source_managers[manager_key]
 
             sample = manager.get_next_sample()

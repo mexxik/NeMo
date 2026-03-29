@@ -189,6 +189,9 @@ class S3MultiLangStreamingDataset(IterableDataset):
         augment_speed: bool = False,  # Enable speed perturbation (0.9x-1.1x)
         augment_gain: bool = False,  # Enable gain adjustment (+/-6dB)
         augment_time_mask: bool = True,  # Enable time masking (zero out random segments)
+
+        # Curriculum bucketing: process filterN_ sources from shortest to longest
+        curriculum_buckets: bool = False,
     ):
         """
         Initialize multi-language streaming dataset.
@@ -252,6 +255,9 @@ class S3MultiLangStreamingDataset(IterableDataset):
                 f"Augmentation enabled: prob={augment_prob}, "
                 f"speed={augment_speed}, gain={augment_gain}, time_mask={augment_time_mask}"
             )
+        self.curriculum_buckets = curriculum_buckets
+        if curriculum_buckets:
+            logging.info(f"Curriculum bucketing: ENABLED (will process filterN_ sources short→long)")
         logging.info(f"Balance mode: {balance_mode}")
 
         # Determine storage type
@@ -963,6 +969,7 @@ class S3MultiLangStreamingDataset(IterableDataset):
             balance_mode=self.balance_mode,
             lang_sample_counts=self._lang_sample_counts,
             source_sample_counts=self._source_sample_counts,
+            curriculum_buckets=self.curriculum_buckets,
         )
 
     def __iter__(self) -> Iterator[Tuple[torch.Tensor, ...]]:

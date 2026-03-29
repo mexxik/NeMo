@@ -79,13 +79,53 @@ class DynamicBatchingDataset(IterableDataset):
             yield _speech_collate_fn(batch, pad_id=0)
 
     def __iter__(self):
-        sort_buffer = []  # list of (sample, duration)
+        if self.sort_buffer_size <= 1:
+            # Greedy mode: pack samples directly as they arrive (no sorting).
+            # Used with curriculum bucket-stride where the interleaver already
+            # produces mixed-duration samples in a deliberate order.
+            yield from self._iter_greedy()
+        else:
+            # Sort-buffer mode: accumulate, sort by duration, then pack.
+            yield from self._iter_sorted()
+
+    def _iter_greedy(self):
+        """Greedy packing: accumulate samples and emit when budget exceeded."""
+        batch = []
+        max_dur_in_batch = 0.0
 
         for sample in self.inner_dataset:
             audio_len = sample[1].item() if hasattr(sample[1], 'item') else sample[1]
             duration = audio_len / self.sample_rate
 
-            # Skip samples that exceed the hard duration cap or the budget
+            if self.max_sample_duration is not None and duration > self.max_sample_duration:
+                continue
+            if duration > self.max_padded_budget_sec:
+                continue
+
+            new_max_dur = max(max_dur_in_batch, duration)
+            new_count = len(batch) + 1
+            new_padded_cost = new_count * new_max_dur
+
+            if batch and (new_padded_cost > self.max_padded_budget_sec
+                          or len(batch) >= self.max_batch_size):
+                yield _speech_collate_fn(batch, pad_id=0)
+                batch = []
+                max_dur_in_batch = 0.0
+
+            batch.append(sample)
+            max_dur_in_batch = max(max_dur_in_batch, duration)
+
+        if batch:
+            yield _speech_collate_fn(batch, pad_id=0)
+
+    def _iter_sorted(self):
+        """Sort-buffer mode: accumulate, sort by duration, then pack."""
+        sort_buffer = []
+
+        for sample in self.inner_dataset:
+            audio_len = sample[1].item() if hasattr(sample[1], 'item') else sample[1]
+            duration = audio_len / self.sample_rate
+
             if self.max_sample_duration is not None and duration > self.max_sample_duration:
                 continue
             if duration > self.max_padded_budget_sec:
@@ -93,13 +133,11 @@ class DynamicBatchingDataset(IterableDataset):
 
             sort_buffer.append((sample, duration))
 
-            # When buffer is full, sort by duration and pack into batches
             if len(sort_buffer) >= self.sort_buffer_size:
                 sort_buffer.sort(key=lambda x: x[1])
                 yield from self._pack_batches(sort_buffer)
                 sort_buffer = []
 
-        # Drain remaining buffer
         if sort_buffer:
             sort_buffer.sort(key=lambda x: x[1])
             yield from self._pack_batches(sort_buffer)
