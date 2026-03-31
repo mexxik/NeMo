@@ -108,9 +108,9 @@ class PurePytorchRNNTLoss(torch.nn.Module):
         # NeMo uses 'mean_batch' which is equivalent to 'mean'
         self.reduction = 'mean' if reduction == 'mean_batch' else (reduction or 'none')
 
-    def forward(self, log_probs, targets, input_lengths, target_lengths):
-        # log_probs: [B, T, U, V+1] — already log-softmax'd from NeMo's joint
+    def forward(self, acts, labels, act_lens, label_lens):
+        # acts: [B, T, U, V+1] — already log-softmax'd from NeMo's joint
         return rnnt_loss_pure_pytorch(
-            log_probs, targets, input_lengths, target_lengths,
+            acts, labels, act_lens, label_lens,
             blank=self.blank, reduction=self.reduction,
         )
