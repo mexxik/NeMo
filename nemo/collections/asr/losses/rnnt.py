@@ -153,6 +153,14 @@ RNNT_LOSS_RESOLVER = {
         is_available=True,
         installation_msg="Pure Pytorch implementation of TDT loss. Slow and for debugging purposes only.",
     ),
+    "pure_pytorch": RNNTLossConfig(
+        loss_name="pure_pytorch",
+        lib_name="torch",
+        min_version='0.0',
+        is_available=True,
+        installation_msg="Pure PyTorch RNNT loss — no numba, no custom CUDA kernels.",
+        force_float32=True,
+    ),
 }
 
 RNNT_LOSS_RESOLVER['default'] = RNNT_LOSS_RESOLVER['warprnnt_numba']
@@ -268,6 +276,11 @@ def resolve_rnnt_loss(loss_name: str, blank_idx: int, loss_kwargs: dict = None) 
 
     elif loss_name == 'pytorch':
         loss_func = RNNTLossPytorch(blank=blank_idx, reduction='none')
+        _warn_unused_additional_kwargs(loss_name, loss_kwargs)
+
+    elif loss_name == 'pure_pytorch':
+        from nemo.collections.asr.parts.numba.rnnt_loss.rnnt_pure_pytorch import PurePytorchRNNTLoss
+        loss_func = PurePytorchRNNTLoss(blank=blank_idx, reduction='none')
         _warn_unused_additional_kwargs(loss_name, loss_kwargs)
 
     elif loss_name == 'multiblank_rnnt':
