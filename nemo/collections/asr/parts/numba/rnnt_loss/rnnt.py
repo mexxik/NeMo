@@ -170,10 +170,9 @@ def rnnt_loss_gpu(
     maxU = acts.shape[2]
     alphabet_size = acts.shape[3]
 
-    if hasattr(cuda, 'external_stream'):
-        stream = cuda.external_stream(torch.cuda.current_stream(acts.device).cuda_stream)
-    else:
-        stream = cuda.default_stream()
+    # Use default stream to avoid stale external_stream handles that cause
+    # CUDA_ERROR_INVALID_VALUE in cuLaunchKernel (NeMo issue #6321)
+    stream = cuda.default_stream()
 
     if num_threads < 0:
         num_threads = multiprocessing.cpu_count()
@@ -406,10 +405,9 @@ def multiblank_rnnt_loss_gpu(
     maxU = acts.shape[2]
     alphabet_size = acts.shape[3]
 
-    if hasattr(cuda, 'external_stream'):
-        stream = cuda.external_stream(torch.cuda.current_stream(acts.device).cuda_stream)
-    else:
-        stream = cuda.default_stream()
+    # Use default stream to avoid stale external_stream handles that cause
+    # CUDA_ERROR_INVALID_VALUE in cuLaunchKernel (NeMo issue #6321)
+    stream = cuda.default_stream()
 
     if num_threads < 0:
         num_threads = multiprocessing.cpu_count()
