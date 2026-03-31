@@ -161,6 +161,12 @@ class GPURNNT:
         self.log_softmax(acts, denom)
 
         # Compute alphas
+        if self.maxU_ > 1024:
+            raise ValueError(
+                f"RNNT loss: maxU={self.maxU_} exceeds CUDA 1024-thread limit. "
+                f"Batch has label_lengths that are too long (maxT={self.maxT_}, "
+                f"minibatch={self.minibatch_}). Filter long-label samples in the dataset."
+            )
         gpu_rnnt_kernel.compute_alphas_kernel[self.minibatch_, self.maxU_, self.stream_, 0](
             acts,
             denom,

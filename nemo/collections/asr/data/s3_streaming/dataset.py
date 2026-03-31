@@ -1125,6 +1125,12 @@ class S3MultiLangStreamingDataset(IterableDataset):
             if self.eos_id is not None:
                 tokens = tokens + [self.eos_id]
 
+        # Guard: RNNT numba kernels launch with maxU = max(label_lengths) + 1 as
+        # threads-per-block; CUDA hard-caps this at 1024.  Skip samples that
+        # would breach the limit (typically corrupted data).
+        if len(tokens) > 1023:
+            return None
+
         tokens_tensor = torch.tensor(tokens).long()
         tokens_len = torch.tensor(len(tokens)).long()
 
