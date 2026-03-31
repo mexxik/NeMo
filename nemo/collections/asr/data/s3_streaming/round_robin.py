@@ -404,26 +404,43 @@ class SourceRoundRobinInterleaver:
 
     def _iter_curriculum(self) -> Iterator[dict]:
         """
-        Bucket-stride curriculum: cycle through buckets 5→10→15→20→25→30→5→10→...
-        yielding one sample per bucket per round (with distributed language balancing
-        within each bucket). This produces mixed-duration output so each dynamic batch
-        gets a natural mix of short and long samples, keeping B moderate and memory stable.
+        Proportional bucket-stride curriculum.
+
+        Yields more samples from short buckets, fewer from long ones,
+        proportional to 1/dur². This means the dynamic batcher can form
+        dense batches of short samples (high B) while long samples appear
+        occasionally (low B), matching RNNT memory cost.
+
+        Example with buckets [5,10,15,20,25,30] and max_bucket=30:
+          5s  → weight = 30²/5²  = 36 samples per round
+          10s → weight = 30²/10² = 9
+          15s → weight = 30²/15² = 4
+          20s → weight = 30²/20² = 2
+          25s → weight = 30²/25² = 1
+          30s → weight = 30²/30² = 1
         """
         # Initialize per-bucket distributed tracking
-        bucket_active = {}  # bucket -> set of active source keys
-        bucket_yielded_counts = {}  # bucket -> count for logging
+        bucket_active = {}
+        bucket_yielded_counts = {}
         for bucket in self._bucket_order:
             keys = self._bucket_sources[bucket]
             bucket_active[bucket] = set(
                 k for k in keys if self._source_budget.get(k, 0) > 0
             )
             bucket_yielded_counts[bucket] = 0
-            # Reset per-source yield counters
             for k in keys:
                 self._source_yielded[k] = 0
 
+        # Compute proportional weights: how many samples per bucket per round
+        max_bucket = max(self._bucket_order)
+        bucket_weight = {}
+        for bucket in self._bucket_order:
+            bucket_weight[bucket] = max(1, int((max_bucket / bucket) ** 2))
+
         if not _in_worker():
-            logging.info(f"Curriculum bucket-stride: cycling {self._bucket_order}")
+            logging.info(f"Curriculum proportional bucket-stride: {self._bucket_order}")
+            for bucket in self._bucket_order:
+                logging.info(f"  Bucket {bucket}s: {bucket_weight[bucket]} samples/round")
 
         exhausted_buckets = set()
 
@@ -432,23 +449,24 @@ class SourceRoundRobinInterleaver:
                 if bucket in exhausted_buckets:
                     continue
 
-                # Temporarily set active_sources to this bucket's sources
                 self._active_sources = bucket_active[bucket]
 
-                sample = self._get_next_sample_distributed()
-                if sample is None:
-                    exhausted_buckets.add(bucket)
-                    if not _in_worker():
-                        logging.info(
-                            f"  Bucket {bucket}s exhausted: "
-                            f"{bucket_yielded_counts[bucket]:,} samples"
-                        )
-                    continue
+                # Yield proportional number of samples from this bucket
+                for _ in range(bucket_weight[bucket]):
+                    sample = self._get_next_sample_distributed()
+                    if sample is None:
+                        exhausted_buckets.add(bucket)
+                        if not _in_worker():
+                            logging.info(
+                                f"  Bucket {bucket}s exhausted: "
+                                f"{bucket_yielded_counts[bucket]:,} samples"
+                            )
+                        break
 
-                self._samples_yielded += 1
-                bucket_yielded_counts[bucket] += 1
-                self._log_sample(sample)
-                yield sample
+                    self._samples_yielded += 1
+                    bucket_yielded_counts[bucket] += 1
+                    self._log_sample(sample)
+                    yield sample
 
         # All buckets done — epoch complete
         if not _in_worker():
