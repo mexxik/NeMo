@@ -734,7 +734,8 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             sample_id = batch_nb
 
         # If experimental fused Joint-Loss-WER is not used
-        if not self.joint.fuse_loss_wer:
+        try:
+          if not self.joint.fuse_loss_wer:
             # Compute full joint and loss
             joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder)
             loss_value = self.loss(
@@ -765,7 +766,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 self.wer.reset()
                 tensorboard_logs.update({'training_batch_wer': scores.float() / words})
 
-        else:
+          else:
             # If experimental fused Joint-Loss-WER is used
             if (sample_id + 1) % log_every_n_steps == 0:
                 compute_wer = True
@@ -797,6 +798,30 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
             if compute_wer:
                 tensorboard_logs.update({'training_batch_wer': wer})
+
+        except (torch.cuda.OutOfMemoryError, RuntimeError, ValueError) as e:
+            if 'out of memory' in str(e).lower() or isinstance(e, torch.cuda.OutOfMemoryError) \
+                    or 'exceeds CUDA 1024-thread limit' in str(e):
+                logging.warning(
+                    f">>>>>> SKIPPING BATCH (step {batch_nb}): {e.__class__.__name__} — "
+                    f"encoded_len={encoded_len.tolist()}, transcript_len={transcript_len.tolist()} <<<<<<"
+                )
+                # Free memory and return zero loss so training continues
+                del encoded, decoder, transcript
+                torch.cuda.empty_cache()
+                loss_value = torch.tensor(0.0, device=signal_len.device, requires_grad=True)
+                tensorboard_logs = {
+                    'train_loss': loss_value,
+                    'learning_rate': self._optimizer.param_groups[0]['lr'],
+                    'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
+                }
+            else:
+                raise
+
+        # Ensure loss is scalar before logging (OOM recovery or unreduced loss edge cases)
+        if isinstance(loss_value, torch.Tensor) and loss_value.dim() > 0:
+            loss_value = loss_value.mean()
+            tensorboard_logs['train_loss'] = loss_value
 
         # Log items
         self.log_dict(tensorboard_logs)
