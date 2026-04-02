@@ -806,15 +806,14 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                     f">>>>>> SKIPPING BATCH (step {batch_nb}): {e.__class__.__name__} — "
                     f"encoded_len={encoded_len.tolist()}, transcript_len={transcript_len.tolist()} <<<<<<"
                 )
-                # Free memory and return zero loss so training continues
-                del encoded, decoder, transcript
+                # Free memory and skip this batch entirely.
+                # Returning None tells Lightning to skip backward + optimizer step,
+                # which preserves Adam's momentum/variance state.
+                if 'encoded' in dir(): del encoded
+                if 'decoder' in dir(): del decoder
+                if 'transcript' in dir(): del transcript
                 torch.cuda.empty_cache()
-                loss_value = torch.tensor(0.0, device=signal_len.device, requires_grad=True)
-                tensorboard_logs = {
-                    'train_loss': loss_value,
-                    'learning_rate': self._optimizer.param_groups[0]['lr'],
-                    'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
-                }
+                return None
             else:
                 raise
 
