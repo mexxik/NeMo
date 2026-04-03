@@ -822,6 +822,15 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             loss_value = loss_value.mean()
             tensorboard_logs['train_loss'] = loss_value
 
+        # Guard against NaN/Inf loss — skip batch to prevent poisoning optimizer state
+        if isinstance(loss_value, torch.Tensor) and (torch.isnan(loss_value) or torch.isinf(loss_value)):
+            logging.warning(
+                f">>>>>> SKIPPING BATCH (step {batch_nb}): loss is {loss_value.item()} — "
+                f"encoded_len={encoded_len.tolist()}, transcript_len={transcript_len.tolist()} <<<<<<"
+            )
+            del encoded, decoder, transcript, loss_value
+            return None
+
         # Log items
         self.log_dict(tensorboard_logs)
 
