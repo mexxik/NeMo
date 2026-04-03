@@ -822,14 +822,33 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             loss_value = loss_value.mean()
             tensorboard_logs['train_loss'] = loss_value
 
-        # Guard against NaN/Inf loss — skip batch to prevent poisoning optimizer state
-        if isinstance(loss_value, torch.Tensor) and (torch.isnan(loss_value) or torch.isinf(loss_value)):
-            logging.warning(
-                f">>>>>> SKIPPING BATCH (step {batch_nb}): loss is {loss_value.item()} — "
-                f"encoded_len={encoded_len.tolist()}, transcript_len={transcript_len.tolist()} <<<<<<"
-            )
-            del encoded, decoder, transcript, loss_value
-            return None
+        # Guard against NaN/Inf/anomalous loss — skip batch to prevent poisoning
+        # optimizer state. A single bad backward with extreme gradients can
+        # permanently corrupt Adam's momentum buffers.
+        if isinstance(loss_value, torch.Tensor):
+            lv = loss_value.detach()
+            is_bad = torch.isnan(lv) or torch.isinf(lv)
+
+            # Anomaly detection: track running average, skip extreme outliers.
+            # This catches the batch that *causes* divergence, not just the
+            # NaN aftermath.
+            if not is_bad:
+                if not hasattr(self, '_loss_ema'):
+                    self._loss_ema = lv.item()
+                else:
+                    self._loss_ema = 0.99 * self._loss_ema + 0.01 * lv.item()
+                    # Skip if loss > 5× running average (clear anomaly)
+                    if lv.item() > max(10.0, 5 * self._loss_ema):
+                        is_bad = True
+
+            if is_bad:
+                logging.warning(
+                    f">>>>>> SKIPPING BATCH (step {batch_nb}): loss={lv.item():.4f} "
+                    f"(ema={getattr(self, '_loss_ema', 0):.4f}) — "
+                    f"encoded_len={encoded_len.tolist()}, transcript_len={transcript_len.tolist()} <<<<<<"
+                )
+                del encoded, decoder, transcript, loss_value
+                return None
 
         # Log items
         self.log_dict(tensorboard_logs)

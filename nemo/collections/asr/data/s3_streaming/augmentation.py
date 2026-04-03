@@ -8,6 +8,8 @@ Supported augmentations:
 - Speed perturbation: Change playback speed (affects duration)
 - Gain: Adjust volume level
 - Time masking: Zero out random segments (SpecAugment-style on waveform)
+- Bandwidth limitation: Simulate telephone/8kHz audio via lowpass + resample
+- Additive noise: White noise at configurable SNR levels
 """
 
 import random
@@ -52,6 +54,16 @@ class AugmentationConfig:
     time_mask_prob: float = 0.3
     time_mask_max_ratio: float = 0.1  # Max 10% of audio masked
 
+    # Bandwidth limitation (simulate telephone/8kHz audio)
+    bandwidth_enabled: bool = False
+    bandwidth_prob: float = 0.3
+    bandwidth_cutoff_range: Tuple[int, int] = (4000, 7000)  # Hz, lowpass cutoff
+
+    # Additive noise
+    noise_enabled: bool = False
+    noise_prob: float = 0.3
+    noise_snr_range_db: Tuple[float, float] = (15.0, 40.0)  # SNR in dB
+
 
 class AudioAugmentor:
     """
@@ -93,6 +105,8 @@ class AudioAugmentor:
         self._speed_applied = 0
         self._gain_applied = 0
         self._time_mask_applied = 0
+        self._bandwidth_applied = 0
+        self._noise_applied = 0
 
     def should_augment(self, source_cycle: int = 0) -> bool:
         """
@@ -162,6 +176,16 @@ class AudioAugmentor:
         if self.config.time_mask_enabled and random.random() < self.config.time_mask_prob:
             audio = self._time_mask_np(audio)
             self._time_mask_applied += 1
+
+        # 4. Bandwidth limitation (pure numpy/scipy)
+        if self.config.bandwidth_enabled and random.random() < self.config.bandwidth_prob:
+            audio = self._bandwidth_limit_np(audio, sample_rate)
+            self._bandwidth_applied += 1
+
+        # 5. Additive noise (pure numpy)
+        if self.config.noise_enabled and random.random() < self.config.noise_prob:
+            audio = self._add_noise_np(audio)
+            self._noise_applied += 1
 
         return audio
 
@@ -238,6 +262,54 @@ class AudioAugmentor:
 
         return audio
 
+    def _bandwidth_limit_np(self, audio: np.ndarray, sample_rate: int) -> np.ndarray:
+        """
+        Simulate bandwidth-limited audio (e.g. telephone at 8kHz).
+
+        Applies a lowpass filter with random cutoff, then downsamples and
+        upsamples back to the original rate. This destroys high-frequency
+        content just like real narrowband transmission.
+        """
+        from scipy.signal import resample_poly
+        from math import gcd
+
+        cutoff = random.randint(*self.config.bandwidth_cutoff_range)
+        # Target sample rate is 2x cutoff (Nyquist)
+        target_sr = cutoff * 2
+        if target_sr >= sample_rate:
+            return audio
+
+        # Downsample then upsample using rational resampling
+        g = gcd(sample_rate, target_sr)
+        down = sample_rate // g
+        up = target_sr // g
+        # Downsample (applies anti-alias filter internally)
+        audio_down = resample_poly(audio, up, down)
+        # Upsample back
+        audio_up = resample_poly(audio_down, down, up)
+
+        # Match original length (may differ by 1-2 samples due to rounding)
+        if len(audio_up) > len(audio):
+            audio_up = audio_up[:len(audio)]
+        elif len(audio_up) < len(audio):
+            audio_up = np.pad(audio_up, (0, len(audio) - len(audio_up)))
+
+        return audio_up.astype(audio.dtype)
+
+    def _add_noise_np(self, audio: np.ndarray) -> np.ndarray:
+        """
+        Add white noise at a random SNR level.
+        """
+        snr_db = random.uniform(*self.config.noise_snr_range_db)
+        # Compute signal power
+        signal_power = np.mean(audio ** 2)
+        if signal_power < 1e-10:
+            return audio
+        # Compute noise power for target SNR
+        noise_power = signal_power / (10 ** (snr_db / 10))
+        noise = np.random.normal(0, np.sqrt(noise_power), len(audio))
+        return (audio + noise).astype(audio.dtype)
+
     def get_stats(self) -> dict:
         """Get augmentation statistics."""
         return {
@@ -247,6 +319,8 @@ class AudioAugmentor:
             'speed_applied': self._speed_applied,
             'gain_applied': self._gain_applied,
             'time_mask_applied': self._time_mask_applied,
+            'bandwidth_applied': self._bandwidth_applied,
+            'noise_applied': self._noise_applied,
         }
 
     def log_stats(self):
@@ -256,7 +330,8 @@ class AudioAugmentor:
             f"Augmentation stats: {stats['augmented_calls']}/{stats['total_calls']} "
             f"({stats['augmentation_rate']:.1%}) - "
             f"speed={stats['speed_applied']}, gain={stats['gain_applied']}, "
-            f"time_mask={stats['time_mask_applied']}"
+            f"time_mask={stats['time_mask_applied']}, "
+            f"bandwidth={stats['bandwidth_applied']}, noise={stats['noise_applied']}"
         )
 
     def reset_stats(self):
@@ -266,3 +341,5 @@ class AudioAugmentor:
         self._speed_applied = 0
         self._gain_applied = 0
         self._time_mask_applied = 0
+        self._bandwidth_applied = 0
+        self._noise_applied = 0

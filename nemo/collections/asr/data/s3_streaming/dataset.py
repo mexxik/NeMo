@@ -189,6 +189,8 @@ class S3MultiLangStreamingDataset(IterableDataset):
         augment_speed: bool = False,  # Enable speed perturbation (0.9x-1.1x)
         augment_gain: bool = False,  # Enable gain adjustment (+/-6dB)
         augment_time_mask: bool = True,  # Enable time masking (zero out random segments)
+        augment_bandwidth: bool = False,  # Enable bandwidth limitation (8kHz telephone)
+        augment_noise: bool = False,  # Enable additive white noise
 
         # Curriculum bucketing: process filterN_ sources from shortest to longest
         curriculum_buckets: bool = False,
@@ -241,19 +243,22 @@ class S3MultiLangStreamingDataset(IterableDataset):
         self.balance_mode = balance_mode
 
         # Audio augmentation
-        augment_any = augment_speed or augment_gain or augment_time_mask
+        augment_any = augment_speed or augment_gain or augment_time_mask or augment_bandwidth or augment_noise
         augment_config = AugmentationConfig(
             enabled=augment_any,
             base_prob=augment_prob,
             speed_enabled=augment_speed,
             gain_enabled=augment_gain,
             time_mask_enabled=augment_time_mask,
+            bandwidth_enabled=augment_bandwidth,
+            noise_enabled=augment_noise,
         )
         self.augmentor = AudioAugmentor(augment_config)
         if augment_any:
             logging.info(
                 f"Augmentation enabled: prob={augment_prob}, "
-                f"speed={augment_speed}, gain={augment_gain}, time_mask={augment_time_mask}"
+                f"speed={augment_speed}, gain={augment_gain}, time_mask={augment_time_mask}, "
+                f"bandwidth={augment_bandwidth}, noise={augment_noise}"
             )
         self.curriculum_buckets = curriculum_buckets
         if curriculum_buckets:
