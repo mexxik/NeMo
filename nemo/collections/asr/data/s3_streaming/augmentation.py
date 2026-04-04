@@ -17,14 +17,6 @@ from dataclasses import dataclass
 from typing import Tuple, Optional
 
 import numpy as np
-import torch
-
-try:
-    import torchaudio
-    import torchaudio.functional as F
-    TORCHAUDIO_AVAILABLE = True
-except ImportError:
-    TORCHAUDIO_AVAILABLE = False
 
 from nemo.utils import logging
 
@@ -92,13 +84,6 @@ class AudioAugmentor:
         """
         self.config = config or AugmentationConfig()
 
-        if not TORCHAUDIO_AVAILABLE and self.config.speed_enabled:
-            logging.warning(
-                "torchaudio not available - speed perturbation disabled. "
-                "Install with: pip install torchaudio"
-            )
-            self.config.speed_enabled = False
-
         # Stats tracking
         self._total_calls = 0
         self._augmented_calls = 0
@@ -160,11 +145,9 @@ class AudioAugmentor:
 
         # Apply augmentations in numpy (no torch conversion for gain/time_mask)
 
-        # 1. Speed perturbation (requires torch/torchaudio)
+        # 1. Speed perturbation (pure scipy)
         if self.config.speed_enabled and random.random() < self.config.speed_prob:
-            audio_tensor = torch.from_numpy(audio).float()
-            audio_tensor = self._speed_perturb(audio_tensor, sample_rate)
-            audio = audio_tensor.numpy()
+            audio = self._speed_perturb_np(audio, sample_rate)
             self._speed_applied += 1
 
         # 2. Gain adjustment (pure numpy)
@@ -189,34 +172,26 @@ class AudioAugmentor:
 
         return audio
 
-    def _speed_perturb(self, audio: torch.Tensor, sample_rate: int) -> torch.Tensor:
+    def _speed_perturb_np(self, audio: np.ndarray, sample_rate: int) -> np.ndarray:
         """
-        Apply speed perturbation via resampling.
+        Apply speed perturbation via resampling (pure scipy).
 
         Changes both speed and pitch (like playing a record at different speed).
         This is the most common augmentation for ASR.
         """
+        from scipy.signal import resample_poly
+        from math import gcd
+
         speed = random.uniform(*self.config.speed_range)
-
-        # Compute new sample rate for speed change
-        # speed > 1.0 = faster = higher apparent sample rate
+        # speed > 1.0 = faster speech = shorter audio
+        # Resample: treat audio as if recorded at (sample_rate * speed),
+        # then resample to sample_rate → changes duration
         new_sr = int(sample_rate * speed)
-
-        # Resample to new rate (changes duration)
-        audio = F.resample(audio.unsqueeze(0), sample_rate, new_sr).squeeze(0)
-
-        # Resample back to original rate
-        audio = F.resample(audio.unsqueeze(0), new_sr, sample_rate).squeeze(0)
-
-        return audio
-
-    def _gain(self, audio: torch.Tensor) -> torch.Tensor:
-        """
-        Apply gain adjustment in dB (torch version).
-        """
-        gain_db = random.uniform(*self.config.gain_range_db)
-        gain_linear = 10 ** (gain_db / 20)
-        return audio * gain_linear
+        g = gcd(sample_rate, new_sr)
+        up = sample_rate // g
+        down = new_sr // g
+        audio = resample_poly(audio, up, down)
+        return audio.astype(np.float32)
 
     def _gain_np(self, audio: np.ndarray) -> np.ndarray:
         """
@@ -225,24 +200,6 @@ class AudioAugmentor:
         gain_db = random.uniform(*self.config.gain_range_db)
         gain_linear = 10 ** (gain_db / 20)
         return (audio * gain_linear).astype(audio.dtype)
-
-    def _time_mask(self, audio: torch.Tensor) -> torch.Tensor:
-        """
-        Apply time masking by zeroing out a random segment (torch version).
-        """
-        length = audio.shape[-1]
-        max_mask_len = int(length * self.config.time_mask_max_ratio)
-
-        if max_mask_len < 1:
-            return audio
-
-        mask_len = random.randint(1, max_mask_len)
-        start = random.randint(0, length - mask_len)
-
-        audio = audio.clone()
-        audio[start:start + mask_len] = 0
-
-        return audio
 
     def _time_mask_np(self, audio: np.ndarray) -> np.ndarray:
         """
