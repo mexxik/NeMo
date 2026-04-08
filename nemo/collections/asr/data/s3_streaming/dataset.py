@@ -1012,6 +1012,7 @@ class S3MultiLangStreamingDataset(IterableDataset):
         merge_buffer = MergeBuffer(self.audio_merger, self.merge_config)
 
         sample_idx = 0
+        max_samples = self.samples_per_epoch
 
         def process_and_yield(sample):
             """Process sample through merge buffer and yield results."""
@@ -1034,6 +1035,9 @@ class S3MultiLangStreamingDataset(IterableDataset):
 
         # Stream samples through interleaver and shuffle buffer
         for sample in interleaver:
+            if sample_idx >= max_samples:
+                break
+
             shuffle_buffer.add(sample)
 
             # Yield when buffer is full
@@ -1043,15 +1047,21 @@ class S3MultiLangStreamingDataset(IterableDataset):
                     result = process_and_yield(buffered_sample)
                     if result is not None:
                         yield result
+                        if sample_idx >= max_samples:
+                            break
 
         # Drain remaining samples from shuffle buffer
         for buffered_sample in shuffle_buffer.drain():
+            if sample_idx >= max_samples:
+                break
             result = process_and_yield(buffered_sample)
             if result is not None:
                 yield result
 
         # Drain remaining samples from merge buffer
         for remaining_sample in merge_buffer.drain():
+            if sample_idx >= max_samples:
+                break
             result = self._process_sample(remaining_sample, sample_idx)
             if result is not None:
                 yield result
