@@ -138,6 +138,7 @@ class S3MultiLangStreamingDataset(IterableDataset):
         min_duration: float = 0.5,
         max_duration: float = 15.0,
         max_chars: int = 50000,
+        filter_whisper_hallucinations: bool = True,
 
         # Token augmentation
         add_eou_token: bool = True,
@@ -307,12 +308,13 @@ class S3MultiLangStreamingDataset(IterableDataset):
         self.use_start_end_token = use_start_end_token
         self.return_sample_id = return_sample_id
 
-        # Create filter (duration and text length bounds only)
+        # Create filter (duration, text length, and whisper hallucination detection)
         filter_config = FilterConfig(
             min_duration=min_duration,
             max_duration=max_duration,
             min_chars=1,
             max_chars=max_chars,
+            filter_whisper_hallucinations=filter_whisper_hallucinations,
         )
         self.sample_filter = SampleFilter(filter_config)
 

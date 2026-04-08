@@ -253,6 +253,7 @@ class FilterConfig:
     max_duration: float = 30.0
     min_chars: int = 1
     max_chars: int = 500
+    filter_whisper_hallucinations: bool = True
 
 
 class SampleFilter:
@@ -262,7 +263,12 @@ class SampleFilter:
     Filters:
     - Duration bounds (min/max)
     - Text length bounds (min/max chars)
+    - Whisper hallucination detection (phrase matching + structural heuristics)
     """
+
+    # Log first N hallucination rejections individually, then periodic summaries
+    _HALL_LOG_FIRST = 20
+    _HALL_LOG_INTERVAL = 5000
 
     def __init__(self, config: FilterConfig):
         self.config = config
@@ -273,7 +279,16 @@ class SampleFilter:
             'rejected_max_duration': 0,
             'rejected_min_chars': 0,
             'rejected_max_chars': 0,
+            'rejected_whisper_hallucination': 0,
         }
+        self._hall_reason_counts: Dict[str, int] = {}
+        self._last_hall_log_count = 0
+
+        # Initialize whisper hallucination filter
+        self._hall_filter = None
+        if config.filter_whisper_hallucinations:
+            from .whisper_hallucination_filter import WhisperHallucinationFilter
+            self._hall_filter = WhisperHallucinationFilter(enabled=True)
 
     def __call__(self, sample: dict) -> bool:
         """
@@ -309,12 +324,51 @@ class SampleFilter:
             self._stats['rejected_max_chars'] += 1
             return False
 
+        # Whisper hallucination filter
+        if self._hall_filter is not None:
+            reason = self._hall_filter(sample)
+            if reason:
+                self._stats['rejected_whisper_hallucination'] += 1
+                self._hall_reason_counts[reason] = self._hall_reason_counts.get(reason, 0) + 1
+                hall_count = self._stats['rejected_whisper_hallucination']
+
+                # Log first N individually so you can see what's being caught
+                if hall_count <= self._HALL_LOG_FIRST:
+                    lang = sample.get('lang', '?')
+                    text_preview = text.strip()[:80]
+                    logging.info(
+                        f"[HALL_FILTER] Skipped ({reason}) [{lang}] "
+                        f"\"{text_preview}\" ({duration:.1f}s)"
+                    )
+                    if hall_count == self._HALL_LOG_FIRST:
+                        logging.info(
+                            f"[HALL_FILTER] Suppressing per-sample logs, "
+                            f"summary every {self._HALL_LOG_INTERVAL} rejections"
+                        )
+                # Periodic summary
+                elif (hall_count - self._last_hall_log_count) >= self._HALL_LOG_INTERVAL:
+                    self._last_hall_log_count = hall_count
+                    total = self._stats['total']
+                    pct = 100.0 * hall_count / total if total > 0 else 0
+                    top_reasons = sorted(
+                        self._hall_reason_counts.items(), key=lambda x: -x[1]
+                    )[:5]
+                    reasons_str = ", ".join(f"{r}={c}" for r, c in top_reasons)
+                    logging.info(
+                        f"[HALL_FILTER] {hall_count:,} hallucinations rejected "
+                        f"({pct:.1f}% of {total:,} seen). Top: {reasons_str}"
+                    )
+
+                return False
+
         self._stats['passed'] += 1
         return True
 
     def get_stats(self) -> dict:
         """Return filtering statistics."""
-        return self._stats.copy()
+        stats = self._stats.copy()
+        stats['hallucination_reasons'] = self._hall_reason_counts.copy()
+        return stats
 
     def log_stats(self):
         """Log filtering statistics."""
@@ -330,3 +384,9 @@ class SampleFilter:
         logging.info(f"  Rejected max_duration: {self._stats['rejected_max_duration']}")
         logging.info(f"  Rejected min_chars: {self._stats['rejected_min_chars']}")
         logging.info(f"  Rejected max_chars: {self._stats['rejected_max_chars']}")
+
+        hall_count = self._stats['rejected_whisper_hallucination']
+        if hall_count > 0:
+            logging.info(f"  Rejected whisper_hallucination: {hall_count}")
+            for reason, count in sorted(self._hall_reason_counts.items(), key=lambda x: -x[1]):
+                logging.info(f"    {reason}: {count}")

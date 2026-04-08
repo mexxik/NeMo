@@ -23,6 +23,7 @@ from .filters import (
     is_valid_text,
 )
 from .lang_source_manager import LanguageSourceManager, SingleSourceManager
+from .whisper_hallucination_filter import WhisperHallucinationFilter
 from .prefetch_buffer import MultiSourcePrefetcher, PrefetchBuffer
 from .round_robin import RoundRobinInterleaver, SourceRoundRobinInterleaver
 from .s3_tar_stream import S3ManifestLoader, S3TarStream
@@ -82,4 +83,6 @@ __all__ = [
     # Token augmentation
     'TokenAugmenter',
     'SENTENCE_ENDINGS',
+    # Whisper hallucination filter
+    'WhisperHallucinationFilter',
 ]
