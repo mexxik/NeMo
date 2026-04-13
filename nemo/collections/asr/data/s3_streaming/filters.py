@@ -226,6 +226,11 @@ def is_valid_text(text: str) -> bool:
             if text.count(char * 10) > 0:
                 return False
 
+    # Filter out spaceless text (corrupted transcripts with words merged together)
+    # Normal speech always has spaces if longer than ~20 chars
+    if len(text_stripped) > 20 and ' ' not in text_stripped:
+        return False
+
     # Count alphanumeric vs special characters
     alpha_count = sum(c.isalnum() or c.isspace() for c in text)
     total_count = len(text)
@@ -279,6 +284,7 @@ class SampleFilter:
             'rejected_max_duration': 0,
             'rejected_min_chars': 0,
             'rejected_max_chars': 0,
+            'rejected_bad_text': 0,
             'rejected_whisper_hallucination': 0,
         }
         self._hall_reason_counts: Dict[str, int] = {}
@@ -322,6 +328,11 @@ class SampleFilter:
 
         if text_len > self.config.max_chars:
             self._stats['rejected_max_chars'] += 1
+            return False
+
+        # Spaceless text filter (corrupted transcripts with words merged together)
+        if text_len > 20 and ' ' not in text.strip():
+            self._stats['rejected_bad_text'] += 1
             return False
 
         # Whisper hallucination filter
@@ -384,6 +395,7 @@ class SampleFilter:
         logging.info(f"  Rejected max_duration: {self._stats['rejected_max_duration']}")
         logging.info(f"  Rejected min_chars: {self._stats['rejected_min_chars']}")
         logging.info(f"  Rejected max_chars: {self._stats['rejected_max_chars']}")
+        logging.info(f"  Rejected bad_text: {self._stats['rejected_bad_text']}")
 
         hall_count = self._stats['rejected_whisper_hallucination']
         if hall_count > 0:
