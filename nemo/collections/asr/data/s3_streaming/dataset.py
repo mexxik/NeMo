@@ -991,16 +991,37 @@ class S3MultiLangStreamingDataset(IterableDataset):
         worker_info = torch.utils.data.get_worker_info()
         worker_id = worker_info.id if worker_info is not None else 0
 
-        logging.debug(f"[Worker {worker_id}] Starting iteration")
+        # Read distributed info live, so this works correctly even when the
+        # caller didn't plumb global_rank/world_size through the constructor.
+        # Lightning's use_distributed_sampler is a no-op for IterableDataset,
+        # so each rank otherwise iterates the full sample stream → world_size×
+        # duplicate work. Each rank now seeds independently and limits its own
+        # quota to samples_per_epoch / world_size.
+        try:
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                rank = torch.distributed.get_rank()
+                world_size = torch.distributed.get_world_size()
+            else:
+                rank = self.global_rank
+                world_size = max(1, self.world_size)
+        except Exception:
+            rank = self.global_rank
+            world_size = max(1, self.world_size)
+
+        logging.debug(f"[Worker {worker_id}] Starting iteration (rank={rank}/{world_size})")
 
         # Log epoch plan from worker 0 only
-        if worker_id == 0 and self.global_rank == 0:
+        if worker_id == 0 and rank == 0:
             self._log_epoch_plan()
 
         if worker_info is not None:
-            # In multi-worker mode, we could shard languages across workers
-            # For now, each worker gets all languages but different random seeds
-            random.seed(worker_info.id + self.global_rank * 1000)
+            # In multi-worker mode, give each (rank, worker) pair a distinct
+            # random seed so the substreams diverge.
+            random.seed(worker_info.id + rank * 1000)
+        else:
+            # Single-process: still seed per rank to diverge across ranks.
+            if rank > 0:
+                random.seed(rank * 1000)
 
         # Create interleaver for this worker
         interleaver = self._create_interleaver()
@@ -1012,7 +1033,14 @@ class S3MultiLangStreamingDataset(IterableDataset):
         merge_buffer = MergeBuffer(self.audio_merger, self.merge_config)
 
         sample_idx = 0
-        max_samples = self.samples_per_epoch
+        # Per-rank quota: total samples_per_epoch is the cluster-wide budget,
+        # so each rank takes 1/world_size of it. Floor by 1 to never deadlock.
+        max_samples = max(1, self.samples_per_epoch // world_size)
+        if rank == 0 and worker_id == 0 and world_size > 1:
+            logging.info(
+                f"[DDP] Sharded streaming: {self.samples_per_epoch:,} total -> "
+                f"{max_samples:,} per rank ({world_size} ranks)"
+            )
 
         def process_and_yield(sample):
             """Process sample through merge buffer and yield results."""
