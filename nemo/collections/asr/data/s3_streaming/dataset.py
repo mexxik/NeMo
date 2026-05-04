@@ -145,6 +145,13 @@ class S3MultiLangStreamingDataset(IterableDataset):
         eou_token: str = "<eou>",
         add_eot_token: bool = False,
         eot_token: str = "<eot>",
+        # Per-language tag at the END of an utterance (e.g. "...text <uk>").
+        # Pieces are looked up as f"<{lang}>" in the SentencePiece vocab.
+        # When add_lang_token=True, lang_token_prob controls how often the tag
+        # is inserted (1.0 = always, lets you read the lang back from decoded
+        # output reliably; <1.0 = sometimes, model handles tagged + untagged).
+        add_lang_token: bool = False,
+        lang_token_prob: float = 1.0,
 
         # Text normalization: "none", "full" (lowercase + remove all punctuation), "soft" (keep casing + keep only . , ! ?)
         normalize_text = "none",
@@ -394,6 +401,40 @@ class S3MultiLangStreamingDataset(IterableDataset):
 
                 if self.eot_token_id is None:
                     logging.warning(f"EOT token '{eot_token}' not found in vocabulary")
+
+        # Per-language tag tokens. Looked up once from the SentencePiece vocab
+        # so we can append the corresponding ID directly during tokenization
+        # (SentencePiece doesn't tokenize USER_DEFINED tokens during encoding).
+        self.add_lang_token = add_lang_token
+        self.lang_token_prob = float(lang_token_prob)
+        self.lang_token_ids: Dict[str, int] = {}
+        if add_lang_token:
+            sp = tokenizer.tokenizer if hasattr(tokenizer, 'tokenizer') else None
+            for lang in language_sources.keys():
+                token_str = f"<{lang}>"
+                tid = None
+                if sp is not None and hasattr(sp, 'piece_to_id'):
+                    candidate = sp.piece_to_id(token_str)
+                    if candidate != sp.unk_id():
+                        tid = candidate
+                if tid is None:
+                    # Fallback: linear scan
+                    for i in range(tokenizer.vocab_size):
+                        try:
+                            piece = tokenizer.ids_to_tokens([i])
+                            if piece and piece[0] == token_str:
+                                tid = i
+                                break
+                        except Exception:
+                            continue
+                if tid is not None:
+                    self.lang_token_ids[lang] = tid
+                    logging.info(f"Lang token '{token_str}' found at ID {tid}")
+                else:
+                    logging.warning(
+                        f"Lang token '{token_str}' not found in vocabulary — "
+                        f"samples for lang='{lang}' will not be tagged"
+                    )
 
         # BOS/EOS tokens
         # NeMo uses -1 to indicate "no BOS/EOS", so we need to check for >= 0
@@ -1133,7 +1174,11 @@ class S3MultiLangStreamingDataset(IterableDataset):
 
         if original_texts is not None:
             # Merged sample: tokenize each segment and add EOU where appropriate
-            tokens = self._tokenize_merged(original_texts, eou_positions)
+            tokens = self._tokenize_merged(
+                original_texts,
+                eou_positions,
+                sample_lang=sample.get('lang'),
+            )
         else:
             # Regular sample
             text = sample.get('text', '')
@@ -1166,6 +1211,16 @@ class S3MultiLangStreamingDataset(IterableDataset):
             if self.add_eot_token and self.eot_token_id is not None:
                 tokens = tokens + [self.eot_token_id]
 
+            # Append per-utterance lang tag (e.g. "...text <uk>") so the
+            # model learns to identify the language at the end of speech.
+            if self.add_lang_token and self.lang_token_ids:
+                sample_lang = sample.get('lang')
+                lang_id = self.lang_token_ids.get(sample_lang) if sample_lang else None
+                if lang_id is not None and (
+                    self.lang_token_prob >= 1.0 or random.random() < self.lang_token_prob
+                ):
+                    tokens = tokens + [lang_id]
+
             # Add EOS token if configured
             if self.eos_id is not None:
                 tokens = tokens + [self.eos_id]
@@ -1184,7 +1239,12 @@ class S3MultiLangStreamingDataset(IterableDataset):
         else:
             return audio_tensor, audio_len, tokens_tensor, tokens_len
 
-    def _tokenize_merged(self, texts: List[str], eou_positions: List[int]) -> List[int]:
+    def _tokenize_merged(
+        self,
+        texts: List[str],
+        eou_positions: List[int],
+        sample_lang: Optional[str] = None,
+    ) -> List[int]:
         """
         Tokenize merged multi-utterance/multi-turn sample.
 
@@ -1225,6 +1285,16 @@ class S3MultiLangStreamingDataset(IterableDataset):
             elif self.add_eou_token and self.eou_token_id is not None and i in eou_positions:
                 # EOU mode: append EOU after segments with sentence-ending punctuation
                 tokens.append(self.eou_token_id)
+
+        # Append per-utterance lang tag once at the end of the merged turn.
+        # (Merge is currently same-lang only; if cross-lang merging is ever
+        # added, switch to a per-segment tag inside the loop above.)
+        if self.add_lang_token and self.lang_token_ids:
+            lang_id = self.lang_token_ids.get(sample_lang) if sample_lang else None
+            if lang_id is not None and (
+                self.lang_token_prob >= 1.0 or random.random() < self.lang_token_prob
+            ):
+                tokens.append(lang_id)
 
         # Add EOS token if configured (only at the very end)
         if self.eos_id is not None:

@@ -217,6 +217,11 @@ class AudioMerger:
             'merged_count': len(samples),
             'eou_positions': eou_positions,
             'original_texts': merged_texts,  # Keep original texts for tokenization
+            # Carry the lang of the first sample so downstream tokenization can
+            # append the per-utterance <lang> tag. Merge is currently used with
+            # same-lang sources; if cross-lang merging is added later, switch
+            # to a per-segment list here.
+            'lang': samples[0].get('lang') if samples else None,
         }
 
     def get_stats(self) -> dict:
