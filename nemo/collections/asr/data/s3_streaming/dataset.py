@@ -202,6 +202,14 @@ class S3MultiLangStreamingDataset(IterableDataset):
 
         # Curriculum bucketing: process filterN_ sources from shortest to longest
         curriculum_buckets: bool = False,
+
+        # Language-ID training mode. When True, the label sequence for each
+        # utterance is `[<lang_id>] * num_words` (one lang token per word in the
+        # transcription, language-tag IDs from the SP vocab). EOU/EOT/BOS/EOS/
+        # text-normalization are skipped — they're irrelevant for LID. Combined
+        # with merge_utterances + cross-language sample rotation, this produces
+        # code-switch training samples like `<en> <en> <en> <fr> <fr>`.
+        lid_mode: bool = False,
     ):
         """
         Initialize multi-language streaming dataset.
@@ -402,6 +410,17 @@ class S3MultiLangStreamingDataset(IterableDataset):
                 if self.eot_token_id is None:
                     logging.warning(f"EOT token '{eot_token}' not found in vocabulary")
 
+        # LID mode: force lang-token vocab lookup, disable text/normalization paths.
+        self.lid_mode = bool(lid_mode)
+        if self.lid_mode:
+            add_lang_token = True
+            add_eou_token = False
+            add_eot_token = False
+            use_start_end_token = False
+            normalize_text = "none"
+            logging.info("[DATASET_INIT] LID mode ENABLED: per-word lang-token labels, "
+                         "EOU/EOT/BOS/EOS/text-norm disabled")
+
         # Per-language tag tokens. Looked up once from the SentencePiece vocab
         # so we can append the corresponding ID directly during tokenization
         # (SentencePiece doesn't tokenize USER_DEFINED tokens during encoding).
@@ -480,7 +499,9 @@ class S3MultiLangStreamingDataset(IterableDataset):
                 self._sqlite_cache_path = os.path.join(cache_dir, f"manifest_{cache_name}.db")
                 os.makedirs(cache_dir, exist_ok=True)
 
-        # Audio merger for multi-utterance training
+        # Audio merger for multi-utterance training.
+        # In LID mode the punctuation gate is irrelevant — disable it so cross-
+        # language merges go through regardless of where utterances end.
         self.merge_config = MergeConfig(
             enabled=merge_utterances,
             merge_probability=merge_probability,
@@ -489,6 +510,7 @@ class S3MultiLangStreamingDataset(IterableDataset):
             silence_min_sec=merge_silence_min,
             silence_max_sec=merge_silence_max,
             max_merged_duration=merge_max_duration,
+            require_punctuation=not self.lid_mode,
         )
         self.audio_merger = AudioMerger(self.merge_config, sample_rate=sample_rate)
 
@@ -1028,6 +1050,13 @@ class S3MultiLangStreamingDataset(IterableDataset):
             Tuple of (audio, audio_len, tokens, tokens_len) or
             (audio, audio_len, tokens, tokens_len, sample_id) if return_sample_id=True
         """
+        import time as _time
+        _PROF = os.environ.get('DATASET_PROFILE', '0') == '1'
+        try:
+            _PROF_EVERY = int(os.environ.get('DATASET_PROFILE_EVERY', '2000'))
+        except ValueError:
+            _PROF_EVERY = 2000
+
         # Get worker info for multi-worker data loading
         worker_info = torch.utils.data.get_worker_info()
         worker_id = worker_info.id if worker_info is not None else 0
@@ -1083,14 +1112,42 @@ class S3MultiLangStreamingDataset(IterableDataset):
                 f"{max_samples:,} per rank ({world_size} ranks)"
             )
 
+        # Per-stage timing counters; only populated when DATASET_PROFILE=1.
+        # Splits one consumer cycle into:
+        #   t_fetch  : interleaver.next  (DiskTarStream pull + buffer/merge)
+        #   t_proc   : _process_sample   (augment + tensor + tokenize)
+        #   t_yield  : time the yield blocks (downstream backpressure: dynamic
+        #              batch sort/pack + DataLoader IPC)
+        _ds_t_fetch = 0.0
+        _ds_t_proc = 0.0
+        _ds_t_yield = 0.0
+        _ds_n = 0
+        _ds_t0 = _time.perf_counter() if _PROF else 0.0
+
+        def _ds_emit():
+            if not _PROF or _ds_n == 0:
+                return
+            tot = _ds_t_fetch + _ds_t_proc + _ds_t_yield
+            logging.info(
+                f"[DS_PROF wid={worker_id}] n={_ds_n} "
+                f"fetch={_ds_t_fetch*1000:.0f}ms ({_ds_t_fetch/_ds_n*1000:.2f}ms/smp) "
+                f"proc={_ds_t_proc*1000:.0f}ms ({_ds_t_proc/_ds_n*1000:.2f}ms/smp) "
+                f"yield_block={_ds_t_yield*1000:.0f}ms ({_ds_t_yield/_ds_n*1000:.2f}ms/smp) "
+                f"total={tot*1000:.0f}ms"
+            )
+
         def process_and_yield(sample):
             """Process sample through merge buffer and yield results."""
-            nonlocal sample_idx
+            nonlocal sample_idx, _ds_t_proc
 
             # Try to add to merge buffer - may return merged sample, single sample, or None
             result_sample = merge_buffer.add(sample)
             if result_sample is not None:
+                if _PROF:
+                    _t = _time.perf_counter()
                 result = self._process_sample(result_sample, sample_idx)
+                if _PROF:
+                    _ds_t_proc += _time.perf_counter() - _t
                 if result is not None:
                     sample_idx += 1
 
@@ -1103,7 +1160,18 @@ class S3MultiLangStreamingDataset(IterableDataset):
             return None
 
         # Stream samples through interleaver and shuffle buffer
-        for sample in interleaver:
+        _last_yield_resume = _time.perf_counter() if _PROF else 0.0
+        _interleaver_iter = iter(interleaver)
+        while True:
+            if _PROF:
+                _t = _time.perf_counter()
+            try:
+                sample = next(_interleaver_iter)
+            except StopIteration:
+                break
+            if _PROF:
+                _ds_t_fetch += _time.perf_counter() - _t
+
             if sample_idx >= max_samples:
                 break
 
@@ -1115,7 +1183,18 @@ class S3MultiLangStreamingDataset(IterableDataset):
                 if buffered_sample is not None:
                     result = process_and_yield(buffered_sample)
                     if result is not None:
+                        if _PROF:
+                            _yield_start = _time.perf_counter()
                         yield result
+                        if _PROF:
+                            _ds_t_yield += _time.perf_counter() - _yield_start
+                            _ds_n += 1
+                            if _ds_n % _PROF_EVERY == 0:
+                                _ds_emit()
+                                _ds_t_fetch = 0.0
+                                _ds_t_proc = 0.0
+                                _ds_t_yield = 0.0
+                                _ds_n = 0
                         if sample_idx >= max_samples:
                             break
 
@@ -1178,7 +1257,19 @@ class S3MultiLangStreamingDataset(IterableDataset):
                 original_texts,
                 eou_positions,
                 sample_lang=sample.get('lang'),
+                segment_langs=sample.get('langs'),
             )
+        elif self.lid_mode:
+            # LID mode (single utterance): emit `[<lang_id>] * num_words` —
+            # word count from whitespace split. No BOS/EOS/EOU/normalization.
+            text = sample.get('text', '') or ''
+            sample_lang = sample.get('lang')
+            lang_id = self.lang_token_ids.get(sample_lang) if sample_lang else None
+            if lang_id is None:
+                # Unknown language for this sample — skip rather than corrupt the batch.
+                return None
+            num_words = max(1, len(text.split()))
+            tokens = [lang_id] * num_words
         else:
             # Regular sample
             text = sample.get('text', '')
@@ -1244,6 +1335,7 @@ class S3MultiLangStreamingDataset(IterableDataset):
         texts: List[str],
         eou_positions: List[int],
         sample_lang: Optional[str] = None,
+        segment_langs: Optional[List[str]] = None,
     ) -> List[int]:
         """
         Tokenize merged multi-utterance/multi-turn sample.
@@ -1255,13 +1347,31 @@ class S3MultiLangStreamingDataset(IterableDataset):
         When EOU mode is active (add_eou_token=True, add_eot_token=False),
         EOU is inserted after segments with sentence-ending punctuation.
 
+        When lid_mode is active, the segment text is replaced by `[<lang_i>] *
+        num_words_i` per segment, producing a label sequence like
+        `<en> <en> <en> <fr> <fr>` for code-switch training.
+
         Args:
             texts: List of text segments
             eou_positions: Indices of segments that should have EOU appended
+            sample_lang: Fallback language tag (used when segment_langs is not provided)
+            segment_langs: Per-segment language tags, parallel to `texts`
 
         Returns:
             Combined token list with special tokens inserted appropriately
         """
+        # LID mode: emit per-segment lang tokens, one per word. No BOS/EOS/EOU/EOT.
+        if self.lid_mode:
+            tokens: List[int] = []
+            langs = segment_langs if segment_langs is not None else [sample_lang] * len(texts)
+            for txt, lang in zip(texts, langs):
+                lang_id = self.lang_token_ids.get(lang) if lang else None
+                if lang_id is None:
+                    continue
+                num_words = max(1, len((txt or '').split()))
+                tokens.extend([lang_id] * num_words)
+            return tokens
+
         tokens = []
 
         # Add BOS token if configured (only at the very beginning)

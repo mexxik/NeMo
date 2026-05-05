@@ -29,6 +29,10 @@ class MergeConfig:
     add_trailing_silence: bool = True  # Add silence after last utterance
     trailing_silence_min_sec: float = 0.3
     trailing_silence_max_sec: float = 1.0
+    # LID/code-switch mode: skip the "first sample must end with punctuation"
+    # gate. EOU isn't being learned here, so punctuation is irrelevant; we want
+    # to merge regardless so cross-language concatenations get produced.
+    require_punctuation: bool = True
 
 
 class AudioMerger:
@@ -131,9 +135,11 @@ class AudioMerger:
             for s in samples[:-1]  # Check all but last (last always gets EOU if punctuated)
         )
         # Actually, we want ALL samples to ideally end with punctuation
-        # But we can be flexible - at least require the first one
-        if not self._ends_with_punctuation(samples[0].get('text', '')):
-            return False, "first_sample_no_punctuation"
+        # But we can be flexible - at least require the first one.
+        # In LID/code-switch mode this gate is disabled (require_punctuation=False).
+        if self.config.require_punctuation:
+            if not self._ends_with_punctuation(samples[0].get('text', '')):
+                return False, "first_sample_no_punctuation"
 
         return True, "ok"
 
@@ -217,11 +223,11 @@ class AudioMerger:
             'merged_count': len(samples),
             'eou_positions': eou_positions,
             'original_texts': merged_texts,  # Keep original texts for tokenization
-            # Carry the lang of the first sample so downstream tokenization can
-            # append the per-utterance <lang> tag. Merge is currently used with
-            # same-lang sources; if cross-lang merging is added later, switch
-            # to a per-segment list here.
+            # First-sample lang preserved for backward compat (legacy add_lang_token path).
             'lang': samples[0].get('lang') if samples else None,
+            # Per-segment langs parallel to original_texts. Used by lid_mode to
+            # emit `[<lang_i>] * num_words_i` per segment for code-switch training.
+            'langs': [s.get('lang') for s in samples],
         }
 
     def get_stats(self) -> dict:
