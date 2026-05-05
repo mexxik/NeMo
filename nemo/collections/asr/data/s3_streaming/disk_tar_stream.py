@@ -8,6 +8,7 @@ Provides the same interface as S3TarStream for unified usage.
 import json
 import os
 import tarfile
+import time
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Union
 
@@ -16,6 +17,15 @@ import numpy as np
 from nemo.utils import logging
 
 from .s3_tar_stream import fast_wav_to_float32
+
+
+# Optional per-tar timing diagnostic. Enable with DATASET_PROFILE=1.
+# When on, every tar stream emits one log line on completion with the
+# breakdown: how many members it scanned, how many matched the manifest,
+# and ms spent in tar iter, manifest lookup, extractfile, and WAV decode.
+# Read these from any worker's stdout/log. Lets us see whether the wall
+# is SQLite/manifest queries, tar header parsing, or audio decode.
+_DATASET_PROFILE = os.environ.get('DATASET_PROFILE', '0') == '1'
 
 
 class DiskTarStream:
@@ -57,36 +67,76 @@ class DiskTarStream:
             self._exhausted = True
             return
 
+        # Timing buckets — only populated when DATASET_PROFILE=1.
+        members_seen = 0
+        members_matched = 0
+        t_iter = 0.0
+        t_lookup = 0.0
+        t_extract = 0.0
+        t_decode = 0.0
+        t_start = time.perf_counter() if _DATASET_PROFILE else 0.0
+
         try:
             with tarfile.open(self.tar_path, mode='r:*') as tar:
-                for member in tar:
+                tar_iter = iter(tar)
+                while True:
+                    if _DATASET_PROFILE:
+                        _t0 = time.perf_counter()
+                    try:
+                        member = next(tar_iter)
+                    except StopIteration:
+                        if _DATASET_PROFILE:
+                            t_iter += time.perf_counter() - _t0
+                        break
+                    except Exception:
+                        if _DATASET_PROFILE:
+                            t_iter += time.perf_counter() - _t0
+                        break
+                    if _DATASET_PROFILE:
+                        t_iter += time.perf_counter() - _t0
                     if not member.isfile():
                         continue
+                    members_seen += 1
 
                     filename = member.name
 
-                    # Check if this file is in our manifest
-                    if filename not in self.manifest_entries:
+                    if _DATASET_PROFILE:
+                        _t0 = time.perf_counter()
+                    in_manifest = filename in self.manifest_entries
+                    if _DATASET_PROFILE:
+                        t_lookup += time.perf_counter() - _t0
+                    if not in_manifest:
                         continue
+                    members_matched += 1
 
                     # Extract audio bytes
                     try:
+                        if _DATASET_PROFILE:
+                            _t0 = time.perf_counter()
                         audio_file = tar.extractfile(member)
                         if audio_file is None:
                             continue
                         audio_bytes = audio_file.read()
+                        if _DATASET_PROFILE:
+                            t_extract += time.perf_counter() - _t0
                     except Exception as e:
                         logging.warning(f"Failed to extract {filename}: {e}")
                         continue
 
-                    # Parse WAV to float32
+                    if _DATASET_PROFILE:
+                        _t0 = time.perf_counter()
                     audio = fast_wav_to_float32(audio_bytes)
+                    if _DATASET_PROFILE:
+                        t_decode += time.perf_counter() - _t0
                     if audio is None:
                         logging.debug(f"Failed to parse WAV: {filename}")
                         continue
 
-                    # Get manifest entry
+                    if _DATASET_PROFILE:
+                        _t0 = time.perf_counter()
                     entry = self.manifest_entries[filename]
+                    if _DATASET_PROFILE:
+                        t_lookup += time.perf_counter() - _t0
 
                     yield {
                         'audio': audio,
@@ -98,6 +148,27 @@ class DiskTarStream:
 
         except Exception as e:
             logging.error(f"Error streaming TAR from {self.tar_path}: {e}")
+
+        if _DATASET_PROFILE and members_seen > 0:
+            tot = time.perf_counter() - t_start
+            other = max(0.0, tot - (t_iter + t_lookup + t_extract + t_decode))
+            try:
+                wid = -1
+                import torch.utils.data as _tud
+                wi = _tud.get_worker_info()
+                if wi is not None:
+                    wid = wi.id
+            except Exception:
+                wid = -1
+            logging.info(
+                f"[TAR_PROF wid={wid}] {os.path.basename(self.tar_path)} "
+                f"seen={members_seen} matched={members_matched} "
+                f"iter={t_iter*1000:.0f}ms "
+                f"lookup={t_lookup*1000:.0f}ms ({t_lookup/max(members_seen,1)*1e6:.0f}us/member) "
+                f"extract={t_extract*1000:.0f}ms "
+                f"decode={t_decode*1000:.0f}ms "
+                f"other={other*1000:.0f}ms total={tot*1000:.0f}ms"
+            )
 
         self._exhausted = True
 
