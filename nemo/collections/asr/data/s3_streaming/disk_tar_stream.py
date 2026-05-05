@@ -20,12 +20,17 @@ from .s3_tar_stream import fast_wav_to_float32
 
 
 # Optional per-tar timing diagnostic. Enable with DATASET_PROFILE=1.
-# When on, every tar stream emits one log line on completion with the
-# breakdown: how many members it scanned, how many matched the manifest,
-# and ms spent in tar iter, manifest lookup, extractfile, and WAV decode.
-# Read these from any worker's stdout/log. Lets us see whether the wall
-# is SQLite/manifest queries, tar header parsing, or audio decode.
+# When on, every tar stream emits log lines with the breakdown of where
+# per-member time goes: tar iter, manifest lookup, extractfile, WAV decode.
+# Lines are emitted periodically (every DATASET_PROFILE_EVERY members,
+# default 2000) AND at tar completion. Lets us see whether the wall is
+# SQLite/manifest queries, tar header parsing, or audio decode without
+# waiting minutes for a 3GB tar to drain.
 _DATASET_PROFILE = os.environ.get('DATASET_PROFILE', '0') == '1'
+try:
+    _DATASET_PROFILE_EVERY = int(os.environ.get('DATASET_PROFILE_EVERY', '2000'))
+except ValueError:
+    _DATASET_PROFILE_EVERY = 2000
 
 
 class DiskTarStream:
@@ -75,6 +80,30 @@ class DiskTarStream:
         t_extract = 0.0
         t_decode = 0.0
         t_start = time.perf_counter() if _DATASET_PROFILE else 0.0
+        last_emit_seen = 0
+
+        def _emit_profile(tag: str):
+            if not _DATASET_PROFILE or members_seen == 0:
+                return
+            tot = time.perf_counter() - t_start
+            other = max(0.0, tot - (t_iter + t_lookup + t_extract + t_decode))
+            try:
+                wid = -1
+                import torch.utils.data as _tud
+                wi = _tud.get_worker_info()
+                if wi is not None:
+                    wid = wi.id
+            except Exception:
+                wid = -1
+            logging.info(
+                f"[TAR_PROF wid={wid} {tag}] {os.path.basename(self.tar_path)} "
+                f"seen={members_seen} matched={members_matched} "
+                f"iter={t_iter*1000:.0f}ms "
+                f"lookup={t_lookup*1000:.0f}ms ({t_lookup/max(members_seen,1)*1e6:.0f}us/member) "
+                f"extract={t_extract*1000:.0f}ms "
+                f"decode={t_decode*1000:.0f}ms "
+                f"other={other*1000:.0f}ms total={tot*1000:.0f}ms"
+            )
 
         try:
             with tarfile.open(self.tar_path, mode='r:*') as tar:
@@ -146,29 +175,14 @@ class DiskTarStream:
                         'filename': filename,
                     }
 
+                    if _DATASET_PROFILE and members_seen - last_emit_seen >= _DATASET_PROFILE_EVERY:
+                        _emit_profile("partial")
+                        last_emit_seen = members_seen
+
         except Exception as e:
             logging.error(f"Error streaming TAR from {self.tar_path}: {e}")
 
-        if _DATASET_PROFILE and members_seen > 0:
-            tot = time.perf_counter() - t_start
-            other = max(0.0, tot - (t_iter + t_lookup + t_extract + t_decode))
-            try:
-                wid = -1
-                import torch.utils.data as _tud
-                wi = _tud.get_worker_info()
-                if wi is not None:
-                    wid = wi.id
-            except Exception:
-                wid = -1
-            logging.info(
-                f"[TAR_PROF wid={wid}] {os.path.basename(self.tar_path)} "
-                f"seen={members_seen} matched={members_matched} "
-                f"iter={t_iter*1000:.0f}ms "
-                f"lookup={t_lookup*1000:.0f}ms ({t_lookup/max(members_seen,1)*1e6:.0f}us/member) "
-                f"extract={t_extract*1000:.0f}ms "
-                f"decode={t_decode*1000:.0f}ms "
-                f"other={other*1000:.0f}ms total={tot*1000:.0f}ms"
-            )
+        _emit_profile("done")
 
         self._exhausted = True
 
