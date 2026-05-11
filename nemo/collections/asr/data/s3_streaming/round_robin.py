@@ -205,6 +205,7 @@ class SourceRoundRobinInterleaver:
         balance_mode: str = "max",
         lang_sample_counts: Optional[Dict[str, int]] = None,
         source_sample_counts: Optional[Dict[str, int]] = None,
+        lang_target_samples: Optional[Dict[str, int]] = None,
         curriculum_buckets: bool = False,
     ):
         """
@@ -216,10 +217,14 @@ class SourceRoundRobinInterleaver:
             languages_order: Optional explicit ordering of languages
             samples_per_source: Number of samples to get from each source before
                                rotating to the next.
-            balance_mode: "none", "max", "min", or "distributed"
+            balance_mode: "none", "max", "min", "distributed", or "cap"
             lang_sample_counts: Per-language sample counts (required for "min")
             source_sample_counts: Per-source sample counts "lang:source" -> count
                                   (required for "distributed")
+            lang_target_samples: Per-language target sample counts (required for
+                                 "cap"). Langs below their target get source
+                                 restarts (oversampling); langs above get
+                                 truncated when budget is reached (undersampling).
         """
         self.language_sources = language_sources
         self.source_managers = source_managers
@@ -230,8 +235,10 @@ class SourceRoundRobinInterleaver:
             balance_mode = "max"
         elif balance_mode is False:
             balance_mode = "none"
-        if balance_mode not in ("none", "max", "min", "distributed"):
-            raise ValueError(f"balance_mode must be 'none', 'max', 'min', or 'distributed', got: {balance_mode}")
+        if balance_mode not in ("none", "max", "min", "distributed", "cap"):
+            raise ValueError(
+                f"balance_mode must be 'none', 'max', 'min', 'distributed', or 'cap', got: {balance_mode}"
+            )
         self.balance_mode = balance_mode
 
         # Language order (sorted alphabetically by default)
@@ -299,6 +306,16 @@ class SourceRoundRobinInterleaver:
             else:
                 logging.warning(
                     "balance_mode='min' requires lang_sample_counts but none provided. "
+                    "Falling back to 'none' mode."
+                )
+                self.balance_mode = "none"
+        elif balance_mode == "cap":
+            if lang_target_samples:
+                for lang in self.languages_order:
+                    self._lang_budget[lang] = max(1, int(lang_target_samples.get(lang, 0)))
+            else:
+                logging.warning(
+                    "balance_mode='cap' requires lang_target_samples but none provided. "
                     "Falling back to 'none' mode."
                 )
                 self.balance_mode = "none"
@@ -481,7 +498,7 @@ class SourceRoundRobinInterleaver:
 
     def _get_next_sample(self) -> Optional[dict]:
         """Dispatch to mode-specific sample selection."""
-        if self.balance_mode in ("min", "distributed"):
+        if self.balance_mode in ("min", "distributed", "cap"):
             return self._get_next_sample_weighted()
         else:
             return self._get_next_sample_round_robin()
@@ -534,16 +551,20 @@ class SourceRoundRobinInterleaver:
         if self.balance_mode == "distributed":
             return self._get_next_sample_distributed()
 
-        # "min" mode — language-level weighted
+        # "min" and "cap" modes — language-level weighted by completion ratio.
+        # The only difference: "cap" allows source restarts so under-quota langs
+        # can be oversampled to reach their per-lang target.
         if not self._active_languages:
             return None
+
+        restart_sources = (self.balance_mode == "cap")
 
         next_lang = min(
             self._active_languages,
             key=lambda l: self._lang_yielded[l] / max(self._lang_budget[l], 1)
         )
 
-        sample = self._get_sample_from_lang(next_lang, restart_sources=False)
+        sample = self._get_sample_from_lang(next_lang, restart_sources=restart_sources)
         if sample is not None:
             self._lang_yielded[next_lang] += 1
             if self._lang_yielded[next_lang] >= self._lang_budget[next_lang]:
@@ -697,6 +718,12 @@ class SourceRoundRobinInterleaver:
                     f"Epoch {self._epoch} - Balance mode 'min': "
                     f"per-lang yields: {dict(self._lang_yielded)}"
                 )
+            elif self.balance_mode == "cap":
+                logging.info(
+                    f"Epoch {self._epoch} - Balance mode 'cap': "
+                    f"per-lang yields/budget: "
+                    f"{ {l: f'{self._lang_yielded[l]:,}/{self._lang_budget[l]:,}' for l in self.languages_order} }"
+                )
             logging.info(f"Starting epoch {self._epoch}")
 
         for manager in self.source_managers.values():
@@ -738,7 +765,7 @@ class SourceRoundRobinInterleaver:
             stats['max_source_cycle'] = max(self._source_cycles.values()) if self._source_cycles else 0
             stats['sources_repeated'] = sum(1 for c in self._source_cycles.values() if c > 0)
 
-        if self.balance_mode in ("min", "distributed"):
+        if self.balance_mode in ("min", "distributed", "cap"):
             stats['lang_budgets'] = dict(self._lang_budget)
             stats['lang_yielded'] = dict(self._lang_yielded)
 

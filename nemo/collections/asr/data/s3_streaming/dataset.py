@@ -191,8 +191,12 @@ class S3MultiLangStreamingDataset(IterableDataset):
         # Prefetch (background sample loading)
         prefetch_buffer_size: int = 0,  # Number of samples to prefetch per source (0 to disable)
 
-        # Source balancing mode: "none", "max", "min", "distributed"
+        # Source balancing mode: "none", "max", "min", "distributed", "cap"
         balance_mode: str = "max",
+        # Per-lang hours cap for balance_mode="cap". Each lang is sampled to
+        # exactly this many hours per epoch: oversampled if natural < cap,
+        # undersampled if natural > cap. Required when balance_mode="cap".
+        balance_target_hours: Optional[float] = None,
         augment_prob: float = 0.1,  # Base probability of augmentation for non-repeated samples
         augment_speed: bool = False,  # Enable speed perturbation (0.9x-1.1x)
         augment_gain: bool = False,  # Enable gain adjustment (+/-6dB)
@@ -259,9 +263,17 @@ class S3MultiLangStreamingDataset(IterableDataset):
             balance_mode = "max"
         elif balance_mode is False:
             balance_mode = "none"
-        if balance_mode not in ("none", "max", "min", "distributed"):
-            raise ValueError(f"balance_mode must be 'none', 'max', 'min', or 'distributed', got: {balance_mode}")
+        if balance_mode not in ("none", "max", "min", "distributed", "cap"):
+            raise ValueError(
+                f"balance_mode must be 'none', 'max', 'min', 'distributed', or 'cap', "
+                f"got: {balance_mode}"
+            )
+        if balance_mode == "cap" and (balance_target_hours is None or balance_target_hours <= 0):
+            raise ValueError(
+                "balance_mode='cap' requires balance_target_hours > 0 (hours per language per epoch)"
+            )
         self.balance_mode = balance_mode
+        self.balance_target_hours = balance_target_hours
 
         # Audio augmentation
         augment_any = augment_speed or augment_gain or augment_time_mask or augment_bandwidth or augment_noise
@@ -631,12 +643,40 @@ class S3MultiLangStreamingDataset(IterableDataset):
         # Compute per-language and per-source sample counts (needed for min/distributed modes)
         self._lang_sample_counts: Optional[Dict[str, int]] = None
         self._source_sample_counts: Optional[Dict[str, int]] = None
+        self._lang_hours: Optional[Dict[str, float]] = None
         if self._sqlite_cache_path and os.path.exists(self._sqlite_cache_path):
             self._lang_sample_counts, self._source_sample_counts = self._get_sample_counts()
+            self._lang_hours = self._get_lang_hours()
 
         # Log balancing strategy if enabled
         if self.balance_mode != "none" and self._sqlite_cache_path and os.path.exists(self._sqlite_cache_path):
             self._log_balancing_strategy()
+
+    def _get_lang_hours(self) -> Optional[Dict[str, float]]:
+        """Get per-language total duration in hours, restricted to the sources
+        listed in language_sources (so cache entries from other configs don't
+        inflate the numbers)."""
+        if not self._sqlite_cache_path or not os.path.exists(self._sqlite_cache_path):
+            return None
+        try:
+            from .sqlite_manifest import SQLiteManifestCache
+            cache = SQLiteManifestCache(self._sqlite_cache_path, read_only=True)
+            conn = cache._get_connection()
+            out: Dict[str, float] = {}
+            for lang, sources in self.language_sources.items():
+                total_seconds = 0.0
+                for source in sources:
+                    row = conn.execute(
+                        "SELECT COALESCE(SUM(duration), 0) AS s FROM manifest_entries WHERE source = ?",
+                        (source,),
+                    ).fetchone()
+                    total_seconds += float(row["s"] if row else 0.0)
+                out[lang] = total_seconds / 3600.0
+            cache.close()
+            return out
+        except Exception as e:
+            logging.warning(f"Could not get per-lang hours from cache: {e}")
+            return None
 
     def _get_sample_counts(self):
         """Get per-language and per-source sample counts from SQLite cache."""
@@ -801,6 +841,11 @@ class S3MultiLangStreamingDataset(IterableDataset):
                 logging.info(f"Largest language: {max_lang} ({max_lang_hours:.1f}h)")
                 logging.info(f"Expected epoch: ~{max_lang_hours * num_languages:.1f}h "
                              f"({num_languages} x {max_lang_hours:.1f}h)")
+            elif self.balance_mode == "cap" and self.balance_target_hours:
+                cap = self.balance_target_hours
+                logging.info(f"Per-language cap: {cap:.1f}h")
+                logging.info(f"Expected epoch: ~{cap * num_languages:.1f}h "
+                             f"({num_languages} x {cap:.1f}h)")
             logging.info("-" * 60)
 
             for lang in sorted(lang_hours.keys()):
@@ -819,6 +864,19 @@ class S3MultiLangStreamingDataset(IterableDataset):
                             f"  {lang}: {hours:.1f}h ({samples:,} samples) "
                             f"-> 1.0x (largest)"
                         )
+                elif self.balance_mode == "cap" and self.balance_target_hours and hours > 0:
+                    ratio = self.balance_target_hours / hours
+                    epoch_samples = int(samples * ratio)
+                    if ratio > 1.05:
+                        tag = f"{ratio:.1f}x repeat (oversample)"
+                    elif ratio < 0.95:
+                        tag = f"{ratio*100:.1f}% subset (undersample)"
+                    else:
+                        tag = "1.0x (at cap)"
+                    logging.info(
+                        f"  {lang}: {hours:.1f}h ({samples:,} samples) -> {tag} "
+                        f"-> ~{epoch_samples:,} samples/epoch"
+                    )
                 else:
                     logging.info(f"  {lang}: {hours:.1f}h ({samples:,} samples)")
 
@@ -1074,6 +1132,26 @@ class S3MultiLangStreamingDataset(IterableDataset):
                     )
                 source_managers[manager_key] = manager
 
+        lang_target_samples = None
+        if self.balance_mode == "cap" and self.balance_target_hours and self._lang_sample_counts:
+            # Compute per-lang target samples from target_hours * samples_per_hour.
+            # `_lang_hours` is populated alongside `_lang_sample_counts` when the
+            # cache is loaded; fall back to a heuristic if it's missing.
+            lang_hours = getattr(self, "_lang_hours", None) or {}
+            lang_target_samples = {}
+            for lang, samples in self._lang_sample_counts.items():
+                hours = lang_hours.get(lang, 0)
+                if hours > 0:
+                    samples_per_hour = samples / hours
+                    lang_target_samples[lang] = max(1, int(self.balance_target_hours * samples_per_hour))
+                else:
+                    # No hours info — leave the natural count (no cap)
+                    lang_target_samples[lang] = samples
+            logging.info(
+                f"balance_mode='cap' target={self.balance_target_hours}h/lang -> "
+                f"per-lang target samples: {lang_target_samples}"
+            )
+
         return SourceRoundRobinInterleaver(
             language_sources=self.language_sources,
             source_managers=source_managers,
@@ -1082,6 +1160,7 @@ class S3MultiLangStreamingDataset(IterableDataset):
             balance_mode=self.balance_mode,
             lang_sample_counts=self._lang_sample_counts,
             source_sample_counts=self._source_sample_counts,
+            lang_target_samples=lang_target_samples,
             curriculum_buckets=self.curriculum_buckets,
         )
 
