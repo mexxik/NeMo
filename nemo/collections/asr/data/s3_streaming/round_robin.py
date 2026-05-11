@@ -390,6 +390,8 @@ class SourceRoundRobinInterleaver:
         """
         # Set worker-specific language offset (must be done in __iter__, not __init__)
         worker_info = torch.utils.data.get_worker_info()
+        num_workers = worker_info.num_workers if worker_info is not None else 1
+        num_workers = max(1, num_workers)
         if worker_info is not None and len(self.languages_order) > 1:
             self._current_lang_idx = worker_info.id % len(self.languages_order)
             if not _in_worker():
@@ -397,6 +399,16 @@ class SourceRoundRobinInterleaver:
                     f"Worker {worker_info.id} starting at language index {self._current_lang_idx} "
                     f"({self.languages_order[self._current_lang_idx]})"
                 )
+
+        # If a per-lang budget is in effect (modes: min, cap, max+target_hours),
+        # split it across workers so the cluster-wide hours-per-lang target is
+        # preserved instead of being multiplied by num_workers.
+        if num_workers > 1 and self._lang_budget:
+            for lang in self.languages_order:
+                if lang in self._lang_budget:
+                    self._lang_budget[lang] = max(
+                        1, self._lang_budget[lang] // num_workers
+                    )
 
         # Reset state for this epoch
         self._active_languages = set(self.languages_order)

@@ -1283,13 +1283,21 @@ class S3MultiLangStreamingDataset(IterableDataset):
         merge_buffer = MergeBuffer(self.audio_merger, self.merge_config)
 
         sample_idx = 0
-        # Per-rank quota: total samples_per_epoch is the cluster-wide budget,
-        # so each rank takes 1/world_size of it. Floor by 1 to never deadlock.
-        max_samples = max(1, self.samples_per_epoch // world_size)
-        if rank == 0 and worker_id == 0 and world_size > 1:
+        # Per-(rank, worker) quota: total samples_per_epoch is the cluster-wide
+        # budget. Each rank gets 1/world_size of it; within a rank, each of the
+        # `num_workers` DataLoader workers gets 1/num_workers of the rank's share.
+        # Without dividing by num_workers, every worker independently runs the
+        # full per-rank budget — `actual yield ≈ num_workers × samples_per_epoch`
+        # — which breaks Lightning's progress-bar `__len__` accounting and
+        # destroys ETA.
+        num_workers = worker_info.num_workers if worker_info is not None else 1
+        num_workers = max(1, num_workers)
+        max_samples = max(1, self.samples_per_epoch // (world_size * num_workers))
+        if rank == 0 and worker_id == 0:
             logging.info(
-                f"[DDP] Sharded streaming: {self.samples_per_epoch:,} total -> "
-                f"{max_samples:,} per rank ({world_size} ranks)"
+                f"Sharded streaming: {self.samples_per_epoch:,} total -> "
+                f"{max_samples:,} per (rank, worker) "
+                f"({world_size} ranks x {num_workers} workers)"
             )
 
         # Per-stage timing counters; only populated when DATASET_PROFILE=1.
