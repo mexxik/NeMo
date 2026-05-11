@@ -320,6 +320,13 @@ class SourceRoundRobinInterleaver:
                 )
                 self.balance_mode = "none"
 
+        # In "max" mode, an optional per-lang budget enforces an hours cap on
+        # top of the standard round-robin + source-restart behavior. Without
+        # it, "max" runs unbounded (epoch length governed by samples_per_epoch).
+        if balance_mode == "max" and lang_target_samples:
+            for lang in self.languages_order:
+                self._lang_budget[lang] = max(1, int(lang_target_samples.get(lang, 0)))
+
         # Curriculum bucketing: group sources by duration bucket, process sequentially
         self.curriculum_buckets = curriculum_buckets
         self._bucket_order: List[int] = []
@@ -508,7 +515,11 @@ class SourceRoundRobinInterleaver:
         Round-robin language selection (for "none" and "max" modes).
 
         "none": skip exhausted sources, remove exhausted languages.
-        "max": restart exhausted sources with cycle increment.
+        "max": restart exhausted sources with cycle increment. If a per-lang
+               budget was provided (via lang_target_samples), each lang is
+               removed from rotation once its yield reaches its budget — this
+               is what makes "max + balance_target_hours" enforce an actual
+               hours cap (not just an equal-samples split).
         """
         if not self._active_languages:
             return None
@@ -516,6 +527,7 @@ class SourceRoundRobinInterleaver:
         attempts = 0
         max_attempts = len(self.languages_order)
         restart_sources = (self.balance_mode == "max")
+        enforce_budget = bool(self._lang_budget) and self.balance_mode == "max"
 
         while attempts < max_attempts:
             lang = self.languages_order[self._current_lang_idx]
@@ -528,6 +540,10 @@ class SourceRoundRobinInterleaver:
             sample = self._get_sample_from_lang(lang, restart_sources=restart_sources)
             if sample is not None:
                 self._current_lang_idx = (self._current_lang_idx + 1) % len(self.languages_order)
+                if enforce_budget:
+                    self._lang_yielded[lang] += 1
+                    if self._lang_yielded[lang] >= self._lang_budget[lang]:
+                        self._active_languages.discard(lang)
                 return sample
 
             # All sources for this language exhausted

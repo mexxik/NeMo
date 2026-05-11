@@ -272,6 +272,12 @@ class S3MultiLangStreamingDataset(IterableDataset):
             raise ValueError(
                 "balance_mode='cap' requires balance_target_hours > 0 (hours per language per epoch)"
             )
+        if balance_target_hours is not None and balance_target_hours > 0 \
+                and balance_mode not in ("max", "cap"):
+            logging.warning(
+                f"balance_target_hours={balance_target_hours} is ignored for "
+                f"balance_mode='{balance_mode}'. Only 'max' and 'cap' modes use it."
+            )
         self.balance_mode = balance_mode
         self.balance_target_hours = balance_target_hours
 
@@ -735,16 +741,29 @@ class S3MultiLangStreamingDataset(IterableDataset):
             max_lang_hours = max(lang_hours.values())
             min_lang_samples = min(lang_samples.values()) if lang_samples else 0
 
+            # If balance_target_hours is set, use it as the per-lang target
+            # instead of max_lang_hours (works with "max" and "cap" modes).
+            effective_target_hours = (
+                self.balance_target_hours
+                if self.balance_target_hours and self.balance_mode in ("max", "cap")
+                else max_lang_hours
+            )
+
             # Calculate expected epoch samples based on balance mode
             if self.balance_mode == "max":
                 expected_epoch_samples = 0
                 for lang, hours in lang_hours.items():
-                    repeats = max_lang_hours / hours if hours > 0 else 0
-                    expected_epoch_samples += lang_samples[lang] * repeats
+                    ratio = effective_target_hours / hours if hours > 0 else 0
+                    expected_epoch_samples += lang_samples[lang] * ratio
             elif self.balance_mode == "min":
                 expected_epoch_samples = min_lang_samples * num_languages
             elif self.balance_mode == "distributed":
                 expected_epoch_samples = total_samples
+            elif self.balance_mode == "cap":
+                expected_epoch_samples = 0
+                for lang, hours in lang_hours.items():
+                    ratio = effective_target_hours / hours if hours > 0 else 0
+                    expected_epoch_samples += lang_samples[lang] * ratio
             else:
                 expected_epoch_samples = total_samples
 
@@ -754,11 +773,19 @@ class S3MultiLangStreamingDataset(IterableDataset):
             logging.info(f"Total data: {total_hours:.1f}h across {num_languages} languages ({total_samples:,} samples)")
 
             if self.balance_mode == "max":
-                logging.info(f"Target per language: {max_lang_hours:.1f}h (largest language)")
+                if self.balance_target_hours:
+                    logging.info(
+                        f"Target per language: {self.balance_target_hours:.1f}h "
+                        f"(custom cap; largest natural is {max_lang_hours:.1f}h)"
+                    )
+                else:
+                    logging.info(f"Target per language: {max_lang_hours:.1f}h (largest language)")
             elif self.balance_mode == "min":
                 logging.info(f"Target per language: {min_lang_samples:,} samples (smallest language)")
             elif self.balance_mode == "distributed":
                 logging.info(f"Proportional distribution: each language uses its own data, spread evenly")
+            elif self.balance_mode == "cap":
+                logging.info(f"Target per language: {self.balance_target_hours:.1f}h (cap)")
 
             logging.info("")
             logging.info(f"Expected epoch length: ~{int(expected_epoch_samples):,} samples")
@@ -781,11 +808,17 @@ class S3MultiLangStreamingDataset(IterableDataset):
                 pct = (hours / total_hours) * 100 if total_hours > 0 else 0
 
                 if self.balance_mode == "max":
-                    repeats = max_lang_hours / hours if hours > 0 else 0
-                    epoch_samples = int(samples * repeats)
+                    ratio = effective_target_hours / hours if hours > 0 else 0
+                    epoch_samples = int(samples * ratio)
+                    if ratio >= 1.05:
+                        tag = f"~{ratio:.1f}x repeat"
+                    elif ratio <= 0.95:
+                        tag = f"~{ratio*100:.1f}% subset"
+                    else:
+                        tag = "~1.0x"
                     logging.info(
                         f"  {lang:6s}: {hours:7.1f}h ({pct:5.1f}%) - {samples:>10,} samples - "
-                        f"~{repeats:.1f}x repeat (~{epoch_samples:,} per epoch)"
+                        f"{tag} (~{epoch_samples:,} per epoch)"
                     )
                 elif self.balance_mode == "min":
                     epoch_samples = min_lang_samples
@@ -797,6 +830,19 @@ class S3MultiLangStreamingDataset(IterableDataset):
                     logging.info(
                         f"  {lang:6s}: {hours:7.1f}h ({pct:5.1f}%) - {samples:>10,} samples - "
                         f"proportional"
+                    )
+                elif self.balance_mode == "cap":
+                    ratio = effective_target_hours / hours if hours > 0 else 0
+                    epoch_samples = int(samples * ratio)
+                    if ratio >= 1.05:
+                        tag = f"~{ratio:.1f}x repeat"
+                    elif ratio <= 0.95:
+                        tag = f"~{ratio*100:.1f}% subset"
+                    else:
+                        tag = "~1.0x"
+                    logging.info(
+                        f"  {lang:6s}: {hours:7.1f}h ({pct:5.1f}%) - {samples:>10,} samples - "
+                        f"{tag} (~{epoch_samples:,} per epoch)"
                     )
 
             logging.info("=" * 70)
@@ -838,9 +884,20 @@ class S3MultiLangStreamingDataset(IterableDataset):
             logging.info(f"Languages: {num_languages} | Total unique data: {total_hours:.1f}h")
             logging.info(f"Balance mode: {self.balance_mode}")
             if self.balance_mode == "max":
-                logging.info(f"Largest language: {max_lang} ({max_lang_hours:.1f}h)")
-                logging.info(f"Expected epoch: ~{max_lang_hours * num_languages:.1f}h "
-                             f"({num_languages} x {max_lang_hours:.1f}h)")
+                if self.balance_target_hours:
+                    cap = self.balance_target_hours
+                    logging.info(
+                        f"Per-language cap: {cap:.1f}h "
+                        f"(custom; largest natural is {max_lang} at {max_lang_hours:.1f}h)"
+                    )
+                    logging.info(
+                        f"Expected epoch: ~{cap * num_languages:.1f}h "
+                        f"({num_languages} x {cap:.1f}h)"
+                    )
+                else:
+                    logging.info(f"Largest language: {max_lang} ({max_lang_hours:.1f}h)")
+                    logging.info(f"Expected epoch: ~{max_lang_hours * num_languages:.1f}h "
+                                 f"({num_languages} x {max_lang_hours:.1f}h)")
             elif self.balance_mode == "cap" and self.balance_target_hours:
                 cap = self.balance_target_hours
                 logging.info(f"Per-language cap: {cap:.1f}h")
@@ -852,18 +909,19 @@ class S3MultiLangStreamingDataset(IterableDataset):
                 hours = lang_hours[lang]
                 samples = lang_samples[lang]
                 if self.balance_mode == "max" and max_lang_hours > 0:
-                    repeat = max_lang_hours / hours if hours > 0 else 0
-                    epoch_samples = int(samples * repeat)
-                    if repeat > 1.05:
-                        logging.info(
-                            f"  {lang}: {hours:.1f}h ({samples:,} samples) "
-                            f"-> {repeat:.1f}x repeat -> ~{epoch_samples:,} samples/epoch"
-                        )
+                    target = self.balance_target_hours or max_lang_hours
+                    ratio = target / hours if hours > 0 else 0
+                    epoch_samples = int(samples * ratio)
+                    if ratio > 1.05:
+                        tag = f"{ratio:.1f}x repeat (oversample)"
+                    elif ratio < 0.95:
+                        tag = f"{ratio*100:.1f}% subset (undersample)"
                     else:
-                        logging.info(
-                            f"  {lang}: {hours:.1f}h ({samples:,} samples) "
-                            f"-> 1.0x (largest)"
-                        )
+                        tag = "1.0x (at cap)" if self.balance_target_hours else "1.0x (largest)"
+                    logging.info(
+                        f"  {lang}: {hours:.1f}h ({samples:,} samples) "
+                        f"-> {tag} -> ~{epoch_samples:,} samples/epoch"
+                    )
                 elif self.balance_mode == "cap" and self.balance_target_hours and hours > 0:
                     ratio = self.balance_target_hours / hours
                     epoch_samples = int(samples * ratio)
@@ -1133,7 +1191,7 @@ class S3MultiLangStreamingDataset(IterableDataset):
                 source_managers[manager_key] = manager
 
         lang_target_samples = None
-        if self.balance_mode == "cap" and self.balance_target_hours and self._lang_sample_counts:
+        if self.balance_mode in ("cap", "max") and self.balance_target_hours and self._lang_sample_counts:
             # Compute per-lang target samples from target_hours * samples_per_hour.
             # `_lang_hours` is populated alongside `_lang_sample_counts` when the
             # cache is loaded; fall back to a heuristic if it's missing.
@@ -1148,7 +1206,7 @@ class S3MultiLangStreamingDataset(IterableDataset):
                     # No hours info — leave the natural count (no cap)
                     lang_target_samples[lang] = samples
             logging.info(
-                f"balance_mode='cap' target={self.balance_target_hours}h/lang -> "
+                f"balance_mode='{self.balance_mode}' target={self.balance_target_hours}h/lang -> "
                 f"per-lang target samples: {lang_target_samples}"
             )
 
