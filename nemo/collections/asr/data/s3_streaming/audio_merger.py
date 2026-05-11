@@ -129,17 +129,15 @@ class AudioMerger:
         if total_duration + min_silence > self.config.max_merged_duration:
             return False, "exceeds_max_duration"
 
-        # At least one sample should end with punctuation for meaningful EOU
-        has_punctuation = any(
-            self._ends_with_punctuation(s.get('text', ''))
-            for s in samples[:-1]  # Check all but last (last always gets EOU if punctuated)
-        )
-        # Actually, we want ALL samples to ideally end with punctuation
-        # But we can be flexible - at least require the first one.
+        # Every merged sample should end with terminal punctuation so that the
+        # downstream tokenizer can emit <eou> after each segment. Without this,
+        # the lang tag floats without an <eou> in front of it and the model
+        # learns an inconsistent end-of-utterance pattern.
         # In LID/code-switch mode this gate is disabled (require_punctuation=False).
         if self.config.require_punctuation:
-            if not self._ends_with_punctuation(samples[0].get('text', '')):
-                return False, "first_sample_no_punctuation"
+            for idx, s in enumerate(samples):
+                if not self._ends_with_punctuation(s.get('text', '')):
+                    return False, f"sample_{idx}_no_punctuation"
 
         return True, "ok"
 
@@ -159,7 +157,7 @@ class AudioMerger:
         if not can_merge:
             if reason == "exceeds_max_duration":
                 self._stats['skipped_duration'] += 1
-            elif reason == "first_sample_no_punctuation":
+            elif reason.endswith("_no_punctuation"):
                 self._stats['skipped_no_punctuation'] += 1
             return None
 

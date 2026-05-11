@@ -204,12 +204,17 @@ class S3MultiLangStreamingDataset(IterableDataset):
         curriculum_buckets: bool = False,
 
         # Language-ID training mode. When True, the label sequence for each
-        # utterance is `[<lang_id>] * num_words` (one lang token per word in the
-        # transcription, language-tag IDs from the SP vocab). EOU/EOT/BOS/EOS/
+        # utterance is built from per-word lang tokens. EOU/EOT/BOS/EOS/
         # text-normalization are skipped — they're irrelevant for LID. Combined
         # with merge_utterances + cross-language sample rotation, this produces
-        # code-switch training samples like `<en> <en> <en> <fr> <fr>`.
+        # code-switch training samples.
         lid_mode: bool = False,
+        # Label scheme for lid_mode:
+        #   "word"     -> `<lang>` × num_words   (token-per-word, current default)
+        #   "syllable" -> `<lang_S> <syl>×N <lang_E>` per word, N = syllable count
+        #                 from a vowel-group heuristic. Gives word boundaries +
+        #                 syllable-rate anchoring (useful for VAD + alignment).
+        lid_label_scheme: str = "word",
     ):
         """
         Initialize multi-language streaming dataset.
@@ -412,14 +417,17 @@ class S3MultiLangStreamingDataset(IterableDataset):
 
         # LID mode: force lang-token vocab lookup, disable text/normalization paths.
         self.lid_mode = bool(lid_mode)
+        self.lid_label_scheme = lid_label_scheme if lid_label_scheme in ("word", "syllable") else "word"
         if self.lid_mode:
             add_lang_token = True
             add_eou_token = False
             add_eot_token = False
             use_start_end_token = False
             normalize_text = "none"
-            logging.info("[DATASET_INIT] LID mode ENABLED: per-word lang-token labels, "
-                         "EOU/EOT/BOS/EOS/text-norm disabled")
+            logging.info(
+                "[DATASET_INIT] LID mode ENABLED: label_scheme=%s, EOU/EOT/BOS/EOS/text-norm disabled",
+                self.lid_label_scheme,
+            )
 
         # Per-language tag tokens. Looked up once from the SentencePiece vocab
         # so we can append the corresponding ID directly during tokenization
@@ -454,6 +462,41 @@ class S3MultiLangStreamingDataset(IterableDataset):
                         f"Lang token '{token_str}' not found in vocabulary — "
                         f"samples for lang='{lang}' will not be tagged"
                     )
+
+        # Syllable-scheme token IDs: per-language `<lang_S>`, `<lang_E>` plus
+        # a single generic `<syl>` marker.
+        self.lang_start_ids: Dict[str, int] = {}
+        self.lang_end_ids: Dict[str, int] = {}
+        self.syllable_token_id: Optional[int] = None
+        if self.lid_mode and self.lid_label_scheme == "syllable":
+            sp = tokenizer.tokenizer if hasattr(tokenizer, 'tokenizer') else None
+
+            def _lookup(piece_str):
+                if sp is not None and hasattr(sp, 'piece_to_id'):
+                    cand = sp.piece_to_id(piece_str)
+                    if cand != sp.unk_id():
+                        return cand
+                return None
+
+            self.syllable_token_id = _lookup("<syl>")
+            if self.syllable_token_id is None:
+                raise ValueError(
+                    "lid_label_scheme='syllable' requires the tokenizer to contain `<syl>`. "
+                    "Rebuild the tokenizer with --label-scheme syllable."
+                )
+            logging.info(f"Syllable token '<syl>' found at ID {self.syllable_token_id}")
+
+            for lang in language_sources.keys():
+                s_id = _lookup(f"<{lang}_S>")
+                e_id = _lookup(f"<{lang}_E>")
+                if s_id is None or e_id is None:
+                    raise ValueError(
+                        f"lid_label_scheme='syllable' requires `<{lang}_S>` and `<{lang}_E>` "
+                        f"in the tokenizer (got s_id={s_id}, e_id={e_id}). Rebuild the tokenizer."
+                    )
+                self.lang_start_ids[lang] = s_id
+                self.lang_end_ids[lang] = e_id
+                logging.info(f"Lang boundary tokens: <{lang}_S>={s_id}, <{lang}_E>={e_id}")
 
         # BOS/EOS tokens
         # NeMo uses -1 to indicate "no BOS/EOS", so we need to check for >= 0
@@ -1260,16 +1303,15 @@ class S3MultiLangStreamingDataset(IterableDataset):
                 segment_langs=sample.get('langs'),
             )
         elif self.lid_mode:
-            # LID mode (single utterance): emit `[<lang_id>] * num_words` —
-            # word count from whitespace split. No BOS/EOS/EOU/normalization.
+            # LID mode (single utterance). Scheme = "word" or "syllable" — both
+            # routed through `_build_lid_tokens`. No BOS/EOS/EOU/normalization.
             text = sample.get('text', '') or ''
             sample_lang = sample.get('lang')
-            lang_id = self.lang_token_ids.get(sample_lang) if sample_lang else None
-            if lang_id is None:
-                # Unknown language for this sample — skip rather than corrupt the batch.
+            if not sample_lang:
                 return None
-            num_words = max(1, len(text.split()))
-            tokens = [lang_id] * num_words
+            tokens = self._build_lid_tokens(text, sample_lang)
+            if tokens is None:
+                return None
         else:
             # Regular sample
             text = sample.get('text', '')
@@ -1280,6 +1322,13 @@ class S3MultiLangStreamingDataset(IterableDataset):
                 and self.eou_token_id is not None
                 and self.token_augmenter.should_add_eou(text)
             )
+
+            # If EOU mode is on, drop samples without terminal punctuation.
+            # They produce inconsistent label patterns (no <eou>, but lang tag
+            # may still follow) and dilute the meaning of <eou>. Allow them
+            # only when EOU is disabled entirely (full-norm training).
+            if self.add_eou_token and self.eou_token_id is not None and not should_add_eou:
+                return None
 
             # Normalize text if configured
             if self.normalize_text == "full":
@@ -1330,6 +1379,57 @@ class S3MultiLangStreamingDataset(IterableDataset):
         else:
             return audio_tensor, audio_len, tokens_tensor, tokens_len
 
+    # Vowel sets for the syllable-count heuristic. Union of Latin (with common
+    # diacritics) + Cyrillic vowels — works for all eu-23 languages.
+    _LID_VOWELS = set(
+        "aeiouy"
+        "äöüß"
+        "áéíóúýñ"
+        "àèìòùâêîôûãõçœæ"
+        "ąęųīē"
+        # Cyrillic (lowercase)
+        "аеиіоуюяїєё"
+    )
+
+    def _count_syllables(self, word: str) -> int:
+        """Approximate syllable count: number of contiguous vowel groups.
+        Returns at least 1 so consonant-only tokens (acronyms, interjections)
+        still get one `<syl>` marker."""
+        word = word.lower()
+        n, in_v = 0, False
+        for ch in word:
+            if ch in self._LID_VOWELS:
+                if not in_v:
+                    n += 1
+                in_v = True
+            else:
+                in_v = False
+        return max(1, n)
+
+    def _build_lid_tokens(self, text: str, lang: str) -> Optional[List[int]]:
+        """Return the LID label sequence for one utterance segment in `lang`.
+        Returns None if the language isn't in the vocab (sample will be skipped)."""
+        words = (text or "").split()
+        if self.lid_label_scheme == "word":
+            lang_id = self.lang_token_ids.get(lang)
+            if lang_id is None:
+                return None
+            return [lang_id] * max(1, len(words))
+        # syllable scheme
+        s_id = self.lang_start_ids.get(lang)
+        e_id = self.lang_end_ids.get(lang)
+        if s_id is None or e_id is None or self.syllable_token_id is None:
+            return None
+        out: List[int] = []
+        for w in words:
+            n = self._count_syllables(w)
+            out.append(s_id)
+            out.extend([self.syllable_token_id] * n)
+            out.append(e_id)
+        if not words:  # empty text guard — emit one bracket pair
+            out = [s_id, self.syllable_token_id, e_id]
+        return out
+
     def _tokenize_merged(
         self,
         texts: List[str],
@@ -1360,16 +1460,17 @@ class S3MultiLangStreamingDataset(IterableDataset):
         Returns:
             Combined token list with special tokens inserted appropriately
         """
-        # LID mode: emit per-segment lang tokens, one per word. No BOS/EOS/EOU/EOT.
+        # LID mode: emit per-segment lang tokens (word or syllable scheme).
+        # No BOS/EOS/EOU/EOT.
         if self.lid_mode:
             tokens: List[int] = []
             langs = segment_langs if segment_langs is not None else [sample_lang] * len(texts)
             for txt, lang in zip(texts, langs):
-                lang_id = self.lang_token_ids.get(lang) if lang else None
-                if lang_id is None:
+                if not lang:
                     continue
-                num_words = max(1, len((txt or '').split()))
-                tokens.extend([lang_id] * num_words)
+                seg = self._build_lid_tokens(txt or "", lang)
+                if seg is not None:
+                    tokens.extend(seg)
             return tokens
 
         tokens = []
@@ -1404,15 +1505,24 @@ class S3MultiLangStreamingDataset(IterableDataset):
                 # EOT mode: every segment is a turn, append EOT after each
                 tokens.append(self.eot_token_id)
             elif self.add_eou_token and self.eou_token_id is not None and i in eou_positions:
-                # EOU mode: append EOU after segments with sentence-ending punctuation
+                # EOU mode: append EOU after segments with sentence-ending
+                # punctuation. Non-punctuated segments shouldn't reach here —
+                # the merger now requires every merged sample to end with
+                # terminal punctuation. The check is kept defensive.
                 tokens.append(self.eou_token_id)
 
             # Append per-segment lang tag immediately after this segment's
             # boundary marker. Code-switch friendly: cross-lang merges produce
             # labels like  "<text_en> <eou> <en> <text_fr> <eou> <fr>" and the
             # inference layer can read each tag at every <eou> to know which
-            # language the just-completed utterance was.
-            if emit_lang_tags:
+            # language the just-completed utterance was. Only emit when the
+            # segment actually got a boundary marker — otherwise the lang
+            # token would float without an <eou> in front of it.
+            seg_got_boundary = (
+                (self.add_eot_token and self.eot_token_id is not None)
+                or (self.add_eou_token and self.eou_token_id is not None and i in eou_positions)
+            )
+            if emit_lang_tags and seg_got_boundary:
                 seg_lang = segment_langs[i] if i < len(segment_langs) else None
                 lang_id = self.lang_token_ids.get(seg_lang) if seg_lang else None
                 if lang_id is not None:
