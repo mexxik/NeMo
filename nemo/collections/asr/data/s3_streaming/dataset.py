@@ -1378,6 +1378,17 @@ class S3MultiLangStreamingDataset(IterableDataset):
         if self.bos_id is not None:
             tokens.append(self.bos_id)
 
+        # Decide once per sample whether to emit lang tokens at all (consistency
+        # across segments — partial tagging would teach the model an ambiguous
+        # signal). If we do tag, we emit one per segment using segment_langs.
+        emit_lang_tags = (
+            self.add_lang_token
+            and self.lang_token_ids
+            and (self.lang_token_prob >= 1.0 or random.random() < self.lang_token_prob)
+        )
+        if emit_lang_tags and segment_langs is None:
+            segment_langs = [sample_lang] * len(texts)
+
         for i, text in enumerate(texts):
             # Normalize text if configured
             if self.normalize_text == "full":
@@ -1396,15 +1407,16 @@ class S3MultiLangStreamingDataset(IterableDataset):
                 # EOU mode: append EOU after segments with sentence-ending punctuation
                 tokens.append(self.eou_token_id)
 
-        # Append per-utterance lang tag once at the end of the merged turn.
-        # (Merge is currently same-lang only; if cross-lang merging is ever
-        # added, switch to a per-segment tag inside the loop above.)
-        if self.add_lang_token and self.lang_token_ids:
-            lang_id = self.lang_token_ids.get(sample_lang) if sample_lang else None
-            if lang_id is not None and (
-                self.lang_token_prob >= 1.0 or random.random() < self.lang_token_prob
-            ):
-                tokens.append(lang_id)
+            # Append per-segment lang tag immediately after this segment's
+            # boundary marker. Code-switch friendly: cross-lang merges produce
+            # labels like  "<text_en> <eou> <en> <text_fr> <eou> <fr>" and the
+            # inference layer can read each tag at every <eou> to know which
+            # language the just-completed utterance was.
+            if emit_lang_tags:
+                seg_lang = segment_langs[i] if i < len(segment_langs) else None
+                lang_id = self.lang_token_ids.get(seg_lang) if seg_lang else None
+                if lang_id is not None:
+                    tokens.append(lang_id)
 
         # Add EOS token if configured (only at the very end)
         if self.eos_id is not None:
