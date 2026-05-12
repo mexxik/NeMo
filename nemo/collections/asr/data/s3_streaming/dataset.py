@@ -152,6 +152,12 @@ class S3MultiLangStreamingDataset(IterableDataset):
         # output reliably; <1.0 = sometimes, model handles tagged + untagged).
         add_lang_token: bool = False,
         lang_token_prob: float = 1.0,
+        # Additionally inject the lang tag mid-text, immediately after the N-th
+        # word (0 = disabled; only emit at end of utterance).  Trains the model
+        # to commit to a language as early as ~2 spoken words instead of waiting
+        # for <eou>. Has no effect unless add_lang_token is also True, and only
+        # fires for samples/segments whose word count exceeds N.
+        early_lang_token_after_word: int = 0,
 
         # Text normalization: "none", "full" (lowercase + remove all punctuation), "soft" (keep casing + keep only . , ! ?)
         normalize_text = "none",
@@ -452,6 +458,7 @@ class S3MultiLangStreamingDataset(IterableDataset):
         # (SentencePiece doesn't tokenize USER_DEFINED tokens during encoding).
         self.add_lang_token = add_lang_token
         self.lang_token_prob = float(lang_token_prob)
+        self.early_lang_token_after_word = max(0, int(early_lang_token_after_word))
         self.lang_token_ids: Dict[str, int] = {}
         if add_lang_token:
             sp = tokenizer.tokenizer if hasattr(tokenizer, 'tokenizer') else None
@@ -1403,6 +1410,47 @@ class S3MultiLangStreamingDataset(IterableDataset):
                 yield result
                 sample_idx += 1
 
+    def _maybe_inject_early_lang(
+        self,
+        ids: List[int],
+        lang_id: Optional[int],
+        after_word: int,
+    ) -> List[int]:
+        """
+        Splice a `<lang>` token into a token sequence after the N-th word.
+
+        Args:
+            ids:       Token IDs produced by `tokenizer.text_to_ids(text)` for
+                       a single text span (one utterance / one merged segment).
+            lang_id:   The lang token to insert. If None, nothing is inserted.
+            after_word: 1-based word index after which to insert. 0 disables.
+
+        Returns:
+            New token list with the lang ID inserted, or the original list
+            unchanged if there are not enough words (must have > after_word).
+
+        Word boundaries are detected via the SentencePiece word-start convention:
+        position 0 is always a word start, plus every piece whose string begins
+        with U+2581 (the ▁ space marker). Holds for SP models built with
+        `add_dummy_prefix=False`, which is what this codebase uses.
+        """
+        if after_word <= 0 or lang_id is None or not ids:
+            return ids
+        try:
+            pieces = self.tokenizer.ids_to_tokens(ids)
+        except Exception:
+            return ids
+        word_starts = [
+            i for i, p in enumerate(pieces)
+            if i == 0 or (isinstance(p, str) and p.startswith('▁'))
+        ]
+        # Total words = number of word-start positions. Need strictly more
+        # words than `after_word` so that an N+1-th word actually exists.
+        if len(word_starts) <= after_word:
+            return ids
+        insert_pos = word_starts[after_word]
+        return ids[:insert_pos] + [lang_id] + ids[insert_pos:]
+
     def _process_sample(self, sample: dict, sample_idx: int) -> Optional[Tuple]:
         """
         Process a sample into training tensors.
@@ -1483,6 +1531,22 @@ class S3MultiLangStreamingDataset(IterableDataset):
 
             # Tokenize text (without <eou> - we'll append the ID directly)
             tokens = self.tokenizer.text_to_ids(text)
+
+            # Optional: inject a lang tag mid-text after the N-th word so the
+            # model learns to commit to a language early (before <eou>).
+            # Only active when add_lang_token=True AND text has > N words.
+            if (
+                self.early_lang_token_after_word > 0
+                and self.add_lang_token
+                and self.lang_token_ids
+            ):
+                sample_lang = sample.get('lang')
+                early_lang_id = (
+                    self.lang_token_ids.get(sample_lang) if sample_lang else None
+                )
+                tokens = self._maybe_inject_early_lang(
+                    tokens, early_lang_id, self.early_lang_token_after_word
+                )
 
             # Add BOS token if configured
             if self.bos_id is not None:
@@ -1644,6 +1708,23 @@ class S3MultiLangStreamingDataset(IterableDataset):
 
             # Tokenize this segment
             segment_tokens = self.tokenizer.text_to_ids(text)
+
+            # Optional: inject this segment's lang tag mid-text, after the
+            # N-th word. Gated by the same condition as end-of-segment lang
+            # tagging (emit_lang_tags) so per-sample randomization stays
+            # consistent within the same merged sample.
+            if emit_lang_tags and self.early_lang_token_after_word > 0:
+                seg_lang_for_early = (
+                    segment_langs[i] if i < len(segment_langs) else sample_lang
+                )
+                early_lang_id = (
+                    self.lang_token_ids.get(seg_lang_for_early)
+                    if seg_lang_for_early else None
+                )
+                segment_tokens = self._maybe_inject_early_lang(
+                    segment_tokens, early_lang_id, self.early_lang_token_after_word
+                )
+
             tokens.extend(segment_tokens)
 
             if self.add_eot_token and self.eot_token_id is not None:
