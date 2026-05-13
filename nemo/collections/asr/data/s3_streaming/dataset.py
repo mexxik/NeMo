@@ -580,6 +580,7 @@ class S3MultiLangStreamingDataset(IterableDataset):
             silence_max_sec=merge_silence_max,
             max_merged_duration=merge_max_duration,
             require_punctuation=not self.lid_mode,
+            require_starts_capital=not self.lid_mode,
         )
         self.audio_merger = AudioMerger(self.merge_config, sample_rate=sample_rate)
 
@@ -1437,6 +1438,16 @@ class S3MultiLangStreamingDataset(IterableDataset):
                 yield result
                 sample_idx += 1
 
+    @staticmethod
+    def _starts_with_capital(text: str) -> bool:
+        """Whether the first alphabetical character in `text` is uppercase.
+        Skips leading non-letter characters (quotes, digits, etc.) so
+        '« Bonjour »' and '42 Is the answer' both pass."""
+        for ch in text or '':
+            if ch.isalpha():
+                return ch.isupper()
+        return False
+
     def _maybe_inject_early_lang(
         self,
         ids: List[int],
@@ -1549,6 +1560,15 @@ class S3MultiLangStreamingDataset(IterableDataset):
             # only when EOU is disabled entirely (full-norm training).
             if self.add_eou_token and self.eou_token_id is not None and not should_add_eou:
                 return None
+
+            # Same gating: drop samples that don't start with a capital letter.
+            # These are mid-sentence fragments that pollute merged outputs with
+            # things like "...<eou>imitando um sinal..." (lowercase mid-segment).
+            # Paired with the punct check, this ensures every single sample
+            # (and every merge candidate) is a complete sentence.
+            if self.add_eou_token and self.eou_token_id is not None:
+                if not self._starts_with_capital(text):
+                    return None
 
             # Normalize text if configured
             if self.normalize_text == "full":

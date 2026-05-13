@@ -33,6 +33,11 @@ class MergeConfig:
     # gate. EOU isn't being learned here, so punctuation is irrelevant; we want
     # to merge regardless so cross-language concatenations get produced.
     require_punctuation: bool = True
+    # Require every merged segment to START with an uppercase letter so we
+    # don't glue together mid-sentence fragments (e.g. "e depois..." +
+    # "imitando..."). Together with require_punctuation this guarantees each
+    # segment is a complete sentence in soft/cased training.
+    require_starts_capital: bool = True
 
 
 class AudioMerger:
@@ -64,6 +69,7 @@ class AudioMerger:
             'merged': 0,
             'skipped_duration': 0,
             'skipped_no_punctuation': 0,
+            'skipped_no_capital': 0,
         }
 
     def should_merge(self) -> bool:
@@ -107,6 +113,15 @@ class AudioMerger:
             return False
         return text[-1] in SENTENCE_ENDINGS
 
+    @staticmethod
+    def _starts_with_capital(text: str) -> bool:
+        """Whether the first alphabetical character is uppercase.
+        Skips leading non-letter characters (quotes, digits, etc.)."""
+        for ch in text or '':
+            if ch.isalpha():
+                return ch.isupper()
+        return False
+
     def can_merge(self, samples: List[dict]) -> Tuple[bool, str]:
         """
         Check if samples can be merged.
@@ -139,6 +154,14 @@ class AudioMerger:
                 if not self._ends_with_punctuation(s.get('text', '')):
                     return False, f"sample_{idx}_no_punctuation"
 
+        # Every merged segment should also START with a capital letter — these
+        # are full sentences, not mid-sentence fragments. Pairs with the
+        # punctuation gate above.
+        if self.config.require_starts_capital:
+            for idx, s in enumerate(samples):
+                if not self._starts_with_capital(s.get('text', '')):
+                    return False, f"sample_{idx}_no_capital"
+
         return True, "ok"
 
     def merge(self, samples: List[dict]) -> Optional[dict]:
@@ -159,6 +182,8 @@ class AudioMerger:
                 self._stats['skipped_duration'] += 1
             elif reason.endswith("_no_punctuation"):
                 self._stats['skipped_no_punctuation'] += 1
+            elif reason.endswith("_no_capital"):
+                self._stats['skipped_no_capital'] += 1
             return None
 
         # Build merged audio and text
@@ -244,7 +269,8 @@ class AudioMerger:
 
         logging.info(f"AudioMerger stats: {merged}/{total} merged ({merge_rate:.1f}%)")
         logging.info(f"  Skipped (duration too long): {self._stats['skipped_duration']}")
-        logging.info(f"  Skipped (first sample no punctuation): {self._stats['skipped_no_punctuation']}")
+        logging.info(f"  Skipped (segment no terminal punct): {self._stats['skipped_no_punctuation']}")
+        logging.info(f"  Skipped (segment no leading capital): {self._stats['skipped_no_capital']}")
         logging.info(f"  Config: enabled={self.config.enabled}, probability={self.config.merge_probability}")
 
 
