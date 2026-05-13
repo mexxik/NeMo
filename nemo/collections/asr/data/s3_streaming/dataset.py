@@ -5,6 +5,7 @@ Main dataset class that integrates all streaming components.
 Supports both S3 and local disk storage.
 """
 
+import multiprocessing as mp
 import os
 import random
 import re
@@ -581,6 +582,14 @@ class S3MultiLangStreamingDataset(IterableDataset):
             require_punctuation=not self.lid_mode,
         )
         self.audio_merger = AudioMerger(self.merge_config, sample_rate=sample_rate)
+
+        # Shared counter of raw inputs pulled from the interleaver this epoch.
+        # Workers (DataLoader fork) atomically bump it; the main process resets
+        # it per epoch and reads it from SampleProgressBar. With merging on,
+        # multiple raw inputs collapse into one yielded sample, so counting
+        # yielded samples undercounts progress; this counter matches
+        # samples_per_epoch exactly when the interleaver is drained.
+        self._raw_consumed = mp.Value('q', 0)
 
         # Track whether samples_per_epoch was explicitly provided by user
         self._explicit_samples_per_epoch = samples_per_epoch is not None
@@ -1357,6 +1366,11 @@ class S3MultiLangStreamingDataset(IterableDataset):
         # Stream samples through interleaver and shuffle buffer
         _last_yield_resume = _time.perf_counter() if _PROF else 0.0
         _interleaver_iter = iter(interleaver)
+        # Batch raw-input counter flushes to keep mp.Value lock off the hot
+        # path. The progress bar can lag by up to _RAW_FLUSH_EVERY samples per
+        # worker — invisible at the scale of a multi-hundred-k epoch.
+        _local_raw = 0
+        _RAW_FLUSH_EVERY = 64
         while True:
             if _PROF:
                 _t = _time.perf_counter()
@@ -1366,6 +1380,12 @@ class S3MultiLangStreamingDataset(IterableDataset):
                 break
             if _PROF:
                 _ds_t_fetch += _time.perf_counter() - _t
+
+            _local_raw += 1
+            if _local_raw >= _RAW_FLUSH_EVERY:
+                with self._raw_consumed.get_lock():
+                    self._raw_consumed.value += _local_raw
+                _local_raw = 0
 
             if sample_idx >= max_samples:
                 break
@@ -1392,6 +1412,13 @@ class S3MultiLangStreamingDataset(IterableDataset):
                                 _ds_n = 0
                         if sample_idx >= max_samples:
                             break
+
+        # Flush any unflushed raw-input increments so the progress bar lands
+        # at exactly the interleaver budget at epoch end.
+        if _local_raw > 0:
+            with self._raw_consumed.get_lock():
+                self._raw_consumed.value += _local_raw
+            _local_raw = 0
 
         # Drain remaining samples from shuffle buffer
         for buffered_sample in shuffle_buffer.drain():
