@@ -54,6 +54,7 @@ from nemo.collections.common.data.lhotse.sampling import (
     TokenCountFilter,
     TokenPerSecondFilter,
     TokenPerTokenFilter,
+    UnknownTokenFilter,
     ValidationStatusFilter,
 )
 from nemo.collections.common.data.prompt_fn import apply_prompt_format_fn
@@ -113,6 +114,9 @@ class LhotseDataLoadingConfig:
     # 2.1 Multimodal sampling override options
     pretokenize: bool = True  # should we apply tokenizer before data sampling
     prompt_format: str | None = None  # when provided, we'll apply the prompt in addition to the tokenizer
+    # When True, drop any cut whose pretokenized supervision contains an <unk>
+    # token. Requires pretokenize=True (otherwise no-op).
+    skip_unk_tokens: bool = True
     use_multimodal_sampling: bool = False
     audio_locator_tag: str | None = None  # global audio placeholder token, propagates to datasets in input_cfg
     token_equivalent_duration: float | None = None
@@ -569,6 +573,16 @@ def get_lhotse_sampler_from_config(config, global_rank, world_size, tokenizer=No
     if tokenizer is not None and config.pretokenize:
         cuts = cuts.filter(TokenPerSecondFilter(config.min_tps, config.max_tps))
         cuts = cuts.filter(TokenPerTokenFilter(config.min_tpt, config.max_tpt))
+        if config.skip_unk_tokens:
+            unk_id = _resolve_unk_id(tokenizer)
+            if unk_id is not None:
+                logging.info(f"Enabling UnknownTokenFilter with unk_id={unk_id}")
+                cuts = cuts.filter(UnknownTokenFilter(unk_id))
+            else:
+                logging.warning(
+                    "skip_unk_tokens=True but could not resolve unk_id from the "
+                    "tokenizer; UNK-bearing samples will NOT be filtered."
+                )
 
     # Select the strategy customizing Lhotse sampler behaviour.
     # Provides support for dynamic batch sizes, multimodal dataloading, 2D bucketing, etc.
@@ -778,6 +792,43 @@ def make_structured_with_schema_warnings(config: Union[DictConfig, dict]) -> Dic
         )
 
     return config
+
+
+def _resolve_unk_id(tokenizer) -> int | None:
+    """
+    Best-effort extraction of the <unk> token id from a (possibly wrapped)
+    tokenizer. Returns None if no UNK id can be determined.
+
+    Supports SentencePieceTokenizer (exposes a property `unk_id`) and
+    AggregateTokenizer (per-language sub-tokenizers; we use the first
+    sub-tokenizer's unk_id assuming a shared id across languages, which is
+    the common NeMo convention).
+    """
+    tok = tokenizer._tokenizer if isinstance(tokenizer, TokenizerWrapper) else tokenizer
+
+    # AggregateTokenizer: probe its sub-tokenizers; all sub-tokenizers in NeMo
+    # are typically built with the same special-token IDs.
+    if hasattr(tok, "tokenizers_dict"):
+        for sub in tok.tokenizers_dict.values():
+            uid = getattr(sub, "unk_id", None)
+            if callable(uid):
+                try:
+                    return int(uid())
+                except Exception:
+                    continue
+            if uid is not None:
+                return int(uid)
+        return None
+
+    uid = getattr(tok, "unk_id", None)
+    if callable(uid):
+        try:
+            return int(uid())
+        except Exception:
+            return None
+    if uid is not None:
+        return int(uid)
+    return None
 
 
 def tokenize(example, tokenizer):

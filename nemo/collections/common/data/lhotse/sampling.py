@@ -414,6 +414,29 @@ class TokenPerTokenFilter:
         return self.tpt_min <= tpt <= self.tpt_max
 
 
+class UnknownTokenFilter:
+    """
+    Callable, returns ``False`` if any supervision in the cut has a pretokenized
+    ``tokens`` array containing ``unk_id``. Pass-through when disabled or when
+    ``tokens`` are not present on supervisions (e.g. pretokenize=False).
+    """
+
+    def __init__(self, unk_id: int | None) -> None:
+        self.unk_id = unk_id
+        self.enabled = unk_id is not None and unk_id >= 0
+
+    def __call__(self, example) -> bool:
+        if not isinstance(example, Cut) or not self.enabled:
+            return True
+        for s in example.supervisions:
+            toks = getattr(s, "tokens", None)
+            if toks is None:
+                continue
+            if (toks == self.unk_id).any():
+                return False
+        return True
+
+
 class BucketingFilter:
     """
     Filters out examples that did not fit into any of the buckets.
