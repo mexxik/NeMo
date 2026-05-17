@@ -384,6 +384,25 @@ class S3MultiLangStreamingDataset(IterableDataset):
         if normalize_text != "none":
             logging.info(f"Text normalization: {normalize_text}")
 
+        # Resolve the tokenizer's <unk> id. With byte_fallback enabled the
+        # encoder *should* fall back to UTF-8 bytes for unseen chars, so an
+        # <unk> in the encoded sequence means some character even byte fallback
+        # couldn't handle. Training on UNKs gives the model no signal (the
+        # acoustic frame has no consistent referent), so we drop such samples
+        # in _process_sample below. None means we can't detect → no filter.
+        self._unk_id = None
+        if hasattr(tokenizer, 'tokenizer') and hasattr(tokenizer.tokenizer, 'unk_id'):
+            try:
+                _uid = int(tokenizer.tokenizer.unk_id())
+                if _uid >= 0:
+                    self._unk_id = _uid
+                    logging.info(
+                        f"Tokenizer <unk> id = {self._unk_id} "
+                        f"(samples that tokenize to any UNK will be dropped)"
+                    )
+            except Exception as e:
+                logging.warning(f"Could not resolve tokenizer unk_id: {e}")
+
         # Get EOU token ID from vocabulary (for direct ID appending)
         # SentencePiece doesn't recognize USER_DEFINED tokens during encoding,
         # so we must append the token ID directly after tokenization
@@ -1364,13 +1383,23 @@ class S3MultiLangStreamingDataset(IterableDataset):
                     return result
             return None
 
-        # Stream samples through interleaver and shuffle buffer
+        # Stream samples through interleaver and shuffle buffer.
+        #
+        # Per-worker budget gate: break on raw inputs *pulled*, not yielded.
+        # When the interleaver has no per-worker budget split (balance_mode in
+        # {"none","distributed"}), each worker independently sees the full
+        # corpus. Combined with merging — where yielded ≪ pulled — a yielded-
+        # count gate would let cluster raw consumption balloon to ~num_workers
+        # × samples_per_epoch, blowing past the progress bar's total and
+        # flipping tqdm into "?" mode. Gating on raw pulls keeps cluster
+        # consumption = samples_per_epoch exactly, so the bar reaches 100%
+        # right at epoch end and each raw sample is seen ~once per epoch.
         _last_yield_resume = _time.perf_counter() if _PROF else 0.0
         _interleaver_iter = iter(interleaver)
-        # Batch raw-input counter flushes to keep mp.Value lock off the hot
-        # path. The progress bar can lag by up to _RAW_FLUSH_EVERY samples per
-        # worker — invisible at the scale of a multi-hundred-k epoch.
-        _local_raw = 0
+        # _raw_pulled: per-worker cumulative count (gate); _unflushed: delta
+        # batched up to keep the shared mp.Value lock off the hot path.
+        _raw_pulled = 0
+        _unflushed = 0
         _RAW_FLUSH_EVERY = 64
         while True:
             if _PROF:
@@ -1382,13 +1411,14 @@ class S3MultiLangStreamingDataset(IterableDataset):
             if _PROF:
                 _ds_t_fetch += _time.perf_counter() - _t
 
-            _local_raw += 1
-            if _local_raw >= _RAW_FLUSH_EVERY:
+            _raw_pulled += 1
+            _unflushed += 1
+            if _unflushed >= _RAW_FLUSH_EVERY:
                 with self._raw_consumed.get_lock():
-                    self._raw_consumed.value += _local_raw
-                _local_raw = 0
+                    self._raw_consumed.value += _unflushed
+                _unflushed = 0
 
-            if sample_idx >= max_samples:
+            if _raw_pulled >= max_samples:
                 break
 
             shuffle_buffer.add(sample)
@@ -1416,10 +1446,10 @@ class S3MultiLangStreamingDataset(IterableDataset):
 
         # Flush any unflushed raw-input increments so the progress bar lands
         # at exactly the interleaver budget at epoch end.
-        if _local_raw > 0:
+        if _unflushed > 0:
             with self._raw_consumed.get_lock():
-                self._raw_consumed.value += _local_raw
-            _local_raw = 0
+                self._raw_consumed.value += _unflushed
+            _unflushed = 0
 
         # Drain remaining samples from shuffle buffer
         for buffered_sample in shuffle_buffer.drain():
@@ -1625,6 +1655,11 @@ class S3MultiLangStreamingDataset(IterableDataset):
         # threads-per-block; CUDA hard-caps this at 1024.  Skip samples that
         # would breach the limit (typically corrupted data).
         if len(tokens) > 1023:
+            return None
+
+        # Drop samples whose tokenization contains <unk>. They surface in WER
+        # logs as "⁇" and the model has no acoustic signal for them.
+        if self._unk_id is not None and self._unk_id in tokens:
             return None
 
         tokens_tensor = torch.tensor(tokens).long()
