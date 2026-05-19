@@ -1401,6 +1401,16 @@ class S3MultiLangStreamingDataset(IterableDataset):
         _raw_pulled = 0
         _unflushed = 0
         _RAW_FLUSH_EVERY = 64
+        # Reserve budget for the drain phase after the main loop ends. Each
+        # worker has up to shuffle_buffer_size samples buffered plus a small
+        # merge_buffer; those produce more yielded batches after the gate
+        # fires but don't increment the raw-pull counter. Without this
+        # reserve, the progress bar reaches 100% at raw-pull exhaustion and
+        # then sits there for ~10-15 seconds while drains finish. By
+        # ending the main loop a bit early and counting drain yields, the
+        # bar hits 100% at actual epoch end.
+        _drain_reserve = self.shuffle_buffer_size + self.merge_config.max_utterances * 2
+        _main_budget = max(1, max_samples - _drain_reserve)
         while True:
             if _PROF:
                 _t = _time.perf_counter()
@@ -1418,7 +1428,7 @@ class S3MultiLangStreamingDataset(IterableDataset):
                     self._raw_consumed.value += _unflushed
                 _unflushed = 0
 
-            if _raw_pulled >= max_samples:
+            if _raw_pulled >= _main_budget:
                 break
 
             shuffle_buffer.add(sample)
@@ -1451,12 +1461,17 @@ class S3MultiLangStreamingDataset(IterableDataset):
                 self._raw_consumed.value += _unflushed
             _unflushed = 0
 
-        # Drain remaining samples from shuffle buffer
+        # Drain remaining samples from shuffle buffer. These were already
+        # pulled (and counted) but bumping the counter again here lets the
+        # progress bar advance through the drain phase — the gate above
+        # reserved `_drain_reserve` budget for exactly this.
         for buffered_sample in shuffle_buffer.drain():
             if sample_idx >= max_samples:
                 break
             result = process_and_yield(buffered_sample)
             if result is not None:
+                with self._raw_consumed.get_lock():
+                    self._raw_consumed.value += 1
                 yield result
 
         # Drain remaining samples from merge buffer
@@ -1465,6 +1480,8 @@ class S3MultiLangStreamingDataset(IterableDataset):
                 break
             result = self._process_sample(remaining_sample, sample_idx)
             if result is not None:
+                with self._raw_consumed.get_lock():
+                    self._raw_consumed.value += 1
                 yield result
                 sample_idx += 1
 
