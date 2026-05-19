@@ -46,6 +46,9 @@ class LanguageSourceManager:
         s3_endpoint_url: str = None,
         # Disk config
         data_root: str = None,
+        # Layout: if True, sources resolve to <data_root>/<lang>/<source>
+        # instead of the flat <data_root>/<source>.
+        lang_subdir: bool = False,
         # Common
         prefetch_buffer_size: int = 0,  # Disabled for true sequential streaming
         # SQLite manifest cache (memory optimization)
@@ -64,6 +67,8 @@ class LanguageSourceManager:
             s3_prefix: S3 prefix (e.g., "asr-data/")
             s3_endpoint_url: S3 endpoint URL (for R2, MinIO, etc.)
             data_root: Root directory for data (required for disk)
+            lang_subdir: If True, sources live under <data_root>/<lang>/<source>
+                (per-language subdirectories). If False, flat <data_root>/<source>.
             prefetch_buffer_size: Number of samples to prefetch (0 to disable)
         """
         self.lang = lang
@@ -72,6 +77,7 @@ class LanguageSourceManager:
         self.token_augmenter = token_augmenter
         self.prefetch_buffer_size = prefetch_buffer_size
         self.storage_type = storage_type
+        self.lang_subdir = bool(lang_subdir)
 
         # Storage-specific setup
         if storage_type == "s3":
@@ -209,7 +215,10 @@ class LanguageSourceManager:
 
     def _init_disk_source(self, source: str, verbose: bool = True):
         """Initialize a source from local disk."""
-        source_dir = os.path.join(self.data_root, source)
+        if self.lang_subdir:
+            source_dir = os.path.join(self.data_root, self.lang, source)
+        else:
+            source_dir = os.path.join(self.data_root, source)
 
         if not os.path.isdir(source_dir):
             logging.warning(f"[{self.lang}] Source directory not found: {source_dir}")
@@ -493,6 +502,9 @@ class SingleSourceManager:
         s3_endpoint_url: str = None,
         # Disk config
         data_root: str = None,
+        # Layout: if True, source resolves to <data_root>/<lang>/<source>
+        # instead of the flat <data_root>/<source>.
+        lang_subdir: bool = False,
         # Common
         prefetch_buffer_size: int = 0,  # Disabled for true sequential streaming
         # SQLite manifest cache
@@ -511,6 +523,8 @@ class SingleSourceManager:
             s3_prefix: S3 prefix
             s3_endpoint_url: S3 endpoint URL (for R2, MinIO, etc.)
             data_root: Root directory for data (required for disk)
+            lang_subdir: If True, source lives at <data_root>/<lang>/<source>
+                (per-language subdirectories). If False, flat <data_root>/<source>.
             prefetch_buffer_size: Number of samples to prefetch
             sqlite_cache_path: Path to SQLite manifest cache
         """
@@ -520,6 +534,7 @@ class SingleSourceManager:
         self.token_augmenter = token_augmenter
         self.prefetch_buffer_size = prefetch_buffer_size
         self.storage_type = storage_type
+        self.lang_subdir = bool(lang_subdir)
 
         # Storage-specific setup
         if storage_type == "s3":
@@ -676,7 +691,10 @@ class SingleSourceManager:
 
     def _init_disk_source(self, verbose: bool = True):
         """Initialize source from local disk."""
-        source_dir = os.path.join(self.data_root, self.source)
+        if self.lang_subdir:
+            source_dir = os.path.join(self.data_root, self.lang, self.source)
+        else:
+            source_dir = os.path.join(self.data_root, self.source)
 
         if not os.path.isdir(source_dir):
             logging.warning(f"[{self.lang}:{self.source}] Directory not found: {source_dir}")

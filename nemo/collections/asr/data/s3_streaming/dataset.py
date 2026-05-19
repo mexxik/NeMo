@@ -127,6 +127,10 @@ class S3MultiLangStreamingDataset(IterableDataset):
         aws_region: str = "us-east-1",
         # Disk config
         data_root: str = None,  # Local path like "/media/storage/asr-data"
+        # Layout: if True, sources resolve to <data_root>/<lang>/<source>
+        # instead of the flat <data_root>/<source>. Applies to both disk
+        # paths and (for s3) the <s3_prefix><lang>/<source>/ key prefix.
+        lang_subdir: bool = False,
 
         # Language config
         language_sources: Dict[str, List[str]] = None,
@@ -344,6 +348,9 @@ class S3MultiLangStreamingDataset(IterableDataset):
             raise ValueError("Either s3_bucket or data_root must be provided")
 
         self.aws_region = aws_region
+        self.lang_subdir = bool(lang_subdir)
+        if self.lang_subdir:
+            logging.info("[DATASET_INIT] lang_subdir=True (sources resolve to <root>/<lang>/<source>)")
         self.language_sources = language_sources
         self.tokenizer = tokenizer
         self.sample_rate = sample_rate
@@ -1114,7 +1121,10 @@ class S3MultiLangStreamingDataset(IterableDataset):
             for idx, (lang, source) in enumerate(sources_iterator):
                 if use_tqdm:
                     sources_iterator.set_postfix_str(f"{lang}/{source}")
-                source_dir = os.path.join(self.data_root, source)
+                if self.lang_subdir:
+                    source_dir = os.path.join(self.data_root, lang, source)
+                else:
+                    source_dir = os.path.join(self.data_root, source)
                 manifest_path = os.path.join(source_dir, "tarred_audio_manifest.json")
                 try:
                     if sqlite_cache:
@@ -1183,6 +1193,7 @@ class S3MultiLangStreamingDataset(IterableDataset):
                     token_augmenter=self.token_augmenter,
                     storage_type="disk",
                     data_root=self.data_root,
+                    lang_subdir=self.lang_subdir,
                     sqlite_cache_path=self._sqlite_cache_path,
                     prefetch_buffer_size=self.prefetch_buffer_size,
                 )
@@ -1221,6 +1232,7 @@ class S3MultiLangStreamingDataset(IterableDataset):
                         token_augmenter=self.token_augmenter,
                         storage_type="disk",
                         data_root=self.data_root,
+                        lang_subdir=self.lang_subdir,
                         sqlite_cache_path=self._sqlite_cache_path,
                         prefetch_buffer_size=self.prefetch_buffer_size,
                     )
