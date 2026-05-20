@@ -229,6 +229,10 @@ class S3MultiLangStreamingDataset(IterableDataset):
         #   "syllable" -> `<lang_S> <syl>×N <lang_E>` per word, N = syllable count
         #                 from a vowel-group heuristic. Gives word boundaries +
         #                 syllable-rate anchoring (useful for VAD + alignment).
+        #   "romanize" -> `<lang_S>` + BPE(romanized text) + `<lang_E>` per segment.
+        #                 Dense content target (real transliterated ASR); the
+        #                 boundaries carry the LID label. Needs a tokenizer built
+        #                 with --label-scheme romanize (real BPE over romanized text).
         lid_label_scheme: str = "word",
     ):
         """
@@ -468,7 +472,7 @@ class S3MultiLangStreamingDataset(IterableDataset):
 
         # LID mode: force lang-token vocab lookup, disable text/normalization paths.
         self.lid_mode = bool(lid_mode)
-        self.lid_label_scheme = lid_label_scheme if lid_label_scheme in ("word", "syllable") else "word"
+        self.lid_label_scheme = lid_label_scheme if lid_label_scheme in ("word", "syllable", "romanize") else "word"
         if self.lid_mode:
             add_lang_token = True
             add_eou_token = False
@@ -515,12 +519,13 @@ class S3MultiLangStreamingDataset(IterableDataset):
                         f"samples for lang='{lang}' will not be tagged"
                     )
 
-        # Syllable-scheme token IDs: per-language `<lang_S>`, `<lang_E>` plus
-        # a single generic `<syl>` marker.
+        # Boundary-scheme token IDs: per-language `<lang_S>`, `<lang_E>`.
+        # The syllable scheme additionally needs a generic `<syl>` marker; the
+        # romanize scheme puts BPE'd romanized text between the boundaries.
         self.lang_start_ids: Dict[str, int] = {}
         self.lang_end_ids: Dict[str, int] = {}
         self.syllable_token_id: Optional[int] = None
-        if self.lid_mode and self.lid_label_scheme == "syllable":
+        if self.lid_mode and self.lid_label_scheme in ("syllable", "romanize"):
             sp = tokenizer.tokenizer if hasattr(tokenizer, 'tokenizer') else None
 
             def _lookup(piece_str):
@@ -530,21 +535,23 @@ class S3MultiLangStreamingDataset(IterableDataset):
                         return cand
                 return None
 
-            self.syllable_token_id = _lookup("<syl>")
-            if self.syllable_token_id is None:
-                raise ValueError(
-                    "lid_label_scheme='syllable' requires the tokenizer to contain `<syl>`. "
-                    "Rebuild the tokenizer with --label-scheme syllable."
-                )
-            logging.info(f"Syllable token '<syl>' found at ID {self.syllable_token_id}")
+            if self.lid_label_scheme == "syllable":
+                self.syllable_token_id = _lookup("<syl>")
+                if self.syllable_token_id is None:
+                    raise ValueError(
+                        "lid_label_scheme='syllable' requires the tokenizer to contain `<syl>`. "
+                        "Rebuild the tokenizer with --label-scheme syllable."
+                    )
+                logging.info(f"Syllable token '<syl>' found at ID {self.syllable_token_id}")
 
             for lang in language_sources.keys():
                 s_id = _lookup(f"<{lang}_S>")
                 e_id = _lookup(f"<{lang}_E>")
                 if s_id is None or e_id is None:
                     raise ValueError(
-                        f"lid_label_scheme='syllable' requires `<{lang}_S>` and `<{lang}_E>` "
-                        f"in the tokenizer (got s_id={s_id}, e_id={e_id}). Rebuild the tokenizer."
+                        f"lid_label_scheme='{self.lid_label_scheme}' requires `<{lang}_S>` and "
+                        f"`<{lang}_E>` in the tokenizer (got s_id={s_id}, e_id={e_id}). "
+                        f"Rebuild the tokenizer with --label-scheme {self.lid_label_scheme}."
                     )
                 self.lang_start_ids[lang] = s_id
                 self.lang_end_ids[lang] = e_id
@@ -1744,6 +1751,19 @@ class S3MultiLangStreamingDataset(IterableDataset):
             if lang_id is None:
                 return None
             return [lang_id] * max(1, len(words))
+
+        if self.lid_label_scheme == "romanize":
+            # `<lang_S>` + BPE(romanized text) + `<lang_E>`. The romanized text
+            # is a dense content target; the boundaries carry the LID label.
+            s_id = self.lang_start_ids.get(lang)
+            e_id = self.lang_end_ids.get(lang)
+            if s_id is None or e_id is None:
+                return None
+            from .romanize import romanize as _romanize
+            roman = _romanize(text or "", lang)
+            inner = self.tokenizer.text_to_ids(roman) if roman else []
+            return [s_id] + list(inner) + [e_id]
+
         # syllable scheme
         s_id = self.lang_start_ids.get(lang)
         e_id = self.lang_end_ids.get(lang)
