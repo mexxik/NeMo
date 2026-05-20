@@ -1421,7 +1421,16 @@ class S3MultiLangStreamingDataset(IterableDataset):
         # then sits there for ~10-15 seconds while drains finish. By
         # ending the main loop a bit early and counting drain yields, the
         # bar hits 100% at actual epoch end.
+        #
+        # CRITICAL: only reserve when it's a negligible (<2%) slice of the
+        # per-worker budget. For small datasets — validation sets especially —
+        # a fixed reserve would skip real data and shrink coverage (e.g. a
+        # 2454-sample/worker val set would lose 506 = 21%). Validation doesn't
+        # use the SampleProgressBar at all, so the reserve buys nothing there;
+        # disabling it for small datasets restores full coverage.
         _drain_reserve = self.shuffle_buffer_size + self.merge_config.max_utterances * 2
+        if max_samples < _drain_reserve * 50:
+            _drain_reserve = 0
         _main_budget = max(1, max_samples - _drain_reserve)
         while True:
             if _PROF:
