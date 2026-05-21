@@ -233,6 +233,11 @@ class S3MultiLangStreamingDataset(IterableDataset):
         #                 Dense content target (real transliterated ASR); the
         #                 boundaries carry the LID label. Needs a tokenizer built
         #                 with --label-scheme romanize (real BPE over romanized text).
+        #   "romanize_word" -> per word: BPE(romanized word) + `<lang>`. The tag
+        #                 trails each word so LID is committed after the word is
+        #                 heard (authoritative per word, no provisional opening
+        #                 tag). Uses the single `<lang>` tokens like "word"; needs
+        #                 a tokenizer built with --label-scheme romanize_word.
         lid_label_scheme: str = "word",
     ):
         """
@@ -472,7 +477,7 @@ class S3MultiLangStreamingDataset(IterableDataset):
 
         # LID mode: force lang-token vocab lookup, disable text/normalization paths.
         self.lid_mode = bool(lid_mode)
-        self.lid_label_scheme = lid_label_scheme if lid_label_scheme in ("word", "syllable", "romanize") else "word"
+        self.lid_label_scheme = lid_label_scheme if lid_label_scheme in ("word", "syllable", "romanize", "romanize_word") else "word"
         if self.lid_mode:
             add_lang_token = True
             add_eou_token = False
@@ -1763,6 +1768,26 @@ class S3MultiLangStreamingDataset(IterableDataset):
             roman = _romanize(text or "", lang)
             inner = self.tokenizer.text_to_ids(roman) if roman else []
             return [s_id] + list(inner) + [e_id]
+
+        if self.lid_label_scheme == "romanize_word":
+            # Per-word: BPE(romanized word) + `<lang>`. The tag follows each
+            # word, so the model commits the language only after hearing it
+            # (authoritative per word, ~1-word latency, no provisional opening
+            # tag to skew toward the majority class). Uses the single per-lang
+            # `<lang>` token, same as the "word" scheme.
+            lang_id = self.lang_token_ids.get(lang)
+            if lang_id is None:
+                return None
+            from .romanize import romanize as _romanize
+            out: List[int] = []
+            for w in words:
+                roman = _romanize(w, lang)
+                if roman:
+                    out.extend(self.tokenizer.text_to_ids(roman))
+                out.append(lang_id)
+            if not words:  # empty text guard — emit a bare tag
+                out = [lang_id]
+            return out
 
         # syllable scheme
         s_id = self.lang_start_ids.get(lang)
