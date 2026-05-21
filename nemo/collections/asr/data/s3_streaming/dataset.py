@@ -1343,21 +1343,31 @@ class S3MultiLangStreamingDataset(IterableDataset):
         merge_buffer = MergeBuffer(self.audio_merger, self.merge_config)
 
         sample_idx = 0
-        # Per-(rank, worker) quota: total samples_per_epoch is the cluster-wide
-        # budget. Each rank gets 1/world_size of it; within a rank, each of the
-        # `num_workers` DataLoader workers gets 1/num_workers of the rank's share.
-        # Without dividing by num_workers, every worker independently runs the
-        # full per-rank budget — `actual yield ≈ num_workers × samples_per_epoch`
-        # — which breaks Lightning's progress-bar `__len__` accounting and
-        # destroys ETA.
+        # Per-rank epoch budget, gated on a *cross-worker* shared counter rather
+        # than a static per-worker slice. samples_per_epoch is the cluster-wide
+        # budget; each rank takes 1/world_size of it. Within a rank, all
+        # DataLoader workers share `self._raw_consumed` (an mp.Value inherited
+        # across the fork), so the rank stops as a whole when the shared
+        # raw-consumption count reaches `rank_budget`.
+        #
+        # Why not a static per-worker cap (samples_per_epoch // (world_size *
+        # num_workers))? TAR files shard disjointly across workers
+        # (lang_source_manager: tar[i] -> worker i % N), so a worker's partition
+        # size depends entirely on how many tars it happens to own. A static cap
+        # only yields full coverage when tars are many and uniform; with few or
+        # uneven tars it truncates workers holding fat shards while empty-shard
+        # workers contribute nothing — ending the epoch far below 100%. Gating
+        # on the shared total makes coverage independent of tar layout and of
+        # num_workers: workers with data keep pulling until the rank budget is
+        # met (or their partition drains), absorbing slack from idle workers.
         num_workers = worker_info.num_workers if worker_info is not None else 1
         num_workers = max(1, num_workers)
-        max_samples = max(1, self.samples_per_epoch // (world_size * num_workers))
+        rank_budget = max(1, self.samples_per_epoch // world_size)
         if rank == 0 and worker_id == 0:
             logging.info(
-                f"Sharded streaming: {self.samples_per_epoch:,} total -> "
-                f"{max_samples:,} per (rank, worker) "
-                f"({world_size} ranks x {num_workers} workers)"
+                f"Sharded streaming: {self.samples_per_epoch:,} samples/epoch, "
+                f"rank budget {rank_budget:,} ({world_size} ranks); "
+                f"{num_workers} workers/rank share the budget via a cross-worker counter"
             )
 
         # Per-stage timing counters; only populated when DATASET_PROFILE=1.
@@ -1409,47 +1419,30 @@ class S3MultiLangStreamingDataset(IterableDataset):
 
         # Stream samples through interleaver and shuffle buffer.
         #
-        # Per-worker budget gate: break on raw inputs *pulled*, not yielded.
-        # When the interleaver has no per-worker budget split (balance_mode in
-        # {"none","distributed"}), each worker independently sees the full
-        # corpus. Combined with merging — where yielded ≪ pulled — a yielded-
-        # count gate would let cluster raw consumption balloon to ~num_workers
-        # × samples_per_epoch, blowing past the progress bar's total and
-        # flipping tqdm into "?" mode. Gating on raw pulls keeps cluster
-        # consumption = samples_per_epoch exactly, so the bar reaches 100%
-        # right at epoch end and each raw sample is seen ~once per epoch.
+        # Gate on the shared cross-worker raw-consumption counter. We count raw
+        # inputs *pulled* (not yielded) because merging makes yielded ≪ pulled;
+        # counting pulls keeps the progress bar honest and lets the rank stop at
+        # exactly its budget regardless of merge ratio. Each worker breaks when
+        # the shared counter reaches `rank_budget`, or earlier if its own tar
+        # partition drains (StopIteration). Buffered samples are flushed in the
+        # drain phase below; since they were already counted as pulls, the bar
+        # is already at ~100% when the main loop ends and the drain is invisible.
         _last_yield_resume = _time.perf_counter() if _PROF else 0.0
         _interleaver_iter = iter(interleaver)
-        # _raw_pulled: per-worker cumulative count (gate); _unflushed: delta
-        # batched up to keep the shared mp.Value lock off the hot path.
+        # _raw_pulled: this worker's pull count (diagnostic only). _unflushed:
+        # delta batched up to keep the shared mp.Value lock off the hot path;
+        # we read the shared total at each flush to decide when to stop.
         _raw_pulled = 0
         _unflushed = 0
         _RAW_FLUSH_EVERY = 64
-        # Reserve budget for the drain phase after the main loop ends. Each
-        # worker has up to shuffle_buffer_size samples buffered plus a small
-        # merge_buffer; those produce more yielded batches after the gate
-        # fires but don't increment the raw-pull counter. Without this
-        # reserve, the progress bar reaches 100% at raw-pull exhaustion and
-        # then sits there for ~10-15 seconds while drains finish. By
-        # ending the main loop a bit early and counting drain yields, the
-        # bar hits 100% at actual epoch end.
-        #
-        # CRITICAL: only reserve when it's a negligible (<2%) slice of the
-        # per-worker budget. For small datasets — validation sets especially —
-        # a fixed reserve would skip real data and shrink coverage (e.g. a
-        # 2454-sample/worker val set would lose 506 = 21%). Validation doesn't
-        # use the SampleProgressBar at all, so the reserve buys nothing there;
-        # disabling it for small datasets restores full coverage.
-        _drain_reserve = self.shuffle_buffer_size + self.merge_config.max_utterances * 2
-        if max_samples < _drain_reserve * 50:
-            _drain_reserve = 0
-        _main_budget = max(1, max_samples - _drain_reserve)
         while True:
             if _PROF:
                 _t = _time.perf_counter()
             try:
                 sample = next(_interleaver_iter)
             except StopIteration:
+                # This worker's tar partition is drained; stop contributing.
+                # Other workers carry the remaining rank budget.
                 break
             if _PROF:
                 _ds_t_fetch += _time.perf_counter() - _t
@@ -1459,10 +1452,10 @@ class S3MultiLangStreamingDataset(IterableDataset):
             if _unflushed >= _RAW_FLUSH_EVERY:
                 with self._raw_consumed.get_lock():
                     self._raw_consumed.value += _unflushed
+                    _cluster = self._raw_consumed.value
                 _unflushed = 0
-
-            if _raw_pulled >= _main_budget:
-                break
+                if _cluster >= rank_budget:
+                    break
 
             shuffle_buffer.add(sample)
 
@@ -1484,8 +1477,6 @@ class S3MultiLangStreamingDataset(IterableDataset):
                                 _ds_t_proc = 0.0
                                 _ds_t_yield = 0.0
                                 _ds_n = 0
-                        if sample_idx >= max_samples:
-                            break
 
         # Flush any unflushed raw-input increments so the progress bar lands
         # at exactly the interleaver budget at epoch end.
@@ -1494,27 +1485,19 @@ class S3MultiLangStreamingDataset(IterableDataset):
                 self._raw_consumed.value += _unflushed
             _unflushed = 0
 
-        # Drain remaining samples from shuffle buffer. These were already
-        # pulled (and counted) but bumping the counter again here lets the
-        # progress bar advance through the drain phase — the gate above
-        # reserved `_drain_reserve` budget for exactly this.
+        # Drain remaining buffered samples. These were already pulled (and
+        # counted toward the rank budget), so we do NOT re-increment the shared
+        # counter — the progress bar is already at ~100% from the pull count.
+        # They're real data, so always flush them even if the budget was met.
         for buffered_sample in shuffle_buffer.drain():
-            if sample_idx >= max_samples:
-                break
             result = process_and_yield(buffered_sample)
             if result is not None:
-                with self._raw_consumed.get_lock():
-                    self._raw_consumed.value += 1
                 yield result
 
         # Drain remaining samples from merge buffer
         for remaining_sample in merge_buffer.drain():
-            if sample_idx >= max_samples:
-                break
             result = self._process_sample(remaining_sample, sample_idx)
             if result is not None:
-                with self._raw_consumed.get_lock():
-                    self._raw_consumed.value += 1
                 yield result
                 sample_idx += 1
 
@@ -1782,10 +1765,14 @@ class S3MultiLangStreamingDataset(IterableDataset):
             out: List[int] = []
             for w in words:
                 roman = _romanize(w, lang)
-                if roman:
-                    out.extend(self.tokenizer.text_to_ids(roman))
+                if not roman:
+                    continue  # word stripped to nothing — no bare content-free tag
+                ids = self.tokenizer.text_to_ids(roman)
+                if not ids:
+                    continue
+                out.extend(ids)
                 out.append(lang_id)
-            if not words:  # empty text guard — emit a bare tag
+            if not out:  # whole segment had no romanizable content — one bare tag
                 out = [lang_id]
             return out
 
