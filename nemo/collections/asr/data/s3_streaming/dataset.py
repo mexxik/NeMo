@@ -419,6 +419,11 @@ class S3MultiLangStreamingDataset(IterableDataset):
             except Exception as e:
                 logging.warning(f"Could not resolve tokenizer unk_id: {e}")
 
+        # Per-character UNK cache for _clean_unk_chars. Maps a character to
+        # whether the tokenizer encodes it to <unk> (no token, no byte_fallback).
+        # Populated lazily; bounded by the alphabet size of the corpus.
+        self._unk_char_cache = {}
+
         # Get EOU token ID from vocabulary (for direct ID appending)
         # SentencePiece doesn't recognize USER_DEFINED tokens during encoding,
         # so we must append the token ID directly after tokenization
@@ -1594,6 +1599,37 @@ class S3MultiLangStreamingDataset(IterableDataset):
         insert_pos = word_starts[after_word]
         return ids[:insert_pos] + [lang_id] + ids[insert_pos:]
 
+    def _clean_unk_chars(self, text: str) -> str:
+        """Remove characters the tokenizer can't encode (would become <unk>),
+        replacing each with a space and collapsing whitespace.
+
+        Without byte_fallback, characters absent from the vocab — e.g. em-dash,
+        colon, guillemets, ellipsis — tokenize to <unk>. Rather than drop the
+        whole utterance (losing its audio), we strip those characters so the
+        sample survives with clean text; the model simply never sees them. A
+        character that is <unk> on its own is also <unk> in context (the
+        tokenizer can't merge an unknown character into a known piece), so the
+        per-character test is exact here.
+        """
+        if self._unk_id is None or not text:
+            return text
+        cache = self._unk_char_cache
+        cleaned = []
+        changed = False
+        for ch in text:
+            is_unk = cache.get(ch)
+            if is_unk is None:
+                is_unk = self._unk_id in self.tokenizer.text_to_ids(ch)
+                cache[ch] = is_unk
+            if is_unk:
+                changed = True
+                cleaned.append(' ')
+            else:
+                cleaned.append(ch)
+        if not changed:
+            return text
+        return ' '.join(''.join(cleaned).split())
+
     def _process_sample(self, sample: dict, sample_idx: int) -> Optional[Tuple]:
         """
         Process a sample into training tensors.
@@ -1632,6 +1668,7 @@ class S3MultiLangStreamingDataset(IterableDataset):
 
         if original_texts is not None:
             # Merged sample: tokenize each segment and add EOU where appropriate
+            original_texts = [self._clean_unk_chars(t) for t in original_texts]
             tokens = self._tokenize_merged(
                 original_texts,
                 eou_positions,
@@ -1642,6 +1679,7 @@ class S3MultiLangStreamingDataset(IterableDataset):
             # LID mode (single utterance). Scheme = "word" or "syllable" — both
             # routed through `_build_lid_tokens`. No BOS/EOS/EOU/normalization.
             text = sample.get('text', '') or ''
+            text = self._clean_unk_chars(text)
             sample_lang = sample.get('lang')
             if not sample_lang:
                 return None
@@ -1651,6 +1689,10 @@ class S3MultiLangStreamingDataset(IterableDataset):
         else:
             # Regular sample
             text = sample.get('text', '')
+
+            # Strip characters the tokenizer can't represent (keeps the sample
+            # instead of dropping it via the <unk> guard below).
+            text = self._clean_unk_chars(text)
 
             # Check if we should add EOU token BEFORE normalization (punctuation check)
             should_add_eou = (
