@@ -629,6 +629,25 @@ class S3MultiLangStreamingDataset(IterableDataset):
         # yielded samples undercounts progress; this counter matches
         # samples_per_epoch exactly when the interleaver is drained.
         self._raw_consumed = mp.Value('q', 0)
+        # Bar counter: incremented by the dynamic batcher when it EMITS a batch,
+        # weighted by the raw pulls each emitted sample represents. Unlike
+        # _raw_consumed (pull-time, used for the rank-budget gate), this tracks
+        # consumer-side progress, so the progress bar reaches 100% at the actual
+        # epoch end rather than a full sort-buffer + merge-buffer ahead of it.
+        self._raw_emitted = mp.Value('q', 0)
+        # Per-yield weight side-channel. The dynamic batcher drives this
+        # generator single-threaded within each worker, so it can read this
+        # right after each pull. Value = raw pulls since the previous yield
+        # (captures merges and dropped/filtered samples).
+        self._cur_yield_weight = 0
+        # Epoch/pass generation, bumped by the trainer callback at the start of
+        # each train epoch and validation pass. The first worker to enter
+        # __iter__ for a new generation zeroes the shared gate/bar counters,
+        # under the counter lock (race-free). This is immune to async prefetch /
+        # persistent_workers residue that a main-process reset cannot reliably
+        # synchronize against — the root cause of validation under-covering.
+        self._epoch_gen = mp.Value('q', 0)
+        self._counter_gen = mp.Value('q', -1)
 
         # Track whether samples_per_epoch was explicitly provided by user
         self._explicit_samples_per_epoch = samples_per_epoch is not None
@@ -1435,6 +1454,22 @@ class S3MultiLangStreamingDataset(IterableDataset):
         _raw_pulled = 0
         _unflushed = 0
         _RAW_FLUSH_EVERY = 64
+        # Raw pulls accumulated since the last yield, attributed to the next
+        # yielded sample via self._cur_yield_weight so the batcher can weight
+        # its emit-time bar counter. Sums to the rank budget over the epoch.
+        _pending_raw = 0
+        self._cur_yield_weight = 0
+        # Generation-guarded reset of the shared counters: the first worker to
+        # enter __iter__ for this pass zeroes both, others see the gen already
+        # advanced and skip. Done under the lock before any counting, so no
+        # worker loses increments and stale residue from a prior pass (e.g. the
+        # sanity check's async prefetch) is wiped exactly once.
+        with self._raw_consumed.get_lock():
+            _gen = self._epoch_gen.value
+            if self._counter_gen.value != _gen:
+                self._raw_consumed.value = 0
+                self._raw_emitted.value = 0
+                self._counter_gen.value = _gen
         while True:
             if _PROF:
                 _t = _time.perf_counter()
@@ -1449,6 +1484,7 @@ class S3MultiLangStreamingDataset(IterableDataset):
 
             _raw_pulled += 1
             _unflushed += 1
+            _pending_raw += 1
             if _unflushed >= _RAW_FLUSH_EVERY:
                 with self._raw_consumed.get_lock():
                     self._raw_consumed.value += _unflushed
@@ -1467,6 +1503,8 @@ class S3MultiLangStreamingDataset(IterableDataset):
                     if result is not None:
                         if _PROF:
                             _yield_start = _time.perf_counter()
+                        self._cur_yield_weight = _pending_raw
+                        _pending_raw = 0
                         yield result
                         if _PROF:
                             _ds_t_yield += _time.perf_counter() - _yield_start
@@ -1492,12 +1530,16 @@ class S3MultiLangStreamingDataset(IterableDataset):
         for buffered_sample in shuffle_buffer.drain():
             result = process_and_yield(buffered_sample)
             if result is not None:
+                self._cur_yield_weight = _pending_raw
+                _pending_raw = 0
                 yield result
 
         # Drain remaining samples from merge buffer
         for remaining_sample in merge_buffer.drain():
             result = self._process_sample(remaining_sample, sample_idx)
             if result is not None:
+                self._cur_yield_weight = _pending_raw
+                _pending_raw = 0
                 yield result
                 sample_idx += 1
 

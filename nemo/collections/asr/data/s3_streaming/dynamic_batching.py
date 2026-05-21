@@ -56,28 +56,48 @@ class DynamicBatchingDataset(IterableDataset):
         # Whichever limit hits first wins.
         self.rnnt_budget = rnnt_budget
 
+    def _bump_emitted(self, weight):
+        """Advance the inner dataset's consumer-side bar counter at batch emit.
+
+        `weight` is the total raw pulls represented by the batch (sum of each
+        emitted sample's per-yield weight, which captures merges and dropped
+        samples). Counting here — after the sort buffer — instead of at pull
+        time keeps the progress bar within ~one prefetch queue of the training
+        loop instead of a whole sort-buffer + merge-buffer ahead of it.
+        """
+        rc = getattr(self.inner_dataset, '_raw_emitted', None)
+        if rc is not None and weight:
+            with rc.get_lock():
+                rc.value += weight
+
     def _pack_batches(self, samples):
         """
         Pack sorted samples into batches greedily.
         Samples must be sorted by duration (ascending).
+        `samples` items are (sample, duration, weight).
         Yields collated batch tuples.
         """
         batch = []
+        batch_w = 0
         max_dur_in_batch = 0.0
 
-        for sample, duration in samples:
+        for sample, duration, weight in samples:
             new_max_dur = max(max_dur_in_batch, duration)
             new_count = len(batch) + 1
 
             if batch and self._batch_full(new_count, new_max_dur):
+                self._bump_emitted(batch_w)
                 yield _speech_collate_fn(batch, pad_id=0)
                 batch = []
+                batch_w = 0
                 max_dur_in_batch = 0.0
 
             batch.append(sample)
+            batch_w += weight
             max_dur_in_batch = max(max_dur_in_batch, duration)
 
         if batch:
+            self._bump_emitted(batch_w)
             yield _speech_collate_fn(batch, pad_id=0)
 
     def __iter__(self):
@@ -106,43 +126,59 @@ class DynamicBatchingDataset(IterableDataset):
     def _iter_greedy(self):
         """Greedy packing: accumulate samples and emit when budget exceeded."""
         batch = []
+        batch_w = 0
         max_dur_in_batch = 0.0
+        carry_w = 0  # weight of dropped samples, folded into the next kept one
 
         for sample in self.inner_dataset:
+            weight = getattr(self.inner_dataset, '_cur_yield_weight', 1)
             audio_len = sample[1].item() if hasattr(sample[1], 'item') else sample[1]
             duration = audio_len / self.sample_rate
 
             if self.max_sample_duration is not None and duration > self.max_sample_duration:
+                carry_w += weight
                 continue
 
             new_max_dur = max(max_dur_in_batch, duration)
             new_count = len(batch) + 1
 
             if batch and self._batch_full(new_count, new_max_dur):
+                self._bump_emitted(batch_w)
                 yield _speech_collate_fn(batch, pad_id=0)
                 batch = []
+                batch_w = 0
                 max_dur_in_batch = 0.0
 
             batch.append(sample)
+            batch_w += weight + carry_w
+            carry_w = 0
             max_dur_in_batch = max(max_dur_in_batch, duration)
 
         if batch:
+            self._bump_emitted(batch_w)
             yield _speech_collate_fn(batch, pad_id=0)
+        if carry_w:
+            self._bump_emitted(carry_w)
 
     def _iter_sorted(self):
         """Sort-buffer mode: accumulate, sort by duration, then pack."""
         sort_buffer = []
+        carry_w = 0  # weight of dropped samples, folded into the next kept one
 
         for sample in self.inner_dataset:
+            weight = getattr(self.inner_dataset, '_cur_yield_weight', 1)
             audio_len = sample[1].item() if hasattr(sample[1], 'item') else sample[1]
             duration = audio_len / self.sample_rate
 
             if self.max_sample_duration is not None and duration > self.max_sample_duration:
+                carry_w += weight
                 continue
             if duration > self.max_padded_budget_sec:
+                carry_w += weight
                 continue
 
-            sort_buffer.append((sample, duration))
+            sort_buffer.append((sample, duration, weight + carry_w))
+            carry_w = 0
 
             if len(sort_buffer) >= self.sort_buffer_size:
                 sort_buffer.sort(key=lambda x: x[1])
@@ -152,6 +188,8 @@ class DynamicBatchingDataset(IterableDataset):
         if sort_buffer:
             sort_buffer.sort(key=lambda x: x[1])
             yield from self._pack_batches(sort_buffer)
+        if carry_w:
+            self._bump_emitted(carry_w)
 
     def __len__(self):
         # Return total samples (not batches). The SampleProgressBar callback
