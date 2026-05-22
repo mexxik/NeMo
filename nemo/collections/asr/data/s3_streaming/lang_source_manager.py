@@ -53,6 +53,9 @@ class LanguageSourceManager:
         prefetch_buffer_size: int = 0,  # Disabled for true sequential streaming
         # SQLite manifest cache (memory optimization)
         sqlite_cache_path: str = None,
+        # Selective backprop: set of source names whose transcripts are "clean".
+        # Samples are tagged sample['clean'] accordingly. None => all clean.
+        clean_sources: Optional[set] = None,
     ):
         """
         Initialize language source manager.
@@ -78,6 +81,9 @@ class LanguageSourceManager:
         self.prefetch_buffer_size = prefetch_buffer_size
         self.storage_type = storage_type
         self.lang_subdir = bool(lang_subdir)
+        self.clean_sources = clean_sources
+        # Source whose stream is currently open, used to tag sample['clean'].
+        self._current_source_name: Optional[str] = None
 
         # Storage-specific setup
         if storage_type == "s3":
@@ -315,6 +321,7 @@ class LanguageSourceManager:
                     )
 
                 self._current_stream = iter(stream)
+                self._current_source_name = source
                 self._current_tar_idx += 1
                 return True
 
@@ -350,6 +357,10 @@ class LanguageSourceManager:
 
                 # Apply token augmentation
                 sample = self.token_augmenter(sample)
+
+                # Tag cleanliness for selective backprop (None => all clean).
+                if self.clean_sources is not None:
+                    sample['clean'] = self._current_source_name in self.clean_sources
 
                 yield sample
 
@@ -411,6 +422,10 @@ class LanguageSourceManager:
 
                 # Apply token augmentation
                 sample = self.token_augmenter(sample)
+
+                # Tag cleanliness for selective backprop (None => all clean).
+                if self.clean_sources is not None:
+                    sample['clean'] = self._current_source_name in self.clean_sources
 
                 empty_tar_count = 0  # Reset on success
                 return sample
@@ -509,6 +524,8 @@ class SingleSourceManager:
         prefetch_buffer_size: int = 0,  # Disabled for true sequential streaming
         # SQLite manifest cache
         sqlite_cache_path: str = None,
+        # Selective backprop: set of clean source names. None => all clean.
+        clean_sources: Optional[set] = None,
     ):
         """
         Initialize single source manager.
@@ -535,6 +552,9 @@ class SingleSourceManager:
         self.prefetch_buffer_size = prefetch_buffer_size
         self.storage_type = storage_type
         self.lang_subdir = bool(lang_subdir)
+        # Selective backprop: this whole source is clean iff it's listed.
+        # None => feature off (treat as clean).
+        self._is_clean = (clean_sources is None) or (source in clean_sources)
 
         # Storage-specific setup
         if storage_type == "s3":
@@ -801,6 +821,8 @@ class SingleSourceManager:
                     continue
 
                 sample = self.token_augmenter(sample)
+                # Tag cleanliness for selective backprop.
+                sample['clean'] = self._is_clean
                 yield sample
 
             except StopIteration:
@@ -849,6 +871,8 @@ class SingleSourceManager:
                     continue
 
                 sample = self.token_augmenter(sample)
+                # Tag cleanliness for selective backprop.
+                sample['clean'] = self._is_clean
                 self._samples_yielded += 1
                 empty_tar_count = 0  # Reset on success
                 return sample

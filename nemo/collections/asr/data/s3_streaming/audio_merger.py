@@ -135,6 +135,15 @@ class AudioMerger:
         if len(samples) < self.config.min_utterances:
             return False, "not_enough_samples"
 
+        # Selective backprop: never merge clean with noisy. A merged sample
+        # carries a single cleanliness flag, so its segments must agree —
+        # otherwise we'd either pollute the decoder/joint with noisy text
+        # (if tagged clean) or waste clean text (if tagged noisy). The default
+        # 'clean'=True means samples without the tag (feature off) merge freely.
+        first_clean = samples[0].get('clean', True)
+        if any(s.get('clean', True) != first_clean for s in samples[1:]):
+            return False, "mixed_cleanliness"
+
         # Calculate total duration with minimum silence
         total_duration = sum(s.get('duration', 0) for s in samples)
         min_silence = self.config.silence_min_sec * (len(samples) - 1)
@@ -251,6 +260,9 @@ class AudioMerger:
             # Per-segment langs parallel to original_texts. Used by lid_mode to
             # emit `[<lang_i>] * num_words_i` per segment for code-switch training.
             'langs': [s.get('lang') for s in samples],
+            # Cleanliness for selective backprop. can_merge guarantees all
+            # segments agree, so the first sample's flag is the merged flag.
+            'clean': samples[0].get('clean', True),
         }
 
     def get_stats(self) -> dict:

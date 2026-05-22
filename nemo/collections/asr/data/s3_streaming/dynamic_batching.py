@@ -40,7 +40,7 @@ class DynamicBatchingDataset(IterableDataset):
     def __init__(self, inner_dataset, max_padded_budget_sec: float,
                  sample_rate: int = 16000, sort_buffer_size: int = 500,
                  max_batch_size: int = 64, max_sample_duration: float = None,
-                 rnnt_budget: float = 0):
+                 rnnt_budget: float = 0, emit_clean_flag: bool = False):
         super().__init__()
         self.inner_dataset = inner_dataset
         self.max_padded_budget_sec = max_padded_budget_sec
@@ -48,6 +48,10 @@ class DynamicBatchingDataset(IterableDataset):
         self.sort_buffer_size = sort_buffer_size
         self.max_batch_size = max_batch_size
         self.max_sample_duration = max_sample_duration
+        # Selective backprop: only append the per-batch cleanliness bool to the
+        # collated tuple when the feature is active. When off, batches stay the
+        # standard 4-tuple so NeMo's training_step unpacking is unchanged.
+        self.emit_clean_flag = emit_clean_flag
         # RNNT memory budget: caps B × max_dur² to prevent OOM.
         # RNNT joint memory is O(B × T × U × V) where T,U ∝ duration,
         # so real VRAM cost ≈ O(B × dur²). When set > 0, dynamically limits
@@ -70,35 +74,55 @@ class DynamicBatchingDataset(IterableDataset):
             with rc.get_lock():
                 rc.value += weight
 
+    def _collate(self, batch, clean):
+        """Collate a batch and append the batch-level cleanliness flag.
+
+        Selective backprop: batches are homogeneous (all-clean or all-noisy),
+        so a single bool describes the batch. The training loop pops this 5th
+        element and uses it to gate decoder/joint gradient updates. The flag is
+        a plain Python bool so Lightning's batch-to-device transfer leaves it
+        untouched. When selective backprop is off, returns the standard 4-tuple
+        unchanged.
+        """
+        collated = _speech_collate_fn(batch, pad_id=0)
+        if self.emit_clean_flag:
+            return (*collated, clean)
+        return collated
+
     def _pack_batches(self, samples):
         """
         Pack sorted samples into batches greedily.
-        Samples must be sorted by duration (ascending).
-        `samples` items are (sample, duration, weight).
-        Yields collated batch tuples.
+        Samples must be sorted by (clean, duration) ascending so each batch is
+        homogeneous in cleanliness; a batch is also flushed whenever the flag
+        flips. `samples` items are (sample, duration, weight, clean).
+        Yields collated batch tuples with a trailing cleanliness bool.
         """
         batch = []
         batch_w = 0
         max_dur_in_batch = 0.0
+        batch_clean = True
 
-        for sample, duration, weight in samples:
+        for sample, duration, weight, clean in samples:
             new_max_dur = max(max_dur_in_batch, duration)
             new_count = len(batch) + 1
 
-            if batch and self._batch_full(new_count, new_max_dur):
+            # Flush on budget overflow OR a cleanliness change (keeps batches
+            # homogeneous for selective backprop).
+            if batch and (self._batch_full(new_count, new_max_dur) or clean != batch_clean):
                 self._bump_emitted(batch_w)
-                yield _speech_collate_fn(batch, pad_id=0)
+                yield self._collate(batch, batch_clean)
                 batch = []
                 batch_w = 0
                 max_dur_in_batch = 0.0
 
             batch.append(sample)
             batch_w += weight
+            batch_clean = clean
             max_dur_in_batch = max(max_dur_in_batch, duration)
 
         if batch:
             self._bump_emitted(batch_w)
-            yield _speech_collate_fn(batch, pad_id=0)
+            yield self._collate(batch, batch_clean)
 
     def __iter__(self):
         if self.sort_buffer_size <= 1:
@@ -128,10 +152,12 @@ class DynamicBatchingDataset(IterableDataset):
         batch = []
         batch_w = 0
         max_dur_in_batch = 0.0
+        batch_clean = True
         carry_w = 0  # weight of dropped samples, folded into the next kept one
 
         for sample in self.inner_dataset:
             weight = getattr(self.inner_dataset, '_cur_yield_weight', 1)
+            clean = getattr(self.inner_dataset, '_cur_yield_clean', True)
             audio_len = sample[1].item() if hasattr(sample[1], 'item') else sample[1]
             duration = audio_len / self.sample_rate
 
@@ -142,31 +168,41 @@ class DynamicBatchingDataset(IterableDataset):
             new_max_dur = max(max_dur_in_batch, duration)
             new_count = len(batch) + 1
 
-            if batch and self._batch_full(new_count, new_max_dur):
+            # Flush on budget overflow OR a cleanliness change (keeps batches
+            # homogeneous for selective backprop).
+            if batch and (self._batch_full(new_count, new_max_dur) or clean != batch_clean):
                 self._bump_emitted(batch_w)
-                yield _speech_collate_fn(batch, pad_id=0)
+                yield self._collate(batch, batch_clean)
                 batch = []
                 batch_w = 0
                 max_dur_in_batch = 0.0
 
             batch.append(sample)
             batch_w += weight + carry_w
+            batch_clean = clean
             carry_w = 0
             max_dur_in_batch = max(max_dur_in_batch, duration)
 
         if batch:
             self._bump_emitted(batch_w)
-            yield _speech_collate_fn(batch, pad_id=0)
+            yield self._collate(batch, batch_clean)
         if carry_w:
             self._bump_emitted(carry_w)
 
     def _iter_sorted(self):
-        """Sort-buffer mode: accumulate, sort by duration, then pack."""
+        """Sort-buffer mode: accumulate, sort by (clean, duration), then pack.
+
+        Sorting on cleanliness first groups all clean samples together and all
+        noisy samples together, so duration-based packing stays efficient
+        within each group and only the single clean→noisy boundary forces an
+        extra (possibly short) batch per buffer flush.
+        """
         sort_buffer = []
         carry_w = 0  # weight of dropped samples, folded into the next kept one
 
         for sample in self.inner_dataset:
             weight = getattr(self.inner_dataset, '_cur_yield_weight', 1)
+            clean = getattr(self.inner_dataset, '_cur_yield_clean', True)
             audio_len = sample[1].item() if hasattr(sample[1], 'item') else sample[1]
             duration = audio_len / self.sample_rate
 
@@ -177,16 +213,16 @@ class DynamicBatchingDataset(IterableDataset):
                 carry_w += weight
                 continue
 
-            sort_buffer.append((sample, duration, weight + carry_w))
+            sort_buffer.append((sample, duration, weight + carry_w, clean))
             carry_w = 0
 
             if len(sort_buffer) >= self.sort_buffer_size:
-                sort_buffer.sort(key=lambda x: x[1])
+                sort_buffer.sort(key=lambda x: (x[3], x[1]))
                 yield from self._pack_batches(sort_buffer)
                 sort_buffer = []
 
         if sort_buffer:
-            sort_buffer.sort(key=lambda x: x[1])
+            sort_buffer.sort(key=lambda x: (x[3], x[1]))
             yield from self._pack_batches(sort_buffer)
         if carry_w:
             self._bump_emitted(carry_w)

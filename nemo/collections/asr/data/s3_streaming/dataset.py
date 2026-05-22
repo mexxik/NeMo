@@ -186,6 +186,15 @@ class S3MultiLangStreamingDataset(IterableDataset):
         merge_silence_max: float = 1.5,
         merge_max_duration: float = 30.0,
 
+        # Selective backprop: names of sources whose transcripts are "clean"
+        # (properly punctuated/capitalized). Samples from clean sources are
+        # tagged sample['clean']=True; everything else is tagged False. The
+        # training loop uses this flag to update the full network on clean
+        # batches but only the encoder on noisy batches (see grad-gating in
+        # speech_to_text_s3_finetune.py). None or empty => feature off: every
+        # sample is treated as clean (standard full-network training).
+        clean_sources: Optional[List[str]] = None,
+
         # Other
         return_sample_id: bool = False,
         samples_per_epoch: int = None,  # Override automatic length calculation
@@ -361,6 +370,19 @@ class S3MultiLangStreamingDataset(IterableDataset):
         if self.lang_subdir:
             logging.info("[DATASET_INIT] lang_subdir=True (sources resolve to <root>/<lang>/<source>)")
         self.language_sources = language_sources
+        # Selective-backprop clean-source set. Empty/None => feature off (all
+        # samples treated as clean). Stored as a set for O(1) membership checks
+        # in the per-source managers.
+        self.clean_sources = set(clean_sources) if clean_sources else None
+        if self.clean_sources:
+            logging.info(
+                f"[DATASET_INIT] Selective backprop enabled — clean sources: "
+                f"{sorted(self.clean_sources)} (all other sources tagged noisy)"
+            )
+        # Per-yield cleanliness side-channel, mirrors `_cur_yield_weight`. Set by
+        # `_process_sample` for the sample about to be yielded; read by the
+        # dynamic batcher right after each pull to group homogeneous batches.
+        self._cur_yield_clean = True
         self.tokenizer = tokenizer
         self.sample_rate = sample_rate
         self.shuffle_buffer_size = shuffle_buffer_size
@@ -1220,6 +1242,7 @@ class S3MultiLangStreamingDataset(IterableDataset):
                     s3_endpoint_url=self.s3_endpoint_url,
                     sqlite_cache_path=self._sqlite_cache_path,
                     prefetch_buffer_size=self.prefetch_buffer_size,
+                    clean_sources=self.clean_sources,
                 )
             else:
                 manager = LanguageSourceManager(
@@ -1232,6 +1255,7 @@ class S3MultiLangStreamingDataset(IterableDataset):
                     lang_subdir=self.lang_subdir,
                     sqlite_cache_path=self._sqlite_cache_path,
                     prefetch_buffer_size=self.prefetch_buffer_size,
+                    clean_sources=self.clean_sources,
                 )
             language_managers[lang] = manager
 
@@ -1259,6 +1283,7 @@ class S3MultiLangStreamingDataset(IterableDataset):
                         s3_endpoint_url=self.s3_endpoint_url,
                         sqlite_cache_path=self._sqlite_cache_path,
                         prefetch_buffer_size=self.prefetch_buffer_size,
+                        clean_sources=self.clean_sources,
                     )
                 else:
                     manager = SingleSourceManager(
@@ -1271,6 +1296,7 @@ class S3MultiLangStreamingDataset(IterableDataset):
                         lang_subdir=self.lang_subdir,
                         sqlite_cache_path=self._sqlite_cache_path,
                         prefetch_buffer_size=self.prefetch_buffer_size,
+                        clean_sources=self.clean_sources,
                     )
                 source_managers[manager_key] = manager
 
@@ -1648,6 +1674,13 @@ class S3MultiLangStreamingDataset(IterableDataset):
 
         if audio is None:
             return None
+
+        # Record this sample's cleanliness on the per-yield side-channel so the
+        # dynamic batcher (which only sees the collated tensor tuple, not the
+        # dict) can group homogeneous batches. Merged samples carry a single
+        # 'clean' flag set by the AudioMerger (merges are gated to be
+        # homogeneous). Defaults to True when the feature is off.
+        self._cur_yield_clean = bool(sample.get('clean', True))
 
         # Apply augmentation based on source cycle and configured probability
         source_cycle = sample.get('source_cycle', 0)
