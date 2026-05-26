@@ -1700,8 +1700,17 @@ class S3MultiLangStreamingDataset(IterableDataset):
         eou_positions = sample.get('eou_positions', [])
 
         if original_texts is not None:
-            # Merged sample: tokenize each segment and add EOU where appropriate
-            original_texts = [self._clean_unk_chars(t) for t in original_texts]
+            # Merged sample: tokenize each segment and add EOU where appropriate.
+            # For romanize/romanize_word LID schemes the input text is romanized
+            # downstream by `_build_lid_tokens`, so the per-char UNK strip would
+            # wipe non-Latin scripts (e.g. uk Cyrillic) before romanization runs.
+            # The romanizer already drops anything outside [a-z ] — let it do
+            # the cleaning.
+            skip_unk_clean = (
+                self.lid_mode and self.lid_label_scheme in ("romanize", "romanize_word")
+            )
+            if not skip_unk_clean:
+                original_texts = [self._clean_unk_chars(t) for t in original_texts]
             tokens = self._tokenize_merged(
                 original_texts,
                 eou_positions,
@@ -1711,8 +1720,11 @@ class S3MultiLangStreamingDataset(IterableDataset):
         elif self.lid_mode:
             # LID mode (single utterance). Scheme = "word" or "syllable" — both
             # routed through `_build_lid_tokens`. No BOS/EOS/EOU/normalization.
+            # romanize/romanize_word romanize the text downstream; skip the
+            # UNK-char strip there or it wipes non-Latin scripts pre-romanize.
             text = sample.get('text', '') or ''
-            text = self._clean_unk_chars(text)
+            if self.lid_label_scheme not in ("romanize", "romanize_word"):
+                text = self._clean_unk_chars(text)
             sample_lang = sample.get('lang')
             if not sample_lang:
                 return None
@@ -1800,6 +1812,12 @@ class S3MultiLangStreamingDataset(IterableDataset):
             # Add EOS token if configured
             if self.eos_id is not None:
                 tokens = tokens + [self.eos_id]
+
+        # Guard: an empty target sequence has no signal to learn from (and
+        # breaks RNNT loss). Can happen in LID mode when a merged sample's
+        # segments all romanize to empty content.
+        if len(tokens) == 0:
+            return None
 
         # Guard: RNNT numba kernels launch with maxU = max(label_lengths) + 1 as
         # threads-per-block; CUDA hard-caps this at 1024.  Skip samples that
@@ -1889,8 +1907,11 @@ class S3MultiLangStreamingDataset(IterableDataset):
                     continue
                 out.extend(ids)
                 out.append(lang_id)
-            if not out:  # whole segment had no romanizable content — one bare tag
-                out = [lang_id]
+            if not out:
+                # Whole segment had no romanizable content. Drop the sample
+                # rather than emit a content-free `<lang>` tag — bare tags in
+                # the reference teach the model nothing and pollute WER logs.
+                return None
             return out
 
         # syllable scheme
