@@ -5,10 +5,13 @@ Provides configurable filters for duration, character rate, and text quality.
 Matches the filtering logic from 01_gather.py for consistency.
 """
 
+import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set
 
 from nemo.utils import logging
+
+from .token_augmenter import SENTENCE_ENDINGS
 
 
 # Allowed characters per language
@@ -251,6 +254,60 @@ def is_valid_text(text: str) -> bool:
     return True
 
 
+# Trailing characters that may legitimately follow terminal punctuation
+# (closing quotes / brackets) — ignored when checking the final punctuation.
+_TRAILING_CLOSERS = ' "\'»”’)]}'
+
+# A sentence boundary is terminal punctuation followed by whitespace (or the
+# end of the string). Requiring whitespace keeps decimals/abbreviations like
+# "3.14" or "U.S." from being split into bogus sub-sentences.
+_SENTENCE_SPLIT_RE = re.compile(r'(?<=[.!?。！？])\s+')
+
+
+def is_strict_pnc(text: str) -> bool:
+    """Whether `text` is fully punctuated AND capitalized.
+
+    Returns True only if:
+      - the utterance ends with sentence-terminal punctuation (. ! ? …), and
+      - every sentence (split on terminal punctuation + whitespace) begins
+        with an uppercase letter.
+
+    Leading non-letter characters (quotes, digits, «) are skipped when checking
+    a sentence's initial capital, and trailing closing quotes/brackets are
+    ignored when checking the final punctuation.
+
+    Examples:
+        "Hello, world."            -> True
+        "Hello, world"             -> False  (no terminal punctuation)
+        "hello, world."            -> False  (not capitalized)
+        "Hello, world. How are you?" -> True
+        "Hello, world. how are you?" -> False  (2nd sentence not capitalized)
+    """
+    if not text:
+        return False
+    t = text.strip()
+    if not t:
+        return False
+
+    # Must END with terminal punctuation (ignoring trailing closing quotes).
+    tail = t.rstrip(_TRAILING_CLOSERS)
+    if not tail or tail[-1] not in SENTENCE_ENDINGS:
+        return False
+
+    # Every sentence must START with a capital letter.
+    for sentence in _SENTENCE_SPLIT_RE.split(t):
+        s = sentence.strip()
+        if not s:
+            continue
+        for ch in s:
+            if ch.isalpha():
+                if not ch.isupper():
+                    return False
+                break
+            # non-letter (quote, digit, «) -> keep scanning for first letter
+    return True
+
+
 @dataclass
 class FilterConfig:
     """Configuration for sample filtering."""
@@ -259,6 +316,10 @@ class FilterConfig:
     min_chars: int = 1
     max_chars: int = 500
     filter_whisper_hallucinations: bool = True
+    # When True, drop any utterance that isn't fully punctuated AND capitalized:
+    # it must end with terminal punctuation and every sentence must start with an
+    # uppercase letter. Used for clean-PnC finetune phases (see is_strict_pnc).
+    require_strict_pnc: bool = False
 
 
 class SampleFilter:
@@ -285,6 +346,7 @@ class SampleFilter:
             'rejected_min_chars': 0,
             'rejected_max_chars': 0,
             'rejected_bad_text': 0,
+            'rejected_not_strict_pnc': 0,
             'rejected_whisper_hallucination': 0,
         }
         self._hall_reason_counts: Dict[str, int] = {}
@@ -333,6 +395,13 @@ class SampleFilter:
         # Spaceless text filter (corrupted transcripts with words merged together)
         if text_len > 20 and ' ' not in text.strip():
             self._stats['rejected_bad_text'] += 1
+            return False
+
+        # Strict PnC filter: keep only fully punctuated + capitalized utterances.
+        # Applied at ingestion (before merging), so both single and merged
+        # samples end up fully punctuated and capitalized.
+        if self.config.require_strict_pnc and not is_strict_pnc(text):
+            self._stats['rejected_not_strict_pnc'] += 1
             return False
 
         # Whisper hallucination filter
@@ -396,6 +465,7 @@ class SampleFilter:
         logging.info(f"  Rejected min_chars: {self._stats['rejected_min_chars']}")
         logging.info(f"  Rejected max_chars: {self._stats['rejected_max_chars']}")
         logging.info(f"  Rejected bad_text: {self._stats['rejected_bad_text']}")
+        logging.info(f"  Rejected not_strict_pnc: {self._stats['rejected_not_strict_pnc']}")
 
         hall_count = self._stats['rejected_whisper_hallucination']
         if hall_count > 0:

@@ -167,6 +167,12 @@ class S3MultiLangStreamingDataset(IterableDataset):
         # Text normalization: "none", "full" (lowercase + remove all punctuation), "soft" (keep casing + keep only . , ! ?)
         normalize_text = "none",
 
+        # When True, drop any utterance that isn't fully punctuated AND
+        # capitalized (ends with . ! ? and every sentence starts uppercase).
+        # Enforced at ingestion (in SampleFilter) so both single and merged
+        # samples stay clean. Pairs well with normalize_text="soft".
+        require_strict_pnc: bool = False,
+
         # Shuffle buffer (0 = no buffering, stream directly)
         shuffle_buffer_size: int = 0,
 
@@ -398,8 +404,12 @@ class S3MultiLangStreamingDataset(IterableDataset):
             min_chars=1,
             max_chars=max_chars,
             filter_whisper_hallucinations=filter_whisper_hallucinations,
+            require_strict_pnc=require_strict_pnc,
         )
         self.sample_filter = SampleFilter(filter_config)
+        if require_strict_pnc:
+            logging.info("Strict PnC filter ENABLED: dropping utterances that "
+                         "aren't fully punctuated and capitalized")
 
         # Create token augmenter - but we'll use it only for checking if EOU should be added,
         # NOT for modifying the text (since SentencePiece doesn't tokenize <eou> correctly)
