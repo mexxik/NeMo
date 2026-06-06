@@ -201,6 +201,16 @@ class S3MultiLangStreamingDataset(IterableDataset):
         # sample is treated as clean (standard full-network training).
         clean_sources: Optional[List[str]] = None,
 
+        # Selective backprop, PnC-gated variant. When True, the clean/noisy flag
+        # is computed PER SAMPLE from is_strict_pnc(text) instead of per-source
+        # membership: a fully punctuated + capitalized utterance is tagged
+        # clean=True (updates the full network), anything else clean=False
+        # (encoder-only update). Unlike `require_strict_pnc` (a hard filter that
+        # DROPS non-PnC samples), this keeps every sample — non-PnC audio still
+        # trains the encoder. Mutually exclusive with `require_strict_pnc`
+        # (filter vs gate) and with `clean_sources` (two clean criteria).
+        clean_pnc_gate: bool = False,
+
         # Other
         return_sample_id: bool = False,
         samples_per_epoch: int = None,  # Override automatic length calculation
@@ -384,6 +394,26 @@ class S3MultiLangStreamingDataset(IterableDataset):
             logging.info(
                 f"[DATASET_INIT] Selective backprop enabled — clean sources: "
                 f"{sorted(self.clean_sources)} (all other sources tagged noisy)"
+            )
+        # PnC-gated selective backprop: clean flag derived per-sample from
+        # is_strict_pnc(text). See the constructor arg docstring above.
+        self.clean_pnc_gate = bool(clean_pnc_gate)
+        if self.clean_pnc_gate:
+            if self.clean_sources:
+                raise ValueError(
+                    "clean_pnc_gate and clean_sources are both set — pick one "
+                    "clean/noisy criterion (per-sample PnC OR per-source list)."
+                )
+            if require_strict_pnc:
+                raise ValueError(
+                    "clean_pnc_gate and require_strict_pnc are both set — "
+                    "require_strict_pnc DROPS non-PnC samples, leaving nothing "
+                    "to gate. Use one or the other."
+                )
+            logging.info(
+                "[DATASET_INIT] Selective backprop enabled — PnC-gated: "
+                "per-sample clean flag = is_strict_pnc(text); non-PnC samples "
+                "kept but update the encoder only."
             )
         # Per-yield cleanliness side-channel, mirrors `_cur_yield_weight`. Set by
         # `_process_sample` for the sample about to be yielded; read by the
@@ -1253,6 +1283,7 @@ class S3MultiLangStreamingDataset(IterableDataset):
                     sqlite_cache_path=self._sqlite_cache_path,
                     prefetch_buffer_size=self.prefetch_buffer_size,
                     clean_sources=self.clean_sources,
+                    clean_pnc_gate=self.clean_pnc_gate,
                 )
             else:
                 manager = LanguageSourceManager(
@@ -1266,6 +1297,7 @@ class S3MultiLangStreamingDataset(IterableDataset):
                     sqlite_cache_path=self._sqlite_cache_path,
                     prefetch_buffer_size=self.prefetch_buffer_size,
                     clean_sources=self.clean_sources,
+                    clean_pnc_gate=self.clean_pnc_gate,
                 )
             language_managers[lang] = manager
 
@@ -1294,6 +1326,7 @@ class S3MultiLangStreamingDataset(IterableDataset):
                         sqlite_cache_path=self._sqlite_cache_path,
                         prefetch_buffer_size=self.prefetch_buffer_size,
                         clean_sources=self.clean_sources,
+                        clean_pnc_gate=self.clean_pnc_gate,
                     )
                 else:
                     manager = SingleSourceManager(
@@ -1307,6 +1340,7 @@ class S3MultiLangStreamingDataset(IterableDataset):
                         sqlite_cache_path=self._sqlite_cache_path,
                         prefetch_buffer_size=self.prefetch_buffer_size,
                         clean_sources=self.clean_sources,
+                        clean_pnc_gate=self.clean_pnc_gate,
                     )
                 source_managers[manager_key] = manager
 

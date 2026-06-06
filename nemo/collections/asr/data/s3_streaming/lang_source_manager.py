@@ -11,7 +11,7 @@ from typing import Dict, Iterator, List, Optional
 from nemo.utils import logging
 
 from .disk_tar_stream import DiskManifestLoader, DiskTarStream
-from .filters import FilterConfig, SampleFilter
+from .filters import FilterConfig, SampleFilter, is_strict_pnc
 from .prefetch_buffer import PrefetchBuffer
 from .s3_tar_stream import S3ManifestLoader, S3TarStream
 from .sqlite_manifest import SQLiteManifestCache, SQLiteManifestProvider
@@ -56,6 +56,10 @@ class LanguageSourceManager:
         # Selective backprop: set of source names whose transcripts are "clean".
         # Samples are tagged sample['clean'] accordingly. None => all clean.
         clean_sources: Optional[set] = None,
+        # Selective backprop, PnC-gated: tag sample['clean'] per sample from
+        # is_strict_pnc(text) instead of source membership. Overrides
+        # clean_sources when True.
+        clean_pnc_gate: bool = False,
     ):
         """
         Initialize language source manager.
@@ -82,6 +86,7 @@ class LanguageSourceManager:
         self.storage_type = storage_type
         self.lang_subdir = bool(lang_subdir)
         self.clean_sources = clean_sources
+        self.clean_pnc_gate = bool(clean_pnc_gate)
         # Source whose stream is currently open, used to tag sample['clean'].
         self._current_source_name: Optional[str] = None
 
@@ -359,7 +364,9 @@ class LanguageSourceManager:
                 sample = self.token_augmenter(sample)
 
                 # Tag cleanliness for selective backprop (None => all clean).
-                if self.clean_sources is not None:
+                if self.clean_pnc_gate:
+                    sample['clean'] = is_strict_pnc(sample.get('text', '') or '')
+                elif self.clean_sources is not None:
                     sample['clean'] = self._current_source_name in self.clean_sources
 
                 yield sample
@@ -424,7 +431,9 @@ class LanguageSourceManager:
                 sample = self.token_augmenter(sample)
 
                 # Tag cleanliness for selective backprop (None => all clean).
-                if self.clean_sources is not None:
+                if self.clean_pnc_gate:
+                    sample['clean'] = is_strict_pnc(sample.get('text', '') or '')
+                elif self.clean_sources is not None:
                     sample['clean'] = self._current_source_name in self.clean_sources
 
                 empty_tar_count = 0  # Reset on success
@@ -526,6 +535,9 @@ class SingleSourceManager:
         sqlite_cache_path: str = None,
         # Selective backprop: set of clean source names. None => all clean.
         clean_sources: Optional[set] = None,
+        # Selective backprop, PnC-gated: tag sample['clean'] per sample from
+        # is_strict_pnc(text) instead of source membership.
+        clean_pnc_gate: bool = False,
     ):
         """
         Initialize single source manager.
@@ -555,6 +567,9 @@ class SingleSourceManager:
         # Selective backprop: this whole source is clean iff it's listed.
         # None => feature off (treat as clean).
         self._is_clean = (clean_sources is None) or (source in clean_sources)
+        # PnC-gated variant: clean flag is computed per sample from the text,
+        # not from source membership (see _tag_clean below).
+        self.clean_pnc_gate = bool(clean_pnc_gate)
 
         # Storage-specific setup
         if storage_type == "s3":
@@ -822,7 +837,10 @@ class SingleSourceManager:
 
                 sample = self.token_augmenter(sample)
                 # Tag cleanliness for selective backprop.
-                sample['clean'] = self._is_clean
+                if self.clean_pnc_gate:
+                    sample['clean'] = is_strict_pnc(sample.get('text', '') or '')
+                else:
+                    sample['clean'] = self._is_clean
                 yield sample
 
             except StopIteration:
@@ -872,7 +890,10 @@ class SingleSourceManager:
 
                 sample = self.token_augmenter(sample)
                 # Tag cleanliness for selective backprop.
-                sample['clean'] = self._is_clean
+                if self.clean_pnc_gate:
+                    sample['clean'] = is_strict_pnc(sample.get('text', '') or '')
+                else:
+                    sample['clean'] = self._is_clean
                 self._samples_yielded += 1
                 empty_tar_count = 0  # Reset on success
                 return sample
