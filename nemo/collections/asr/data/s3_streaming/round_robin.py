@@ -39,12 +39,19 @@ class RoundRobinInterleaver:
 
     When a language is exhausted, it's skipped until all languages are exhausted,
     then a new epoch begins and all languages reset.
+
+    stop_on_exhaustion ("sync" balance mode): instead of continuing with the
+    remaining languages once one drains, END the epoch the instant ANY language
+    is exhausted. This keeps every step language-balanced and avoids a
+    monolingual tail at epoch end (which biases LID toward whichever language
+    has more data — e.g. uk here).
     """
 
     def __init__(
         self,
         language_managers: Dict[str, LanguageSourceManager],
         languages_order: Optional[List[str]] = None,
+        stop_on_exhaustion: bool = False,
     ):
         """
         Initialize round-robin interleaver.
@@ -67,7 +74,12 @@ class RoundRobinInterleaver:
         if not self.languages_order:
             raise ValueError("No valid languages provided")
 
-        logging.info(f"RoundRobinInterleaver: {len(self.languages_order)} languages: {self.languages_order}")
+        self.stop_on_exhaustion = stop_on_exhaustion
+
+        logging.info(
+            f"RoundRobinInterleaver: {len(self.languages_order)} languages: "
+            f"{self.languages_order} (stop_on_exhaustion={self.stop_on_exhaustion})"
+        )
 
         self._current_idx = 0
         self._epoch = 0
@@ -139,6 +151,12 @@ class RoundRobinInterleaver:
             self._active_languages.discard(lang)
             if not _in_worker():
                 logging.info(f"[{lang}] Exhausted for epoch {self._epoch}")
+
+            if self.stop_on_exhaustion:
+                # "sync" mode: the moment ANY language drains, end the epoch so
+                # the model never trains on a monolingual tail.
+                self._active_languages.clear()
+                return None
 
         return None
 

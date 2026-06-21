@@ -308,9 +308,21 @@ class S3MultiLangStreamingDataset(IterableDataset):
             balance_mode = "max"
         elif balance_mode is False:
             balance_mode = "none"
+        # "sync": budget/oversample exactly like "max", but end the epoch the
+        # instant any language drains (language interleaver only). Normalize to
+        # "max" here so all balance/budget logic below is unchanged; the drain
+        # behavior is carried by self._stop_on_lang_exhaustion.
+        self._stop_on_lang_exhaustion = (balance_mode == "sync")
+        if balance_mode == "sync":
+            if rotation_level != "language":
+                logging.warning(
+                    "balance_mode='sync' only changes behavior with "
+                    "rotation_level='language'; with 'source' it behaves as 'max'."
+                )
+            balance_mode = "max"
         if balance_mode not in ("none", "max", "min", "distributed", "cap"):
             raise ValueError(
-                f"balance_mode must be 'none', 'max', 'min', 'distributed', or 'cap', "
+                f"balance_mode must be 'none', 'max', 'min', 'distributed', 'cap', or 'sync', "
                 f"got: {balance_mode}"
             )
         if balance_mode == "cap" and (balance_target_hours is None or balance_target_hours <= 0):
@@ -1304,6 +1316,7 @@ class S3MultiLangStreamingDataset(IterableDataset):
         return RoundRobinInterleaver(
             language_managers=language_managers,
             languages_order=sorted(self.language_sources.keys()),
+            stop_on_exhaustion=self._stop_on_lang_exhaustion,
         )
 
     def _create_source_interleaver(self) -> SourceRoundRobinInterleaver:
