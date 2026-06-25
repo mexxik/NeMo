@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import re
 from typing import List, Optional, Tuple, Union
 
 import editdistance
@@ -23,6 +24,27 @@ from nemo.collections.asr.parts.submodules.ctc_decoding import AbstractCTCDecodi
 from nemo.collections.asr.parts.submodules.multitask_decoding import AbstractMultiTaskDecoding
 from nemo.collections.asr.parts.submodules.rnnt_decoding import AbstractRNNTDecoding
 from nemo.utils import logging
+
+# Full text normalization for "fair" WER scoring during validation: lowercase,
+# strip all punctuation, collapse whitespace. The punctuation range MUST match
+# the dataset's _normalize_text (s3_streaming/dataset.py) so the metric measures
+# pure word accuracy regardless of how the model was trained (e.g. on soft/PnC
+# text). Both hypothesis and reference are passed through this before scoring.
+_EVAL_NORM_PUNCT_RE = re.compile(
+    r'[!-/:-@[-`{-~'
+    r'¡-¿ -⁯⸀-⹿'
+    r'　-〿︐-﹯！-｠'
+    r'؀-؏؛-؟٪-٭'
+    r'۔﴾﴿]+'
+)
+
+
+def normalize_text_for_eval(text: str) -> str:
+    """Full normalization: lowercase, remove all punctuation, collapse whitespace."""
+    text = text.lower()
+    text = _EVAL_NORM_PUNCT_RE.sub('', text)
+    return ' '.join(text.split()).strip()
+
 
 __all__ = ['word_error_rate', 'word_error_rate_detail', 'WER']
 
@@ -265,6 +287,13 @@ class WER(Metric):
         self.fold_consecutive = fold_consecutive
         self.batch_dim_index = batch_dim_index
 
+        # When True, both hypothesis and reference are fully normalized
+        # (lowercase + strip punctuation) before scoring, so WER measures pure
+        # word accuracy independent of PnC. Toggled by the training harness
+        # around the validation loop (see EvalNormalizeWERCallback). Default off
+        # preserves the as-trained scoring used for training_batch_wer.
+        self.eval_normalize = False
+
         self.decode = None
         if isinstance(self.decoding, AbstractRNNTDecoding):
             self.decode = lambda predictions, predictions_lengths, predictions_mask, input_ids: self.decoding.rnnt_decoder_predictions_tensor(
@@ -340,11 +369,15 @@ class WER(Metric):
         for h, r in zip(hypotheses, references):
             if isinstance(h, list):
                 h = h[0]
+            h_text = h.text
+            if self.eval_normalize:
+                h_text = normalize_text_for_eval(h_text)
+                r = normalize_text_for_eval(r)
             if self.use_cer:
-                h_list = list(h.text)
+                h_list = list(h_text)
                 r_list = list(r)
             else:
-                h_list = h.text.split()
+                h_list = h_text.split()
                 r_list = r.split()
             words += len(r_list)
             # Compute Levenstein's distance
