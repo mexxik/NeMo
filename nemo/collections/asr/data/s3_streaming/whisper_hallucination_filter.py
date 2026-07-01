@@ -29,6 +29,17 @@ _PHRASES_DIR = os.path.join(os.path.dirname(__file__), "hallucination_phrases")
 _PUNCT_RE = re.compile(r'[.,!?;:\-\u2014\u2013\u00ab\u00bb\u201e\u201c\u201d\u00bf\u00a1\u2026\u2018\u2019\'\"()\[\]{}]+')
 
 
+# CJK / Japanese / Korean scripts. Whisper injects these as cross-language
+# contamination into otherwise-monolingual transcripts (e.g. a Chinese
+# "\u6703\u8b70" spliced into a Ukrainian sentence). Covers: CJK symbols & punctuation,
+# Hiragana, Katakana, CJK Unified Ideographs (+ Ext A) and compatibility,
+# Hangul syllables + Jamo, and fullwidth/halfwidth forms.
+_CJK_RE = re.compile(
+    r'[\u3000-\u303f\u3040-\u30ff\u31f0-\u31ff\u3400-\u4dbf\u4e00-\u9fff'
+    r'\uf900-\ufaff\uac00-\ud7af\u1100-\u11ff\uff00-\uffef]'
+)
+
+
 def _normalize_for_matching(text: str) -> str:
     """Strip punctuation and normalize whitespace for fuzzy phrase matching."""
     text = _PUNCT_RE.sub('', text)
@@ -137,6 +148,13 @@ class WhisperHallucinationFilter:
             return ""
 
         text_stripped = text.strip()
+
+        # --- 0. Wrong-script (CJK) contamination ---
+        # Whisper splices Chinese/Japanese/Korean fragments into otherwise
+        # monolingual transcripts. None of the target languages here use CJK,
+        # so any CJK codepoint marks the whole sample as contaminated.
+        if _CJK_RE.search(text_stripped):
+            return "cjk_contamination"
 
         # --- 1. Exact phrase matching ---
         normalized = _normalize_for_matching(text_stripped).lower()
