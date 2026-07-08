@@ -40,6 +40,25 @@ _CJK_RE = re.compile(
 )
 
 
+# Languages whose NATIVE script is (partly) inside _CJK_RE. For these, CJK /
+# kana / Hangul codepoints are the expected script, NOT cross-language
+# contamination, so the cjk_contamination rule must not fire on them. This is
+# what lets multilingual training (e.g. FLEURS ja/zh/yue/ko) keep its data while
+# still guarding monolingual en/uk transcripts against spliced CJK.
+_CJK_NATIVE_LANGS = frozenset({
+    "ja",                                                  # Japanese (kanji + kana)
+    "zh", "zh-cn", "zh-tw", "cmn", "wuu", "yue", "lzh", "hak", "nan",  # Sinitic
+    "ko",                                                  # Korean (Hangul)
+})
+
+# Kill-switch for the cjk_contamination rule. Set ASR_FILTER_CJK=0 (or
+# false/no/off) to disable it entirely \u2014 e.g. multilingual training where CJK
+# languages are expected everywhere. Default on (guards en/uk-style data).
+_CJK_FILTER_DISABLED = os.environ.get("ASR_FILTER_CJK", "1").strip().lower() in (
+    "0", "false", "no", "off",
+)
+
+
 def _normalize_for_matching(text: str) -> str:
     """Strip punctuation and normalize whitespace for fuzzy phrase matching."""
     text = _PUNCT_RE.sub('', text)
@@ -150,10 +169,15 @@ class WhisperHallucinationFilter:
         text_stripped = text.strip()
 
         # --- 0. Wrong-script (CJK) contamination ---
-        # Whisper splices Chinese/Japanese/Korean fragments into otherwise
-        # monolingual transcripts. None of the target languages here use CJK,
-        # so any CJK codepoint marks the whole sample as contaminated.
-        if _CJK_RE.search(text_stripped):
+        # Whisper splices CJK/kana/Hangul fragments into otherwise-monolingual
+        # transcripts. This rule is SKIPPED when (a) disabled via ASR_FILTER_CJK=0,
+        # or (b) the sample's own language natively uses that script
+        # (ja/zh/yue/ko/...), for which CJK codepoints are expected, not
+        # contamination. Without (b), multilingual training would drop all of its
+        # CJK-language data.
+        if (not _CJK_FILTER_DISABLED
+                and (lang or "").lower() not in _CJK_NATIVE_LANGS
+                and _CJK_RE.search(text_stripped)):
             return "cjk_contamination"
 
         # --- 1. Exact phrase matching ---

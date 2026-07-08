@@ -5,6 +5,7 @@ Provides configurable filters for duration, character rate, and text quality.
 Matches the filtering logic from 01_gather.py for consistency.
 """
 
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set
@@ -352,11 +353,20 @@ class SampleFilter:
         self._hall_reason_counts: Dict[str, int] = {}
         self._last_hall_log_count = 0
 
-        # Initialize whisper hallucination filter
+        # Initialize whisper hallucination filter. Master kill-switch:
+        # ASR_FILTER_HALLUCINATION=0 (or false/no/off) disables the ENTIRE whisper
+        # hallucination filter — phrase matching, repeated-ngram and CJK checks —
+        # overriding the config flag. (For the CJK check alone, prefer the
+        # language-aware ASR_FILTER_CJK switch in whisper_hallucination_filter.)
         self._hall_filter = None
-        if config.filter_whisper_hallucinations:
+        _hall_env_off = os.environ.get("ASR_FILTER_HALLUCINATION", "1").strip().lower() in (
+            "0", "false", "no", "off",
+        )
+        if config.filter_whisper_hallucinations and not _hall_env_off:
             from .whisper_hallucination_filter import WhisperHallucinationFilter
             self._hall_filter = WhisperHallucinationFilter(enabled=True)
+        elif config.filter_whisper_hallucinations and _hall_env_off:
+            logging.info("[HALL_FILTER] Disabled via ASR_FILTER_HALLUCINATION=0")
 
     def __call__(self, sample: dict) -> bool:
         """
