@@ -26,23 +26,27 @@ from nemo.collections.asr.parts.submodules.rnnt_decoding import AbstractRNNTDeco
 from nemo.utils import logging
 
 # Full text normalization for "fair" WER scoring during validation: lowercase,
-# strip all punctuation, collapse whitespace. The punctuation range MUST match
-# the dataset's _normalize_text (s3_streaming/dataset.py) so the metric measures
-# pure word accuracy regardless of how the model was trained (e.g. on soft/PnC
-# text). Both hypothesis and reference are passed through this before scoring.
+# fold apostrophes away, map hyphens/dashes and all other punctuation to spaces,
+# collapse whitespace. Conventions MUST stay consistent with the dataset's
+# normalizers (s3_streaming/dataset.py): training keeps apostrophes and spaces
+# out hyphens, so scoring DELETES apostrophes on both sides (fair to models
+# trained either way) and treats hyphenated compounds as separate words. Both
+# hypothesis and reference are passed through this before scoring.
+_EVAL_APOS_RE = re.compile(r'[\u0027\u2019\u02BC\u0060\u00B4\u2018]')
 _EVAL_NORM_PUNCT_RE = re.compile(
-    r'[!-/:-@[-`{-~'
-    r'¡-¿ -⁯⸀-⹿'
-    r'　-〿︐-﹯！-｠'
-    r'؀-؏؛-؟٪-٭'
-    r'۔﴾﴿]+'
+    r'[\u0021-\u002F\u003A-\u0040\u005B-\u0060\u007B-\u007E'
+    r'\u00A1-\u00BF\u2000-\u206F\u2E00-\u2E7F'
+    r'\u3000-\u303F\uFE10-\uFE6F\uFF01-\uFF60'
+    r'\u0600-\u060F\u061B-\u061F\u066A-\u066D'
+    r'\u06D4\uFD3E\uFD3F]+'
 )
 
 
 def normalize_text_for_eval(text: str) -> str:
-    """Full normalization: lowercase, remove all punctuation, collapse whitespace."""
+    """Full normalization: lowercase, drop apostrophes, punctuation -> space."""
     text = text.lower()
-    text = _EVAL_NORM_PUNCT_RE.sub('', text)
+    text = _EVAL_APOS_RE.sub('', text)
+    text = _EVAL_NORM_PUNCT_RE.sub(' ', text)
     return ' '.join(text.split()).strip()
 
 

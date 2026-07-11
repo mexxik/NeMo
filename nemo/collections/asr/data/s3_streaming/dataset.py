@@ -2107,8 +2107,17 @@ class S3MultiLangStreamingDataset(IterableDataset):
 
         return tokens
 
-    # Pre-compiled regex for punctuation removal (all Unicode punctuation categories)
-    _PUNCT_RE = re.compile(r'[\u0021-\u002F\u003A-\u0040\u005B-\u0060\u007B-\u007E'
+    # Word-internal apostrophe is orthography, not punctuation (uk м'ята,
+    # fr l'école, en don't) — deleting it teaches the model unwritable words.
+    # All variants fold to ASCII "'" (U+0027) so one tokenizer symbol covers them.
+    _APOS_RE = re.compile(r'[\u2019\u02BC\u0060\u00B4\u2018]')
+    # Hyphens/dashes become a space, never deleted: deletion merges compounds
+    # ("будь-яких" -> "будьяких") and the model learns the merged spelling.
+    _DASH_RE = re.compile(r'[\u002D\u2010-\u2015]+')
+
+    # Pre-compiled regex for punctuation removal (all Unicode punctuation
+    # categories except U+0027 "'" — apostrophes are folded and kept above)
+    _PUNCT_RE = re.compile(r'[\u0021-\u0026\u0028-\u002F\u003A-\u003F\u005B-\u0060\u007B-\u007E'
                            r'\u00A1-\u00BF\u2000-\u206F\u2E00-\u2E7F'
                            r'\u3000-\u303F\uFE10-\uFE6F\uFF01-\uFF60'
                            r'\u0600-\u060F\u061B-\u061F\u066A-\u066D'
@@ -2119,22 +2128,28 @@ class S3MultiLangStreamingDataset(IterableDataset):
         Full normalization: remove all punctuation and lowercase.
 
         Produces "no PnC" (no Punctuation and Capitalization) text.
+        Apostrophes are kept (folded to "'"); hyphens/dashes become spaces.
         """
         text = text.lower()
+        text = self._APOS_RE.sub("'", text)
+        text = self._DASH_RE.sub(' ', text)
         text = self._PUNCT_RE.sub('', text)
         text = ' '.join(text.split())
         return text.strip()
 
-    # Regex for soft normalization: remove everything that's not word chars, whitespace, or . , ! ?
-    _SOFT_PUNCT_RE = re.compile(r'[^\w\s.,!?]', re.UNICODE)
+    # Regex for soft normalization: keep word chars, whitespace, . , ! ? @ and '
+    _SOFT_PUNCT_RE = re.compile(r"[^\w\s.,!?@']", re.UNICODE)
 
     def _soft_normalize_text(self, text: str) -> str:
         """
         Soft normalization: keep capitalization, keep only . , ! ? punctuation.
 
-        Removes all other punctuation marks (colons, semicolons, quotes,
-        brackets, dashes, etc.) while preserving the original casing.
+        Apostrophes are kept (folded to "'"), hyphens/dashes become spaces, and
+        all other punctuation (colons, semicolons, quotes, brackets, dashes
+        etc.) is removed while preserving the original casing.
         """
+        text = self._APOS_RE.sub("'", text)
+        text = self._DASH_RE.sub(' ', text)
         text = self._SOFT_PUNCT_RE.sub('', text)
         text = ' '.join(text.split())
         return text.strip()
