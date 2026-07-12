@@ -1203,7 +1203,13 @@ class S3MultiLangStreamingDataset(IterableDataset):
             for idx, (lang, source) in enumerate(sources_iterator):
                 if use_tqdm:
                     sources_iterator.set_postfix_str(f"{lang}/{source}")
-                source_prefix = f"{self.s3_prefix.rstrip('/') + '/' if self.s3_prefix else ''}{source}/"
+                # S3 key prefix. Honor lang_subdir symmetrically with the disk
+                # path (line ~1234) so an on-disk <lang>/<source>/ tree can be
+                # served verbatim over S3. Flat buckets (lang_subdir=False) are
+                # unchanged, so existing R2 configs keep working.
+                base_prefix = f"{self.s3_prefix.rstrip('/') + '/'}" if self.s3_prefix else ""
+                lang_prefix = f"{lang}/" if self.lang_subdir else ""
+                source_prefix = f"{base_prefix}{lang_prefix}{source}/"
                 manifest_key = f"{source_prefix}tarred_audio_manifest.json"
                 try:
                     if sqlite_cache:

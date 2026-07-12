@@ -16,6 +16,8 @@ import numpy as np
 
 from nemo.utils import logging
 
+from . import tar_disk_cache
+
 try:
     import boto3
     from botocore.config import Config as BotoConfig
@@ -116,6 +118,59 @@ class S3TarStream:
 
         self._exhausted = False
 
+    def _emit_members(self, tar, processed_files):
+        """
+        Yield sample dicts for manifest-matched members of an open tarfile.
+
+        Shared by the cached (local-file) and streaming paths. Raises on
+        connection errors during extraction so the streaming caller can retry;
+        the local-file caller never hits those.
+        """
+        for member in tar:
+            if not member.isfile():
+                continue
+
+            filename = member.name
+
+            # Skip already processed files (from a previous retry)
+            if filename in processed_files:
+                continue
+
+            # Check if this file is in our manifest
+            if filename not in self.manifest_entries:
+                continue
+
+            # Extract audio bytes
+            try:
+                audio_file = tar.extractfile(member)
+                if audio_file is None:
+                    continue
+                audio_bytes = audio_file.read()
+            except Exception as e:
+                # Connection error during extraction - raise to trigger retry
+                if 'IncompleteRead' in str(e) or 'Connection' in str(e):
+                    raise
+                logging.warning(f"Failed to extract {filename}: {e}")
+                continue
+
+            # Parse WAV to float32
+            audio = fast_wav_to_float32(audio_bytes)
+            if audio is None:
+                continue
+
+            entry = self.manifest_entries[filename]
+
+            # Mark as processed before yielding
+            processed_files.add(filename)
+
+            yield {
+                'audio': audio,
+                'text': entry.get('text', ''),
+                'duration': entry.get('duration', len(audio) / 16000),
+                'lang': entry.get('lang', 'unknown'),
+                'filename': filename,
+            }
+
     def __iter__(self) -> Iterator[dict]:
         """
         Iterate over samples in the TAR file.
@@ -125,6 +180,23 @@ class S3TarStream:
         """
         self._exhausted = False
         processed_files = set()  # Track files we've already yielded
+
+        # Opt-in cross-epoch shard cache (ASR_TAR_CACHE_DIR). On a cache hit we
+        # read from local disk with no network I/O and no retry loop; on a miss
+        # the shard is fetched, cached, then read locally. Returns None when
+        # caching is disabled or the fetch failed -> fall through to streaming.
+        if tar_disk_cache.cache_enabled():
+            local_path = tar_disk_cache.get_or_fetch(self.s3_client, self.s3_bucket, self.tar_key)
+            if local_path is not None:
+                try:
+                    with tarfile.open(local_path, mode='r:*') as tar:
+                        yield from self._emit_members(tar, processed_files)
+                    self._exhausted = True
+                    return
+                except Exception as e:
+                    logging.warning(
+                        f"Failed reading cached shard {local_path}: {e}; streaming from S3 instead"
+                    )
 
         for attempt in range(self.max_retries):
             try:
@@ -136,57 +208,8 @@ class S3TarStream:
                 tar_stream = S3StreamWrapper(body)
 
                 # Open as tarfile in streaming mode
-                total_files_in_tar = 0
-                matched_files_in_tar = 0
                 with tarfile.open(fileobj=tar_stream, mode='r|*') as tar:
-                    for member in tar:
-                        if not member.isfile():
-                            continue
-
-                        total_files_in_tar += 1
-                        filename = member.name
-
-                        # Skip already processed files (from previous retry)
-                        if filename in processed_files:
-                            continue
-
-                        # Check if this file is in our manifest
-                        if filename not in self.manifest_entries:
-                            continue
-
-                        matched_files_in_tar += 1
-
-                        # Extract audio bytes
-                        try:
-                            audio_file = tar.extractfile(member)
-                            if audio_file is None:
-                                continue
-                            audio_bytes = audio_file.read()
-                        except Exception as e:
-                            # Connection error during extraction - raise to trigger retry
-                            if 'IncompleteRead' in str(e) or 'Connection' in str(e):
-                                raise
-                            logging.warning(f"Failed to extract {filename}: {e}")
-                            continue
-
-                        # Parse WAV to float32
-                        audio = fast_wav_to_float32(audio_bytes)
-                        if audio is None:
-                            continue
-
-                        # Get manifest entry
-                        entry = self.manifest_entries[filename]
-
-                        # Mark as processed before yielding
-                        processed_files.add(filename)
-
-                        yield {
-                            'audio': audio,
-                            'text': entry.get('text', ''),
-                            'duration': entry.get('duration', len(audio) / 16000),
-                            'lang': entry.get('lang', 'unknown'),
-                            'filename': filename,
-                        }
+                    yield from self._emit_members(tar, processed_files)
 
                 # Successfully completed - exit retry loop
                 break
