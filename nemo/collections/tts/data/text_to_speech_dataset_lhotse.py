@@ -152,8 +152,15 @@ class MagpieTTSLhotseDataset(torch.utils.data.Dataset):
         tokenizer_config: DictConfig = None,
         text_context_remapping: Dict[str, str] = None,
         text_context_remapping_prob: float = 0.0,
+        baked_speaker_map: Dict[str, int] = None,
     ):
         super().__init__()
+        # Maps a Speaker:<id> (from cut.supervisions[0].speaker) to a row of the
+        # model's baked_context_embedding. Required to finetune a model that has
+        # one: it selects the context embedding per sample, replacing the
+        # context_encoder entirely. Without it every sample silently falls back
+        # to speaker 0 (see MagpieTTSModel._normalize_speaker_indices).
+        self.baked_speaker_map = dict(baked_speaker_map) if baked_speaker_map else None
         self.sample_rate = sample_rate
         self.volume_norm = volume_norm
         self.audio_bos_id = audio_bos_id
@@ -223,6 +230,7 @@ class MagpieTTSLhotseDataset(torch.utils.data.Dataset):
         context_text_tokens_len_list = []
         context_has_text_context_list = []
         reward_list = []
+        speaker_indices_list = []
         raw_text_list = (
             []
         )  # raw text here is the string of normalized text or text stored in the supervision segment. Used to distinguish from text tokens.
@@ -232,6 +240,16 @@ class MagpieTTSLhotseDataset(torch.utils.data.Dataset):
                 raise ValueError(f"Invalid format in cut.supervisions[0].speaker: {speaker}")
             dataset_name = speaker.strip().split()[2].split(":")[-1]
             dataset_name_list.append(dataset_name)
+
+            if self.baked_speaker_map is not None:
+                speaker_id = speaker.strip().split()[3].split(":", 1)[-1]
+                if speaker_id not in self.baked_speaker_map:
+                    raise KeyError(
+                        f"Speaker '{speaker_id}' is not in baked_speaker_map. Every training "
+                        f"speaker needs a baked_context_embedding row; regenerate the map and "
+                        f"re-run expand_baked_speakers.py."
+                    )
+                speaker_indices_list.append(self.baked_speaker_map[speaker_id])
 
             # target audio or target codes
             if self.load_cached_codes_if_available and cut.has_custom("target_codes"):
@@ -485,6 +503,9 @@ class MagpieTTSLhotseDataset(torch.utils.data.Dataset):
 
         if len(reward_list) > 0:
             batch_dict['rewards'] = torch.FloatTensor(reward_list)
+
+        if len(speaker_indices_list) > 0:
+            batch_dict['speaker_indices'] = torch.tensor(speaker_indices_list, dtype=torch.int64)
 
         # Assert only ONE of context_audio or context_audio_codes in the batch
         assert ('audio' in batch_dict) ^ ('audio_codes' in batch_dict)

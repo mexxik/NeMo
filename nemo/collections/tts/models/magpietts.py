@@ -841,14 +841,44 @@ class MagpieTTSModel(ModelPT):
             T = self._baked_embedding_T.item()
             D = self._baked_embedding_D.item()
 
-            # Create nn.Embedding and load weights (no gradients for inference)
+            # Create nn.Embedding and load weights.
             self.baked_context_embedding = nn.Embedding(num_speakers, embedding_dim)
             self.baked_context_embedding.weight.data = weight
-            self.baked_context_embedding.weight.requires_grad_(False)
+
+            # num_frozen_baked_speakers pins the first N rows while leaving the rest
+            # trainable — the shape a cross-lingual finetune needs: the shipped
+            # speakers stay bit-identical while throwaway rows absorb the training
+            # corpus's voices, so the decoder learns the new language's phonetics
+            # speaker-independently and it transfers back to the frozen voices.
+            # Default (None) freezes everything, preserving inference behaviour.
+            num_frozen = self.cfg.get('num_frozen_baked_speakers', None)
+            if num_frozen is None:
+                self.baked_context_embedding.weight.requires_grad_(False)
+                frozen_desc = "all (inference)"
+            else:
+                num_frozen = int(num_frozen)
+                if not 0 <= num_frozen <= num_speakers:
+                    raise ValueError(
+                        f"num_frozen_baked_speakers={num_frozen} out of range [0, {num_speakers}]"
+                    )
+                self.baked_context_embedding.weight.requires_grad_(True)
+                # Zeroing the frozen rows' gradient is NOT enough: AdamW's decoupled
+                # weight decay shrinks every stepped parameter regardless of its grad.
+                # Keep a pristine copy and restore it after each optimizer step
+                # (see on_before_zero_grad) so the shipped voices stay bit-identical.
+                self._num_frozen_baked_speakers = num_frozen
+                if num_frozen > 0:
+                    self.register_buffer(
+                        '_frozen_baked_rows',
+                        weight[:num_frozen].detach().clone(),
+                        persistent=False,
+                    )
+                frozen_desc = f"rows [0,{num_frozen}) frozen, [{num_frozen},{num_speakers}) trainable"
 
             logging.info(
                 f"Loaded baked context embedding: num_speakers={num_speakers}, T={T}, D={D}, "
-                f"shape=({num_speakers}, {embedding_dim}), lengths={self.baked_context_embedding_len.tolist()}"
+                f"shape=({num_speakers}, {embedding_dim}), lengths={self.baked_context_embedding_len.tolist()}, "
+                f"{frozen_desc}"
             )
 
         if not strict:
@@ -881,6 +911,18 @@ class MagpieTTSModel(ModelPT):
                     if key.startswith(name_with_dot):
                         new_state_dict[key[len(name_with_dot) :]] = state_dict[key]
                 child.load_state_dict(new_state_dict)
+
+    def on_before_zero_grad(self, optimizer):
+        """Restore the frozen baked-speaker rows after each optimizer step.
+
+        Fires after optimizer.step(), before grads are cleared. Needed because
+        AdamW applies decoupled weight decay to every stepped parameter, so a
+        zero gradient alone does not hold a row fixed.
+        """
+        frozen = getattr(self, '_frozen_baked_rows', None)
+        if frozen is not None:
+            with torch.no_grad():
+                self.baked_context_embedding.weight[: frozen.size(0)].copy_(frozen)
 
     def audio_to_codes(self, audio, audio_len, audio_type='target'):
         # audio: (B, T)
@@ -3311,6 +3353,7 @@ class MagpieTTSModel(ModelPT):
             tokenizer_config=self.cfg.text_tokenizers,
             text_context_remapping=self.text_context_remapping,
             text_context_remapping_prob=self.text_context_remapping_prob,
+            baked_speaker_map=self.cfg.get('baked_speaker_map', None),
         )
         data_loader = get_lhotse_dataloader_from_config(
             config=dataset_cfg.dataset,
