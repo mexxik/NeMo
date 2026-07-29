@@ -168,6 +168,7 @@ class S3TarStream:
                 'text': entry.get('text', ''),
                 'duration': entry.get('duration', len(audio) / 16000),
                 'lang': entry.get('lang', 'unknown'),
+                'phonemes': entry.get('phonemes'),
                 'filename': filename,
             }
 

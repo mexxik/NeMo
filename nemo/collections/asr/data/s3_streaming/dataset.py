@@ -5,6 +5,7 @@ Main dataset class that integrates all streaming components.
 Supports both S3 and local disk storage.
 """
 
+import json
 import multiprocessing as mp
 import os
 import random
@@ -263,6 +264,9 @@ class S3MultiLangStreamingDataset(IterableDataset):
         #                 heard (authoritative per word, no provisional opening
         #                 tag). Uses the single `<lang>` tokens like "word"; needs
         #                 a tokenizer built with --label-scheme romanize_word.
+        #   "phoneme_word" -> per word: fixed IPA character IDs + `<lang>`.
+        #                 Phonemes are normally precomputed in SQLite; a slow
+        #                 on-the-fly G2P fallback keeps non-cached manifests usable.
         lid_label_scheme: str = "word",
     ):
         """
@@ -556,7 +560,11 @@ class S3MultiLangStreamingDataset(IterableDataset):
 
         # LID mode: force lang-token vocab lookup, disable text/normalization paths.
         self.lid_mode = bool(lid_mode)
-        self.lid_label_scheme = lid_label_scheme if lid_label_scheme in ("word", "syllable", "romanize", "romanize_word") else "word"
+        self.lid_label_scheme = (
+            lid_label_scheme
+            if lid_label_scheme in ("word", "syllable", "romanize", "romanize_word", "phoneme_word")
+            else "word"
+        )
         if self.lid_mode:
             add_lang_token = True
             add_eou_token = False
@@ -602,6 +610,21 @@ class S3MultiLangStreamingDataset(IterableDataset):
                         f"Lang token '{token_str}' not found in vocabulary — "
                         f"samples for lang='{lang}' will not be tagged"
                     )
+
+        if self.lid_mode and self.lid_label_scheme == "phoneme_word":
+            sp = tokenizer.tokenizer if hasattr(tokenizer, 'tokenizer') else None
+            marker_id = sp.piece_to_id("<phone_vocab>") if sp is not None else None
+            if sp is None or marker_id == sp.unk_id():
+                raise ValueError(
+                    "lid_label_scheme='phoneme_word' requires the fixed IPA tokenizer "
+                    "built by 01p_build_phoneme_tokenizer.py."
+                )
+            self.phoneme_char_ids = {
+                sp.id_to_piece(token_id): token_id
+                for token_id in range(sp.get_piece_size())
+                if len(sp.id_to_piece(token_id)) == 1
+            }
+            logging.info("Phoneme tokenizer marker '<phone_vocab>' found at ID %s", marker_id)
 
         # Boundary-scheme token IDs: per-language `<lang_S>`, `<lang_E>`.
         # The syllable scheme additionally needs a generic `<syl>` marker; the
@@ -1760,6 +1783,7 @@ class S3MultiLangStreamingDataset(IterableDataset):
 
         # Check if this is a merged sample
         original_texts = sample.get('original_texts')
+        original_phonemes = sample.get('original_phonemes')
         eou_positions = sample.get('eou_positions', [])
 
         if original_texts is not None:
@@ -1770,7 +1794,8 @@ class S3MultiLangStreamingDataset(IterableDataset):
             # The romanizer already drops anything outside [a-z ] — let it do
             # the cleaning.
             skip_unk_clean = (
-                self.lid_mode and self.lid_label_scheme in ("romanize", "romanize_word")
+                self.lid_mode
+                and self.lid_label_scheme in ("romanize", "romanize_word", "phoneme_word")
             )
             if not skip_unk_clean:
                 original_texts = [self._clean_unk_chars(t) for t in original_texts]
@@ -1779,6 +1804,7 @@ class S3MultiLangStreamingDataset(IterableDataset):
                 eou_positions,
                 sample_lang=sample.get('lang'),
                 segment_langs=sample.get('langs'),
+                segment_phonemes=original_phonemes,
             )
         elif self.lid_mode:
             # LID mode (single utterance). Scheme = "word" or "syllable" — both
@@ -1786,12 +1812,16 @@ class S3MultiLangStreamingDataset(IterableDataset):
             # romanize/romanize_word romanize the text downstream; skip the
             # UNK-char strip there or it wipes non-Latin scripts pre-romanize.
             text = sample.get('text', '') or ''
-            if self.lid_label_scheme not in ("romanize", "romanize_word"):
+            if self.lid_label_scheme not in ("romanize", "romanize_word", "phoneme_word"):
                 text = self._clean_unk_chars(text)
             sample_lang = sample.get('lang')
             if not sample_lang:
                 return None
-            tokens = self._build_lid_tokens(text, sample_lang)
+            tokens = self._build_lid_tokens(
+                text,
+                sample_lang,
+                phonemes=sample.get('phonemes'),
+            )
             if tokens is None:
                 return None
         else:
@@ -1928,7 +1958,12 @@ class S3MultiLangStreamingDataset(IterableDataset):
                 in_v = False
         return max(1, n)
 
-    def _build_lid_tokens(self, text: str, lang: str) -> Optional[List[int]]:
+    def _build_lid_tokens(
+        self,
+        text: str,
+        lang: str,
+        phonemes: Optional[str] = None,
+    ) -> Optional[List[int]]:
         """Return the LID label sequence for one utterance segment in `lang`.
         Returns None if the language isn't in the vocab (sample will be skipped)."""
         words = (text or "").split()
@@ -1937,6 +1972,55 @@ class S3MultiLangStreamingDataset(IterableDataset):
             if lang_id is None:
                 return None
             return [lang_id] * max(1, len(words))
+
+        if self.lid_label_scheme == "phoneme_word":
+            # Fixed IPA characters followed by the authoritative language tag
+            # for every G2P word.  No BPE merges are possible in this tokenizer.
+            lang_id = self.lang_token_ids.get(lang)
+            if lang_id is None:
+                return None
+
+            ipa_words = None
+            if isinstance(phonemes, list):
+                ipa_words = phonemes
+            elif isinstance(phonemes, str) and phonemes:
+                try:
+                    decoded = json.loads(phonemes)
+                    if isinstance(decoded, list):
+                        ipa_words = decoded
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    ipa_words = None
+
+            if ipa_words is None:
+                # Correctness fallback for raw/non-cached manifests. Production
+                # recipes precompute this field to keep G2P out of dataloader
+                # workers.
+                from .phonemize import phonemize_words
+
+                try:
+                    ipa_words = phonemize_words(text or "", lang)
+                except Exception as exc:
+                    logging.warning("G2P failed for lang=%s: %s", lang, exc)
+                    return None
+
+            char_ids = getattr(self, "phoneme_char_ids", None)
+            if char_ids is None:
+                return None
+            out: List[int] = []
+            for ipa_word in ipa_words:
+                ids: List[int] = []
+                for char in str(ipa_word):
+                    if char.isspace():
+                        continue
+                    token_id = char_ids.get(char)
+                    if token_id is None:
+                        return None
+                    ids.append(token_id)
+                if not ids:
+                    continue
+                out.extend(ids)
+                out.append(lang_id)
+            return out or None
 
         if self.lid_label_scheme == "romanize":
             # `<lang_S>` + BPE(romanized text) + `<lang_E>`. The romanized text
@@ -1998,6 +2082,7 @@ class S3MultiLangStreamingDataset(IterableDataset):
         eou_positions: List[int],
         sample_lang: Optional[str] = None,
         segment_langs: Optional[List[str]] = None,
+        segment_phonemes: Optional[List[str]] = None,
     ) -> List[int]:
         """
         Tokenize merged multi-utterance/multi-turn sample.
@@ -2018,6 +2103,7 @@ class S3MultiLangStreamingDataset(IterableDataset):
             eou_positions: Indices of segments that should have EOU appended
             sample_lang: Fallback language tag (used when segment_langs is not provided)
             segment_langs: Per-segment language tags, parallel to `texts`
+            segment_phonemes: Precomputed IPA JSON strings, parallel to `texts`
 
         Returns:
             Combined token list with special tokens inserted appropriately
@@ -2027,10 +2113,15 @@ class S3MultiLangStreamingDataset(IterableDataset):
         if self.lid_mode:
             tokens: List[int] = []
             langs = segment_langs if segment_langs is not None else [sample_lang] * len(texts)
-            for txt, lang in zip(texts, langs):
+            for index, (txt, lang) in enumerate(zip(texts, langs)):
                 if not lang:
                     continue
-                seg = self._build_lid_tokens(txt or "", lang)
+                cached = (
+                    segment_phonemes[index]
+                    if segment_phonemes is not None and index < len(segment_phonemes)
+                    else None
+                )
+                seg = self._build_lid_tokens(txt or "", lang, phonemes=cached)
                 if seg is not None:
                     tokens.extend(seg)
             return tokens

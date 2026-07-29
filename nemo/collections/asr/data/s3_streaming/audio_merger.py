@@ -198,6 +198,7 @@ class AudioMerger:
         # Build merged audio and text
         merged_audio_parts = []
         merged_texts = []
+        merged_phonemes = []
         eou_positions = []  # Track which segments should have EOU
         total_duration = 0.0
 
@@ -216,6 +217,7 @@ class AudioMerger:
             # Add audio
             merged_audio_parts.append(audio)
             merged_texts.append(text)
+            merged_phonemes.append(sample.get('phonemes'))
             total_duration += duration
 
             # Track if this segment ends with punctuation (should have EOU)
@@ -255,6 +257,8 @@ class AudioMerger:
             'merged_count': len(samples),
             'eou_positions': eou_positions,
             'original_texts': merged_texts,  # Keep original texts for tokenization
+            # Precomputed IPA JSON strings, parallel to original_texts.
+            'original_phonemes': merged_phonemes,
             # First-sample lang preserved for backward compat (legacy add_lang_token path).
             'lang': samples[0].get('lang') if samples else None,
             # Per-segment langs parallel to original_texts. Used by lid_mode to

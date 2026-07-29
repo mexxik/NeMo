@@ -63,7 +63,7 @@ class SQLiteManifestCache:
         tar_files = cache.get_tar_files("common_en_train")
     """
 
-    SCHEMA_VERSION = 2  # Bumped for tar_files table
+    SCHEMA_VERSION = 3  # Adds precomputed per-word IPA targets.
 
     def __init__(self, db_path: str, read_only: bool = False):
         """
@@ -114,9 +114,13 @@ class SQLiteManifestCache:
                 source TEXT NOT NULL,
                 text TEXT,
                 duration REAL,
-                lang TEXT
+                lang TEXT,
+                phonemes TEXT
             )
         """)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(manifest_entries)")}
+        if "phonemes" not in columns:
+            conn.execute("ALTER TABLE manifest_entries ADD COLUMN phonemes TEXT")
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_source
             ON manifest_entries(source)
@@ -165,14 +169,15 @@ class SQLiteManifestCache:
             for filepath, entry in entries.items():
                 conn.execute(
                     """INSERT OR REPLACE INTO manifest_entries
-                       (audio_filepath, source, text, duration, lang)
-                       VALUES (?, ?, ?, ?, ?)""",
+                       (audio_filepath, source, text, duration, lang, phonemes)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
                     (
                         filepath,
                         source,
                         entry.get('text'),
                         entry.get('duration'),
                         entry.get('lang'),
+                        entry.get('phonemes'),
                     )
                 )
                 count += 1
@@ -229,6 +234,7 @@ class SQLiteManifestCache:
                 entry.get('text'),
                 entry.get('duration'),
                 entry.get('lang'),
+                entry.get('phonemes'),
             ))
             count += 1
 
@@ -236,8 +242,8 @@ class SQLiteManifestCache:
                 with conn:
                     conn.executemany(
                         """INSERT OR REPLACE INTO manifest_entries
-                           (audio_filepath, source, text, duration, lang)
-                           VALUES (?, ?, ?, ?, ?)""",
+                           (audio_filepath, source, text, duration, lang, phonemes)
+                           VALUES (?, ?, ?, ?, ?, ?)""",
                         batch
                     )
                 batch = []
@@ -247,8 +253,8 @@ class SQLiteManifestCache:
             with conn:
                 conn.executemany(
                     """INSERT OR REPLACE INTO manifest_entries
-                       (audio_filepath, source, text, duration, lang)
-                       VALUES (?, ?, ?, ?, ?)""",
+                       (audio_filepath, source, text, duration, lang, phonemes)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
                     batch
                 )
 
@@ -276,6 +282,7 @@ class SQLiteManifestCache:
                 'text': row['text'],
                 'duration': row['duration'],
                 'lang': row['lang'],
+                'phonemes': row['phonemes'] if 'phonemes' in row.keys() else None,
             }
         return None
 
