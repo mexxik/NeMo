@@ -538,6 +538,9 @@ class SingleSourceManager:
         # Selective backprop, PnC-gated: tag sample['clean'] per sample from
         # is_strict_pnc(text) instead of source membership.
         clean_pnc_gate: bool = False,
+        # Curriculum: shared DurationWindow handed to every TAR stream this
+        # manager opens. The interleaver mutates it as the curriculum advances.
+        duration_window=None,
     ):
         """
         Initialize single source manager.
@@ -570,6 +573,7 @@ class SingleSourceManager:
         # PnC-gated variant: clean flag is computed per sample from the text,
         # not from source membership (see _tag_clean below).
         self.clean_pnc_gate = bool(clean_pnc_gate)
+        self.duration_window = duration_window
 
         # Storage-specific setup
         if storage_type == "s3":
@@ -790,6 +794,7 @@ class SingleSourceManager:
             stream = DiskTarStream(
                 tar_path=local_path,
                 manifest_entries=manifest_entries,
+                duration_window=self.duration_window,
             )
             self._current_local_tar_path = local_path
 
@@ -803,6 +808,7 @@ class SingleSourceManager:
                 tar_key=tar_path,
                 manifest_entries=manifest_entries,
                 s3_client=self.s3_client,
+                duration_window=self.duration_window,
             )
 
         else:
@@ -812,6 +818,7 @@ class SingleSourceManager:
             stream = DiskTarStream(
                 tar_path=tar_path,
                 manifest_entries=manifest_entries,
+                duration_window=self.duration_window,
             )
 
         self._current_stream = iter(stream)

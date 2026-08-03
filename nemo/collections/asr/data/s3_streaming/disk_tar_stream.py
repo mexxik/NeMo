@@ -45,6 +45,7 @@ class DiskTarStream:
         self,
         tar_path: str,
         manifest_entries: Union[Dict[str, dict], "SQLiteManifestProvider"],
+        duration_window=None,
     ):
         """
         Initialize disk TAR streamer.
@@ -53,9 +54,14 @@ class DiskTarStream:
             tar_path: Path to TAR file on disk
             manifest_entries: Dict or SQLiteManifestProvider for manifest lookups.
                               Must support `in` operator and `[]` access.
+            duration_window: Optional DurationWindow (curriculum mode). Members
+                             whose manifest duration falls outside the active
+                             window are skipped before extract/decode, so they
+                             cost only a header read and a manifest lookup.
         """
         self.tar_path = tar_path
         self.manifest_entries = manifest_entries
+        self.duration_window = duration_window
         self._exhausted = False
 
     def __iter__(self) -> Iterator[dict]:
@@ -131,12 +137,20 @@ class DiskTarStream:
 
                     if _DATASET_PROFILE:
                         _t0 = time.perf_counter()
-                    in_manifest = filename in self.manifest_entries
+                    entry = self.manifest_entries.get(filename)
                     if _DATASET_PROFILE:
                         t_lookup += time.perf_counter() - _t0
-                    if not in_manifest:
+                    if entry is None:
                         continue
                     members_matched += 1
+
+                    # Curriculum gate. Deliberately ahead of extractfile(): a
+                    # member outside the active duration window must not cost a
+                    # payload read or a WAV decode, only the header we already
+                    # walked past.
+                    if self.duration_window is not None:
+                        if not self.duration_window.accepts(entry.get('duration')):
+                            continue
 
                     # Extract audio bytes
                     try:
@@ -160,12 +174,6 @@ class DiskTarStream:
                     if audio is None:
                         logging.debug(f"Failed to parse WAV: {filename}")
                         continue
-
-                    if _DATASET_PROFILE:
-                        _t0 = time.perf_counter()
-                    entry = self.manifest_entries[filename]
-                    if _DATASET_PROFILE:
-                        t_lookup += time.perf_counter() - _t0
 
                     yield {
                         'audio': audio,

@@ -84,6 +84,7 @@ class S3TarStream:
         s3_client=None,
         aws_region: str = "us-east-1",
         max_retries: int = 3,
+        duration_window=None,
     ):
         """
         Initialize S3 TAR streamer.
@@ -96,6 +97,9 @@ class S3TarStream:
             s3_client: Optional pre-configured boto3 S3 client
             aws_region: AWS region (if creating new client)
             max_retries: Max retries for S3 operations
+            duration_window: Optional DurationWindow (curriculum mode). Members
+                             outside the active window are skipped before the
+                             payload is extracted and decoded.
         """
         if not BOTO3_AVAILABLE:
             raise ImportError("boto3 is required for S3 streaming. Install with: pip install boto3")
@@ -104,6 +108,7 @@ class S3TarStream:
         self.tar_key = tar_key
         self.manifest_entries = manifest_entries
         self.max_retries = max_retries
+        self.duration_window = duration_window
 
         if s3_client is not None:
             self.s3_client = s3_client
@@ -137,8 +142,15 @@ class S3TarStream:
                 continue
 
             # Check if this file is in our manifest
-            if filename not in self.manifest_entries:
+            entry = self.manifest_entries.get(filename)
+            if entry is None:
                 continue
+
+            # Curriculum gate, ahead of extraction so an out-of-window member
+            # costs nothing but the header we already read.
+            if self.duration_window is not None:
+                if not self.duration_window.accepts(entry.get('duration')):
+                    continue
 
             # Extract audio bytes
             try:
@@ -157,8 +169,6 @@ class S3TarStream:
             audio = fast_wav_to_float32(audio_bytes)
             if audio is None:
                 continue
-
-            entry = self.manifest_entries[filename]
 
             # Mark as processed before yielding
             processed_files.add(filename)

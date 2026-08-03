@@ -225,6 +225,9 @@ class SourceRoundRobinInterleaver:
         source_sample_counts: Optional[Dict[str, int]] = None,
         lang_target_samples: Optional[Dict[str, int]] = None,
         curriculum_buckets: bool = False,
+        curriculum_windows: Optional[List[Tuple[float, float]]] = None,
+        curriculum_window_counts: Optional[List[Dict[str, int]]] = None,
+        duration_window=None,
     ):
         """
         Initialize source-level round-robin interleaver.
@@ -243,6 +246,12 @@ class SourceRoundRobinInterleaver:
                                  "cap"). Langs below their target get source
                                  restarts (oversampling); langs above get
                                  truncated when budget is reached (undersampling).
+            curriculum_windows: Ascending [lo, hi) duration windows (required for
+                                "curriculum"). The epoch runs them shortest-first.
+            curriculum_window_counts: Per-window {"lang:source" -> count}, used as
+                                the distributed budgets inside each window.
+            duration_window: Shared DurationWindow the TAR streams read. This
+                                interleaver owns it and advances it per window.
         """
         self.language_sources = language_sources
         self.source_managers = source_managers
@@ -253,9 +262,10 @@ class SourceRoundRobinInterleaver:
             balance_mode = "max"
         elif balance_mode is False:
             balance_mode = "none"
-        if balance_mode not in ("none", "max", "min", "distributed", "cap"):
+        if balance_mode not in ("none", "max", "min", "distributed", "cap", "curriculum"):
             raise ValueError(
-                f"balance_mode must be 'none', 'max', 'min', 'distributed', or 'cap', got: {balance_mode}"
+                f"balance_mode must be 'none', 'max', 'min', 'distributed', 'cap', or "
+                f"'curriculum', got: {balance_mode}"
             )
         self.balance_mode = balance_mode
 
@@ -301,6 +311,36 @@ class SourceRoundRobinInterleaver:
         self._source_budget: Dict[str, int] = {}    # "lang:source" -> total samples
         self._source_yielded: Dict[str, int] = {}   # "lang:source" -> yielded so far
         self._active_sources: set = set()            # active "lang:source" keys
+
+        # Duration-window curriculum. Selection inside a window is exactly
+        # "distributed", so the budgets are installed per window in
+        # _enter_window() rather than once up front.
+        self.curriculum_windows: List[Tuple[float, float]] = list(curriculum_windows or [])
+        self.curriculum_window_counts: List[Dict[str, int]] = list(curriculum_window_counts or [])
+        self.duration_window = duration_window
+        self._window_idx = 0
+        self._window_yielded: List[int] = []
+
+        if balance_mode == "curriculum":
+            if not self.curriculum_windows or not self.curriculum_window_counts:
+                logging.warning(
+                    "balance_mode='curriculum' requires curriculum_windows and "
+                    "curriculum_window_counts but none were provided. "
+                    "Falling back to 'distributed'."
+                )
+                self.balance_mode = balance_mode = "distributed"
+            elif self.duration_window is None:
+                logging.warning(
+                    "balance_mode='curriculum' requires a shared duration_window "
+                    "to gate the TAR streams. Falling back to 'distributed'."
+                )
+                self.balance_mode = balance_mode = "distributed"
+            else:
+                # Union of every window's budget, so "distributed" bookkeeping
+                # (which keys off _source_budget) has an entry for each source.
+                for key in source_managers:
+                    self._source_budget[key] = 0
+                    self._source_yielded[key] = 0
 
         if balance_mode == "distributed":
             if source_sample_counts:
@@ -439,7 +479,9 @@ class SourceRoundRobinInterleaver:
                 k for k, v in self._source_budget.items() if v > 0
             )
 
-        if self.curriculum_buckets:
+        if self.balance_mode == "curriculum":
+            yield from self._iter_duration_curriculum()
+        elif self.curriculum_buckets:
             yield from self._iter_curriculum()
         else:
             yield from self._iter_normal()
@@ -455,6 +497,83 @@ class SourceRoundRobinInterleaver:
             self._samples_yielded += 1
             self._log_sample(sample)
             yield sample
+
+    def _enter_window(self, idx: int):
+        """
+        Make window `idx` the active one.
+
+        Opens the duration gate on that window, reinstalls the distributed
+        budgets from its per-source counts, and rewinds every source manager so
+        the shards are re-read from the start looking for this window's samples.
+        """
+        lo, hi = self.curriculum_windows[idx]
+        counts = self.curriculum_window_counts[idx]
+
+        self._window_idx = idx
+        self.duration_window.set(idx, lo, hi)
+
+        for key in self._source_budget:
+            self._source_budget[key] = counts.get(key, 0)
+            self._source_yielded[key] = 0
+        self._active_sources = set(k for k, v in self._source_budget.items() if v > 0)
+
+        # Sources were left mid-shard by the previous window; restart them so
+        # this window sees the whole source again. On window 0 the managers are
+        # already at their start and reset() is a cheap no-op rewind.
+        if idx > 0:
+            for manager in self.source_managers.values():
+                manager.reset()
+
+        if not _in_worker():
+            total = sum(counts.values())
+            logging.info(
+                f"Curriculum window {idx}/{len(self.curriculum_windows) - 1}: "
+                f"[{lo:.2f}, {hi:.2f})s, {total:,} samples across "
+                f"{len(self._active_sources)} sources"
+            )
+
+    def _iter_duration_curriculum(self) -> Iterator[dict]:
+        """
+        Duration-window curriculum: shortest utterances first.
+
+        Runs the windows in ascending duration order. Inside a window, sample
+        selection is plain "distributed" (lowest completion ratio wins), so
+        source balance holds within every stage rather than only across the
+        epoch. A window ends when its sources stop producing; the gate then
+        advances and the sources rewind.
+        """
+        self._window_yielded = [0] * len(self.curriculum_windows)
+
+        for idx in range(len(self.curriculum_windows)):
+            self._enter_window(idx)
+
+            while True:
+                sample = self._get_next_sample_distributed()
+                if sample is None:
+                    break
+                self._samples_yielded += 1
+                self._window_yielded[idx] += 1
+                self._log_sample(sample)
+                yield sample
+
+            if not _in_worker():
+                lo, hi = self.curriculum_windows[idx]
+                budget = sum(self.curriculum_window_counts[idx].values())
+                logging.info(
+                    f"Curriculum window {idx} [{lo:.2f}, {hi:.2f})s done: "
+                    f"{self._window_yielded[idx]:,}/{budget:,} samples"
+                )
+
+        if not _in_worker():
+            logging.info(
+                f"Curriculum epoch complete: {sum(self._window_yielded):,} samples "
+                f"across {len(self.curriculum_windows)} windows"
+            )
+
+        # Leave the gate open so anything reading these streams outside the
+        # curriculum loop (next epoch's warm-up, diagnostics) is not filtered.
+        self.duration_window.disable()
+        self._start_new_epoch()
 
     def _iter_curriculum(self) -> Iterator[dict]:
         """
@@ -535,7 +654,7 @@ class SourceRoundRobinInterleaver:
 
     def _get_next_sample(self) -> Optional[dict]:
         """Dispatch to mode-specific sample selection."""
-        if self.balance_mode in ("min", "distributed", "cap"):
+        if self.balance_mode in ("min", "distributed", "cap", "curriculum"):
             return self._get_next_sample_weighted()
         else:
             return self._get_next_sample_round_robin()
@@ -594,7 +713,7 @@ class SourceRoundRobinInterleaver:
         "min": picks the LANGUAGE with the lowest completion ratio, capped
         at min(lang_counts). No restarts.
         """
-        if self.balance_mode == "distributed":
+        if self.balance_mode in ("distributed", "curriculum"):
             return self._get_next_sample_distributed()
 
         # "min" and "cap" modes — language-level weighted by completion ratio.
@@ -814,5 +933,10 @@ class SourceRoundRobinInterleaver:
         if self.balance_mode in ("min", "distributed", "cap"):
             stats['lang_budgets'] = dict(self._lang_budget)
             stats['lang_yielded'] = dict(self._lang_yielded)
+
+        if self.balance_mode == "curriculum":
+            stats['curriculum_windows'] = list(self.curriculum_windows)
+            stats['curriculum_window_idx'] = self._window_idx
+            stats['curriculum_window_yielded'] = list(self._window_yielded)
 
         return stats

@@ -244,6 +244,12 @@ class S3MultiLangStreamingDataset(IterableDataset):
         # Curriculum bucketing: process filterN_ sources from shortest to longest
         curriculum_buckets: bool = False,
 
+        # Duration-window curriculum (balance_mode="curriculum"): how many
+        # equal-count duration windows to split the epoch into. Windows are
+        # derived from the SQLite manifest cache, so no filterN_ source naming
+        # and no re-sharding is needed.
+        curriculum_windows: int = 4,
+
         # Language-ID training mode. When True, the label sequence for each
         # utterance is built from per-word lang tokens. EOU/EOT/BOS/EOS/
         # text-normalization are skipped — they're irrelevant for LID. Combined
@@ -324,11 +330,17 @@ class S3MultiLangStreamingDataset(IterableDataset):
                     "rotation_level='language'; with 'source' it behaves as 'max'."
                 )
             balance_mode = "max"
-        if balance_mode not in ("none", "max", "min", "distributed", "cap"):
+        if balance_mode not in ("none", "max", "min", "distributed", "cap", "curriculum"):
             raise ValueError(
-                f"balance_mode must be 'none', 'max', 'min', 'distributed', 'cap', or 'sync', "
-                f"got: {balance_mode}"
+                f"balance_mode must be 'none', 'max', 'min', 'distributed', 'cap', "
+                f"'curriculum', or 'sync', got: {balance_mode}"
             )
+        if balance_mode == "curriculum" and rotation_level != "source":
+            logging.warning(
+                "balance_mode='curriculum' requires rotation_level='source'; "
+                "falling back to 'distributed'."
+            )
+            balance_mode = "distributed"
         if balance_mode == "cap" and (balance_target_hours is None or balance_target_hours <= 0):
             raise ValueError(
                 "balance_mode='cap' requires balance_target_hours > 0 (hours per language per epoch)"
@@ -361,6 +373,7 @@ class S3MultiLangStreamingDataset(IterableDataset):
                 f"bandwidth={augment_bandwidth}, noise={augment_noise}"
             )
         self.curriculum_buckets = curriculum_buckets
+        self.curriculum_num_windows = int(curriculum_windows)
         if curriculum_buckets:
             logging.info(f"Curriculum bucketing: ENABLED (will process filterN_ sources short→long)")
         logging.info(f"Balance mode: {balance_mode}")
@@ -453,6 +466,10 @@ class S3MultiLangStreamingDataset(IterableDataset):
             require_strict_pnc=require_strict_pnc,
         )
         self.sample_filter = SampleFilter(filter_config)
+        # Kept on the instance because the duration-window curriculum has to cut
+        # its windows over exactly the range the filter admits.
+        self.min_duration = min_duration
+        self.max_duration = max_duration
         if require_strict_pnc:
             logging.info("Strict PnC filter ENABLED: dropping utterances that "
                          "aren't fully punctuated and capitalized")
@@ -830,9 +847,57 @@ class S3MultiLangStreamingDataset(IterableDataset):
             self._lang_sample_counts, self._source_sample_counts = self._get_sample_counts()
             self._lang_hours = self._get_lang_hours()
 
+        # Duration-window curriculum: derive the windows and their per-source
+        # budgets from the manifest cache. Done once here (not per worker) so
+        # every worker forks an identical plan.
+        self._curriculum_windows: List[Tuple[float, float]] = []
+        self._curriculum_window_counts: List[Dict[str, int]] = []
+        self._duration_window = None
+        if self.balance_mode == "curriculum":
+            self._setup_duration_curriculum()
+
         # Log balancing strategy if enabled
         if self.balance_mode != "none" and self._sqlite_cache_path and os.path.exists(self._sqlite_cache_path):
             self._log_balancing_strategy()
+
+    def _setup_duration_curriculum(self):
+        """
+        Build the duration-window plan for balance_mode="curriculum".
+
+        Falls back to "distributed" if the manifest cache is missing or the
+        durations cannot be cut into windows — the curriculum is an ordering
+        optimization, never a reason to fail a run.
+        """
+        from .curriculum import DurationWindow, compute_duration_windows, log_curriculum_plan
+
+        if not self._sqlite_cache_path or not os.path.exists(self._sqlite_cache_path):
+            logging.warning(
+                "balance_mode='curriculum' needs the SQLite manifest cache to derive "
+                "duration windows, but none was found. Falling back to 'distributed'."
+            )
+            self.balance_mode = "distributed"
+            return
+
+        windows, counts = compute_duration_windows(
+            sqlite_cache_path=self._sqlite_cache_path,
+            language_sources=self.language_sources,
+            num_windows=self.curriculum_num_windows,
+            min_duration=self.min_duration,
+            max_duration=self.max_duration,
+        )
+
+        if not windows:
+            logging.warning(
+                "balance_mode='curriculum': could not derive duration windows. "
+                "Falling back to 'distributed'."
+            )
+            self.balance_mode = "distributed"
+            return
+
+        self._curriculum_windows = windows
+        self._curriculum_window_counts = counts
+        self._duration_window = DurationWindow()
+        log_curriculum_plan(windows, counts)
 
     def _get_lang_hours(self) -> Optional[Dict[str, float]]:
         """Get per-language total duration in hours, restricted to the sources
@@ -1369,6 +1434,7 @@ class S3MultiLangStreamingDataset(IterableDataset):
                         prefetch_buffer_size=self.prefetch_buffer_size,
                         clean_sources=self.clean_sources,
                         clean_pnc_gate=self.clean_pnc_gate,
+                        duration_window=self._duration_window,
                     )
                 else:
                     manager = SingleSourceManager(
@@ -1383,6 +1449,7 @@ class S3MultiLangStreamingDataset(IterableDataset):
                         prefetch_buffer_size=self.prefetch_buffer_size,
                         clean_sources=self.clean_sources,
                         clean_pnc_gate=self.clean_pnc_gate,
+                        duration_window=self._duration_window,
                     )
                 source_managers[manager_key] = manager
 
@@ -1416,6 +1483,9 @@ class S3MultiLangStreamingDataset(IterableDataset):
             source_sample_counts=self._source_sample_counts,
             lang_target_samples=lang_target_samples,
             curriculum_buckets=self.curriculum_buckets,
+            curriculum_windows=self._curriculum_windows,
+            curriculum_window_counts=self._curriculum_window_counts,
+            duration_window=self._duration_window,
         )
 
     def __iter__(self) -> Iterator[Tuple[torch.Tensor, ...]]:
