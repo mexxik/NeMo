@@ -335,12 +335,12 @@ class S3MultiLangStreamingDataset(IterableDataset):
                 f"balance_mode must be 'none', 'max', 'min', 'distributed', 'cap', "
                 f"'curriculum', or 'sync', got: {balance_mode}"
             )
-        if balance_mode == "curriculum" and rotation_level != "source":
-            logging.warning(
-                "balance_mode='curriculum' requires rotation_level='source'; "
-                "falling back to 'distributed'."
-            )
-            balance_mode = "distributed"
+        # 'curriculum' works with both rotation levels. With 'source' it also
+        # reinstalls per-window distributed budgets; with 'language' (the LID
+        # recipe) it only gates each window and round-robins languages inside it,
+        # leaving the language interleaving semantics untouched. It is mutually
+        # exclusive with 'sync' by construction, since 'sync' normalizes to 'max'
+        # above.
         if balance_mode == "cap" and (balance_target_hours is None or balance_target_hours <= 0):
             raise ValueError(
                 "balance_mode='cap' requires balance_target_hours > 0 (hours per language per epoch)"
@@ -1390,6 +1390,7 @@ class S3MultiLangStreamingDataset(IterableDataset):
                     prefetch_buffer_size=self.prefetch_buffer_size,
                     clean_sources=self.clean_sources,
                     clean_pnc_gate=self.clean_pnc_gate,
+                    duration_window=self._duration_window,
                 )
             else:
                 manager = LanguageSourceManager(
@@ -1404,6 +1405,7 @@ class S3MultiLangStreamingDataset(IterableDataset):
                     prefetch_buffer_size=self.prefetch_buffer_size,
                     clean_sources=self.clean_sources,
                     clean_pnc_gate=self.clean_pnc_gate,
+                    duration_window=self._duration_window,
                 )
             language_managers[lang] = manager
 
@@ -1411,6 +1413,8 @@ class S3MultiLangStreamingDataset(IterableDataset):
             language_managers=language_managers,
             languages_order=sorted(self.language_sources.keys()),
             stop_on_exhaustion=self._stop_on_lang_exhaustion,
+            curriculum_windows=self._curriculum_windows,
+            duration_window=self._duration_window,
         )
 
     def _create_source_interleaver(self) -> SourceRoundRobinInterleaver:

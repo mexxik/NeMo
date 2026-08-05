@@ -60,6 +60,9 @@ class LanguageSourceManager:
         # is_strict_pnc(text) instead of source membership. Overrides
         # clean_sources when True.
         clean_pnc_gate: bool = False,
+        # Curriculum: shared DurationWindow handed to every TAR stream this
+        # manager opens. The interleaver mutates it as the curriculum advances.
+        duration_window=None,
     ):
         """
         Initialize language source manager.
@@ -113,6 +116,7 @@ class LanguageSourceManager:
         self.sqlite_cache_path = sqlite_cache_path
         self._sqlite_cache: Optional[SQLiteManifestCache] = None
         self._manifest_provider: Optional[SQLiteManifestProvider] = None
+        self.duration_window = duration_window
 
         # State tracking
         self._current_source_idx = 0
@@ -318,11 +322,13 @@ class LanguageSourceManager:
                         tar_key=tar_path,
                         manifest_entries=manifest_entries,
                         s3_client=self.s3_client,
+                        duration_window=self.duration_window,
                     )
                 else:
                     stream = DiskTarStream(
                         tar_path=tar_path,
                         manifest_entries=manifest_entries,
+                        duration_window=self.duration_window,
                     )
 
                 self._current_stream = iter(stream)

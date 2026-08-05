@@ -52,6 +52,8 @@ class RoundRobinInterleaver:
         language_managers: Dict[str, LanguageSourceManager],
         languages_order: Optional[List[str]] = None,
         stop_on_exhaustion: bool = False,
+        curriculum_windows: Optional[List[Tuple[float, float]]] = None,
+        duration_window=None,
     ):
         """
         Initialize round-robin interleaver.
@@ -60,6 +62,11 @@ class RoundRobinInterleaver:
             language_managers: Dict mapping language code to LanguageSourceManager
             languages_order: Optional explicit ordering of languages
                            (defaults to sorted keys)
+            curriculum_windows: Ascending [lo, hi) duration windows. When given
+                           (with duration_window), the epoch runs them
+                           shortest-first, doing a full language round-robin
+                           inside each window.
+            duration_window: Shared DurationWindow the TAR streams read.
         """
         self.language_managers = language_managers
 
@@ -76,10 +83,32 @@ class RoundRobinInterleaver:
 
         self.stop_on_exhaustion = stop_on_exhaustion
 
+        # Duration-window curriculum. Language rotation has no per-source
+        # budgets to reinstall, so a window is just "gate the streams, run the
+        # normal round-robin until every language drains, rewind, next window".
+        self.curriculum_windows: List[Tuple[float, float]] = list(curriculum_windows or [])
+        self.duration_window = duration_window
+        self.curriculum_enabled = bool(self.curriculum_windows) and duration_window is not None
+        self._window_idx = 0
+        self._window_yielded: List[int] = []
+
+        if self.curriculum_windows and duration_window is None:
+            logging.warning(
+                "curriculum_windows given without a duration_window to gate the "
+                "TAR streams; curriculum disabled."
+            )
+
         logging.info(
             f"RoundRobinInterleaver: {len(self.languages_order)} languages: "
-            f"{self.languages_order} (stop_on_exhaustion={self.stop_on_exhaustion})"
+            f"{self.languages_order} (stop_on_exhaustion={self.stop_on_exhaustion}, "
+            f"curriculum={'%d windows' % len(self.curriculum_windows) if self.curriculum_enabled else 'off'})"
         )
+        if self.curriculum_enabled and self.stop_on_exhaustion:
+            logging.warning(
+                "stop_on_exhaustion ('sync') with a curriculum ends the whole epoch "
+                "the first time any language drains a window, so later windows are "
+                "never reached. Use balance_mode='distributed' semantics instead."
+            )
 
         self._current_idx = 0
         self._epoch = 0
@@ -107,6 +136,10 @@ class RoundRobinInterleaver:
         # Reset state for this epoch
         self._active_languages = set(self.languages_order)
 
+        if self.curriculum_enabled:
+            yield from self._iter_duration_curriculum()
+            return
+
         while True:
             sample = self._get_next_sample()
             if sample is None:
@@ -117,6 +150,57 @@ class RoundRobinInterleaver:
 
             self._samples_yielded += 1
             yield sample
+
+    def _iter_duration_curriculum(self) -> Iterator[dict]:
+        """
+        Duration-window curriculum for language rotation: shortest first.
+
+        Each window opens the gate on its duration band, rewinds every language
+        manager so the shards are re-read for that band, and then runs the
+        normal cross-language round-robin until every language drains.
+        """
+        self._window_yielded = [0] * len(self.curriculum_windows)
+
+        for idx, (lo, hi) in enumerate(self.curriculum_windows):
+            self._window_idx = idx
+            self.duration_window.set(idx, lo, hi)
+            self._active_languages = set(self.languages_order)
+            self._current_idx = 0
+
+            # Window 0 starts at the managers' natural position; later windows
+            # need the shards re-read from the top.
+            if idx > 0:
+                for manager in self.language_managers.values():
+                    manager.reset()
+
+            if not _in_worker():
+                logging.info(
+                    f"Curriculum window {idx}/{len(self.curriculum_windows) - 1}: "
+                    f"[{lo:.2f}, {hi:.2f})s"
+                )
+
+            while True:
+                sample = self._get_next_sample()
+                if sample is None:
+                    break
+                self._samples_yielded += 1
+                self._window_yielded[idx] += 1
+                yield sample
+
+            if not _in_worker():
+                logging.info(
+                    f"Curriculum window {idx} [{lo:.2f}, {hi:.2f})s done: "
+                    f"{self._window_yielded[idx]:,} samples"
+                )
+
+        if not _in_worker():
+            logging.info(
+                f"Curriculum epoch complete: {sum(self._window_yielded):,} samples "
+                f"across {len(self.curriculum_windows)} windows"
+            )
+
+        self.duration_window.disable()
+        self._start_new_epoch()
 
     def _get_next_sample(self) -> Optional[dict]:
         """
