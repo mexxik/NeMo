@@ -109,6 +109,10 @@ class S3TarStream:
         self.manifest_entries = manifest_entries
         self.max_retries = max_retries
         self.duration_window = duration_window
+        # Members that matched a manifest entry, counted BEFORE the curriculum
+        # gate. Distinguishes "no data for the active window" (normal) from
+        # "this shard matches nothing at all" (manifest/layout mismatch).
+        self.manifest_matches = 0
 
         if s3_client is not None:
             self.s3_client = s3_client
@@ -145,6 +149,7 @@ class S3TarStream:
             entry = self.manifest_entries.get(filename)
             if entry is None:
                 continue
+            self.manifest_matches += 1
 
             # Curriculum gate, ahead of extraction so an out-of-window member
             # costs nothing but the header we already read.
@@ -190,6 +195,7 @@ class S3TarStream:
             Dict with keys: audio (np.array), text (str), duration (float), lang (str), filename (str)
         """
         self._exhausted = False
+        self.manifest_matches = 0
         processed_files = set()  # Track files we've already yielded
 
         # Opt-in cross-epoch shard cache (ASR_TAR_CACHE_DIR). On a cache hit we

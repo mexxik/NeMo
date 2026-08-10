@@ -63,6 +63,11 @@ class DiskTarStream:
         self.manifest_entries = manifest_entries
         self.duration_window = duration_window
         self._exhausted = False
+        # Members that matched a manifest entry, counted BEFORE the curriculum
+        # gate. Lets a caller tell "this shard has no data for me right now"
+        # (gated out, normal) apart from "this shard matches nothing at all"
+        # (manifest/layout mismatch, a real problem).
+        self.manifest_matches = 0
 
     def __iter__(self) -> Iterator[dict]:
         """
@@ -72,6 +77,7 @@ class DiskTarStream:
             Dict with keys: audio (np.array), text (str), duration (float), lang (str), filename (str)
         """
         self._exhausted = False
+        self.manifest_matches = 0
 
         if not os.path.exists(self.tar_path):
             logging.error(f"TAR file not found: {self.tar_path}")
@@ -143,6 +149,7 @@ class DiskTarStream:
                     if entry is None:
                         continue
                     members_matched += 1
+                    self.manifest_matches += 1
 
                     # Curriculum gate. Deliberately ahead of extractfile(): a
                     # member outside the active duration window must not cost a

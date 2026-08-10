@@ -122,6 +122,7 @@ class LanguageSourceManager:
         self._current_source_idx = 0
         self._current_tar_idx = 0
         self._current_stream: Optional[Iterator] = None
+        self._current_stream_obj = None
         self._tar_files_by_source: Dict[str, List[str]] = {}
         self._manifests_by_source: Dict[str, Dict[str, dict]] = {}
         self._epoch = 0
@@ -332,6 +333,7 @@ class LanguageSourceManager:
                     )
 
                 self._current_stream = iter(stream)
+                self._current_stream_obj = stream
                 self._current_source_name = source
                 self._current_tar_idx += 1
                 return True
@@ -447,16 +449,41 @@ class LanguageSourceManager:
 
             except StopIteration:
                 # Current stream exhausted
-                if samples_from_current_tar == 0:
+                if samples_from_current_tar == 0 and self._shard_matched_nothing():
                     empty_tar_count += 1
                     if empty_tar_count >= max_empty_tars:
-                        logging.warning(f"[{self.lang}] {empty_tar_count} consecutive empty TARs, giving up")
+                        logging.warning(
+                            f"[{self.lang}] {empty_tar_count} consecutive TARs matched no "
+                            f"manifest entries, giving up (check the source layout)"
+                        )
                         self._exhausted = True
                         return None
                 else:
-                    empty_tar_count = 0  # TAR had samples, reset
+                    # Yielded samples, or matched entries that the curriculum
+                    # gate filtered out. Either way the manifest is fine.
+                    empty_tar_count = 0
                 self._current_stream = None
                 continue
+
+    def _shard_matched_nothing(self) -> bool:
+        """
+        Whether the shard just drained matched ZERO manifest entries.
+
+        The "N consecutive empty TARs, giving up" guard exists to catch a
+        manifest/layout mismatch, where every shard yields nothing and scanning
+        the rest is pure waste. Under the duration-window curriculum a shard
+        legitimately yields nothing whenever none of its utterances fall in the
+        active window, so counting that as evidence of breakage retires the
+        whole source (or language) for the rest of the window and silently
+        drops its remaining data.
+
+        Counting manifest matches instead of yielded samples separates the two:
+        matched-but-all-gated is normal, matched-nothing is the real fault.
+        """
+        stream = self._current_stream_obj
+        if stream is None:
+            return True
+        return getattr(stream, 'manifest_matches', 0) == 0
 
     def reset(self):
         """Reset to beginning of all sources for new epoch."""
@@ -612,6 +639,7 @@ class SingleSourceManager:
         # State tracking
         self._current_tar_idx = 0
         self._current_stream: Optional[Iterator] = None
+        self._current_stream_obj = None
         self._tar_files: List[str] = []
         self._manifest: Dict[str, dict] = {}
         self._epoch = 0
@@ -828,6 +856,7 @@ class SingleSourceManager:
             )
 
         self._current_stream = iter(stream)
+        self._current_stream_obj = stream
         self._current_tar_idx += 1
         return True
 
@@ -912,16 +941,41 @@ class SingleSourceManager:
                 return sample
 
             except StopIteration:
-                if samples_from_current_tar == 0:
+                if samples_from_current_tar == 0 and self._shard_matched_nothing():
                     empty_tar_count += 1
                     if empty_tar_count >= max_empty_tars:
-                        logging.warning(f"[{self.lang}:{self.source}] {empty_tar_count} consecutive empty TARs, giving up")
+                        logging.warning(
+                            f"[{self.lang}:{self.source}] {empty_tar_count} consecutive TARs "
+                            f"matched no manifest entries, giving up (check the source layout)"
+                        )
                         self._exhausted = True
                         return None
                 else:
-                    empty_tar_count = 0  # TAR had samples, reset
+                    # Yielded samples, or matched entries that the curriculum
+                    # gate filtered out. Either way the manifest is fine.
+                    empty_tar_count = 0
                 self._current_stream = None
                 continue
+
+    def _shard_matched_nothing(self) -> bool:
+        """
+        Whether the shard just drained matched ZERO manifest entries.
+
+        The "N consecutive empty TARs, giving up" guard exists to catch a
+        manifest/layout mismatch, where every shard yields nothing and scanning
+        the rest is pure waste. Under the duration-window curriculum a shard
+        legitimately yields nothing whenever none of its utterances fall in the
+        active window, so counting that as evidence of breakage retires the
+        whole source (or language) for the rest of the window and silently
+        drops its remaining data.
+
+        Counting manifest matches instead of yielded samples separates the two:
+        matched-but-all-gated is normal, matched-nothing is the real fault.
+        """
+        stream = self._current_stream_obj
+        if stream is None:
+            return True
+        return getattr(stream, 'manifest_matches', 0) == 0
 
     def reset(self):
         """Reset to beginning for new epoch."""
