@@ -70,6 +70,10 @@ class AudioMerger:
             'skipped_duration': 0,
             'skipped_no_punctuation': 0,
             'skipped_no_capital': 0,
+            'outputs': 0,
+            'merged_outputs': 0,
+            'single_outputs': 0,
+            'merged_segments': 0,
         }
 
     def should_merge(self) -> bool:
@@ -273,17 +277,41 @@ class AudioMerger:
         """Return merger statistics."""
         return self._stats.copy()
 
+    def record_output(self, segment_count: int) -> None:
+        """Record one emitted output independently of merge attempts."""
+        segment_count = max(1, int(segment_count))
+        self._stats['outputs'] += 1
+        if segment_count > 1:
+            self._stats['merged_outputs'] += 1
+            self._stats['merged_segments'] += segment_count
+        else:
+            self._stats['single_outputs'] += 1
+
     def log_stats(self):
         """Log merger statistics."""
-        total = self._stats['total_processed']
-        if total == 0:
+        attempts = self._stats['total_processed']
+        outputs = self._stats['outputs']
+        if attempts == 0 and outputs == 0:
             logging.info("AudioMerger stats: No samples processed yet")
             return
 
         merged = self._stats['merged']
-        merge_rate = 100.0 * merged / total if total > 0 else 0
+        attempt_rate = 100.0 * merged / attempts if attempts > 0 else 0
+        merged_outputs = self._stats['merged_outputs']
+        output_rate = 100.0 * merged_outputs / outputs if outputs > 0 else 0
+        avg_segments = (
+            self._stats['merged_segments'] / merged_outputs
+            if merged_outputs > 0 else 0.0
+        )
 
-        logging.info(f"AudioMerger stats: {merged}/{total} merged ({merge_rate:.1f}%)")
+        logging.info(
+            f"AudioMerger stats: outputs={outputs} merged={merged_outputs} "
+            f"single={self._stats['single_outputs']} "
+            f"merged_output_rate={output_rate:.1f}% avg_segments={avg_segments:.2f}"
+        )
+        logging.info(
+            f"  Merge attempts: {merged}/{attempts} succeeded ({attempt_rate:.1f}%)"
+        )
         logging.info(f"  Skipped (duration too long): {self._stats['skipped_duration']}")
         logging.info(f"  Skipped (segment no terminal punct): {self._stats['skipped_no_punctuation']}")
         logging.info(f"  Skipped (segment no leading capital): {self._stats['skipped_no_capital']}")
@@ -302,6 +330,7 @@ class MergeBuffer:
         self.merger = merger
         self.config = config
         self.buffer: List[dict] = []
+        self._target_count: Optional[int] = None
 
     def add(self, sample: dict) -> Optional[dict]:
         """
@@ -315,46 +344,53 @@ class MergeBuffer:
 
         self.buffer.append(sample)
 
-        # Check if we should try to merge
-        if len(self.buffer) >= self.config.max_utterances:
-            # Buffer full, must yield something
-            return self._try_merge_and_yield(force_decision=True)
+        # Decide once per OUTPUT. Previously a Bernoulli miss merely delayed
+        # the decision and max_utterances forced a merge, so p=0.5 yielded
+        # almost no singles in short-duration windows.
+        if self._target_count is None:
+            if self.merger.should_merge():
+                self._target_count = random.randint(
+                    self.config.min_utterances,
+                    self.config.max_utterances,
+                )
+            else:
+                self._target_count = 1
 
-        # With some probability, try to merge even with fewer samples
-        if len(self.buffer) >= self.config.min_utterances and self.merger.should_merge():
-            return self._try_merge_and_yield(force_decision=False)
+        if self._target_count == 1:
+            result = self.buffer.pop(0)
+            self._target_count = None
+            self.merger.record_output(1)
+            return result
 
-        return None
+        if len(self.buffer) < self._target_count:
+            return None
 
-    def _try_merge_and_yield(self, force_decision: bool = False) -> dict:
-        """
-        Try to merge buffered samples, yield result.
-
-        Args:
-            force_decision: If True, always attempt merge (buffer full).
-                           If False, merge decision already made by should_merge().
-        """
-        should_try_merge = force_decision or len(self.buffer) >= self.config.min_utterances
-
-        if should_try_merge:
-            # Try to merge
-            num_to_merge = random.randint(
-                self.config.min_utterances,
-                min(len(self.buffer), self.config.max_utterances)
-            )
+        num_to_merge = min(
+            self._target_count,
+            len(self.buffer),
+            self.config.max_utterances,
+        )
+        if num_to_merge >= self.config.min_utterances:
             samples_to_merge = self.buffer[:num_to_merge]
             merged = self.merger.merge(samples_to_merge)
-
             if merged is not None:
-                # Successfully merged
                 self.buffer = self.buffer[num_to_merge:]
+                self._target_count = None
+                self.merger.record_output(num_to_merge)
                 return merged
 
-        # Merge failed or not merging, yield first sample
-        return self.buffer.pop(0)
+        # Incompatible merge (normally duration): emit one single and make a
+        # fresh output decision next time. The remaining samples stay ordered.
+        result = self.buffer.pop(0)
+        self._target_count = None
+        self.merger.record_output(1)
+        return result
 
     def drain(self) -> List[dict]:
         """Drain all remaining samples from buffer."""
         remaining = self.buffer
         self.buffer = []
+        self._target_count = None
+        for _ in remaining:
+            self.merger.record_output(1)
         return remaining

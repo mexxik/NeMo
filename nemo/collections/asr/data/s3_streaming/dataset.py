@@ -274,6 +274,8 @@ class S3MultiLangStreamingDataset(IterableDataset):
         #                 Phonemes are normally precomputed in SQLite; a slow
         #                 on-the-fly G2P fallback keeps non-cached manifests usable.
         lid_label_scheme: str = "word",
+        # Drop corrupted dense targets after tokenization. Zero disables.
+        max_target_tokens_per_second: float = 0.0,
     ):
         """
         Initialize multi-language streaming dataset.
@@ -455,6 +457,15 @@ class S3MultiLangStreamingDataset(IterableDataset):
         self.world_size = world_size
         self.use_start_end_token = use_start_end_token
         self.return_sample_id = return_sample_id
+        self.max_target_tokens_per_second = max(
+            0.0, float(max_target_tokens_per_second or 0.0)
+        )
+        self._target_rate_dropped = 0
+        if self.max_target_tokens_per_second > 0:
+            logging.info(
+                "Target-density filter enabled: max %.1f tokens/s",
+                self.max_target_tokens_per_second,
+            )
 
         # Create filter (duration, text length, and whisper hallucination detection)
         filter_config = FilterConfig(
@@ -1733,6 +1744,8 @@ class S3MultiLangStreamingDataset(IterableDataset):
                 _pending_raw = 0
                 yield result
                 sample_idx += 1
+        if self.merge_config.enabled and worker_id == 0 and rank == 0:
+            self.audio_merger.log_stats()
 
     @staticmethod
     def _starts_with_capital(text: str) -> bool:
@@ -1985,6 +1998,24 @@ class S3MultiLangStreamingDataset(IterableDataset):
         # segments all romanize to empty content.
         if len(tokens) == 0:
             return None
+
+        if self.max_target_tokens_per_second > 0:
+            duration_sec = float(audio_len.item()) / float(self.sample_rate)
+            token_rate = len(tokens) / max(duration_sec, 1e-3)
+            if token_rate > self.max_target_tokens_per_second:
+                self._target_rate_dropped += 1
+                if (
+                    self._target_rate_dropped in (1, 10, 100)
+                    or self._target_rate_dropped % 1000 == 0
+                ):
+                    logging.warning(
+                        "Dropped %d target-density outlier(s); latest %.1f "
+                        "tokens/s exceeds %.1f",
+                        self._target_rate_dropped,
+                        token_rate,
+                        self.max_target_tokens_per_second,
+                    )
+                return None
 
         # Guard: RNNT numba kernels launch with maxU = max(label_lengths) + 1 as
         # threads-per-block; CUDA hard-caps this at 1024.  Skip samples that
