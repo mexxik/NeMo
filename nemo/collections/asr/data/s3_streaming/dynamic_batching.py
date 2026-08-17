@@ -40,7 +40,8 @@ class DynamicBatchingDataset(IterableDataset):
     def __init__(self, inner_dataset, max_padded_budget_sec: float,
                  sample_rate: int = 16000, sort_buffer_size: int = 500,
                  max_batch_size: int = 64, max_sample_duration: float = None,
-                 rnnt_budget: float = 0, emit_clean_flag: bool = False):
+                 rnnt_budget: float = 0, emit_clean_flag: bool = False,
+                 joint_budget: float = 0):
         super().__init__()
         self.inner_dataset = inner_dataset
         self.max_padded_budget_sec = max_padded_budget_sec
@@ -59,6 +60,19 @@ class DynamicBatchingDataset(IterableDataset):
         # max_padded_budget_sec (linear) still controls total audio seconds.
         # Whichever limit hits first wins.
         self.rnnt_budget = rnnt_budget
+        # Joint memory budget: caps B × max_dur × max_target_tokens, i.e. the
+        # real O(B × T × U) shape of the joint tensor.
+        #
+        # rnnt_budget above uses dur² as a stand-in for T × U, which only holds
+        # when target length tracks duration. It does not for character-style
+        # schemes: `phoneme_word` emits one token per IPA character plus a tag
+        # per word, and MergeBuffer then concatenates 2-6 utterances, so U ran
+        # to ~1000 on 15-20s merges while dur² predicted far less. That combination
+        # asked for a 48.9 GiB gradient buffer and OOMed 85% into an epoch — only
+        # once the short→long curriculum reached its longest window.
+        #
+        # Measured in token-seconds (max_dur × max_tokens × B). 0 disables.
+        self.joint_budget = joint_budget
 
     def _bump_emitted(self, weight):
         """Advance the inner dataset's consumer-side bar counter at batch emit.
@@ -100,25 +114,32 @@ class DynamicBatchingDataset(IterableDataset):
         batch = []
         batch_w = 0
         max_dur_in_batch = 0.0
+        max_tok_in_batch = 0
         batch_clean = True
 
         for sample, duration, weight, clean in samples:
             new_max_dur = max(max_dur_in_batch, duration)
+            new_max_tok = max(max_tok_in_batch, self._target_len(sample))
             new_count = len(batch) + 1
 
             # Flush on budget overflow OR a cleanliness change (keeps batches
             # homogeneous for selective backprop).
-            if batch and (self._batch_full(new_count, new_max_dur) or clean != batch_clean):
+            if batch and (
+                self._batch_full(new_count, new_max_dur, new_max_tok)
+                or clean != batch_clean
+            ):
                 self._bump_emitted(batch_w)
                 yield self._collate(batch, batch_clean)
                 batch = []
                 batch_w = 0
                 max_dur_in_batch = 0.0
+                max_tok_in_batch = 0
 
             batch.append(sample)
             batch_w += weight
             batch_clean = clean
             max_dur_in_batch = max(max_dur_in_batch, duration)
+            max_tok_in_batch = max(max_tok_in_batch, self._target_len(sample))
 
         if batch:
             self._bump_emitted(batch_w)
@@ -134,13 +155,31 @@ class DynamicBatchingDataset(IterableDataset):
             # Sort-buffer mode: accumulate, sort by duration, then pack.
             yield from self._iter_sorted()
 
-    def _batch_full(self, count, max_dur):
+    @staticmethod
+    def _target_len(sample):
+        """Target token count for a collate 4-tuple (audio, audio_len, tokens, tokens_len)."""
+        try:
+            n = sample[3]
+        except (IndexError, TypeError):
+            return 0
+        return int(n.item()) if hasattr(n, 'item') else int(n)
+
+    def _batch_full(self, count, max_dur, max_tokens=0):
         """Check if adding one more sample would exceed any limit."""
         # Linear budget: total padded seconds
         if count * max_dur > self.max_padded_budget_sec:
             return True
         # RNNT memory budget: B × max_dur²
         if self.rnnt_budget > 0 and count * max_dur * max_dur > self.rnnt_budget:
+            return True
+        # Joint memory budget: B × max_dur × max_target_tokens (∝ B × T × U).
+        # Uses the measured target length, so it holds for label schemes whose
+        # targets are not proportional to duration.
+        if (
+            self.joint_budget > 0
+            and max_tokens > 0
+            and count * max_dur * max_tokens > self.joint_budget
+        ):
             return True
         # Hard batch size cap
         if count > self.max_batch_size:
@@ -152,6 +191,7 @@ class DynamicBatchingDataset(IterableDataset):
         batch = []
         batch_w = 0
         max_dur_in_batch = 0.0
+        max_tok_in_batch = 0
         batch_clean = True
         carry_w = 0  # weight of dropped samples, folded into the next kept one
 
@@ -166,22 +206,28 @@ class DynamicBatchingDataset(IterableDataset):
                 continue
 
             new_max_dur = max(max_dur_in_batch, duration)
+            new_max_tok = max(max_tok_in_batch, self._target_len(sample))
             new_count = len(batch) + 1
 
             # Flush on budget overflow OR a cleanliness change (keeps batches
             # homogeneous for selective backprop).
-            if batch and (self._batch_full(new_count, new_max_dur) or clean != batch_clean):
+            if batch and (
+                self._batch_full(new_count, new_max_dur, new_max_tok)
+                or clean != batch_clean
+            ):
                 self._bump_emitted(batch_w)
                 yield self._collate(batch, batch_clean)
                 batch = []
                 batch_w = 0
                 max_dur_in_batch = 0.0
+                max_tok_in_batch = 0
 
             batch.append(sample)
             batch_w += weight + carry_w
             batch_clean = clean
             carry_w = 0
             max_dur_in_batch = max(max_dur_in_batch, duration)
+            max_tok_in_batch = max(max_tok_in_batch, self._target_len(sample))
 
         if batch:
             self._bump_emitted(batch_w)
